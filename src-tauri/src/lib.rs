@@ -365,23 +365,28 @@ fn vsd_install_extension(browser: String) -> Result<String, String> {
     }
 
     // Open the browser's extension management page
-    let url = match browser.as_str() {
-        "chrome" => "chrome://extensions/",
-        "firefox" => "about:debugging#/runtime/this-firefox",
-        _ => return Err(format!("Unknown browser: {browser}")),
-    };
-
-    // Try to open the URL in the target browser
     let open_result = if cfg!(target_os = "windows") {
         match browser.as_str() {
-            "chrome" => Command::new("cmd").args(["/c", "start", "chrome", url]).spawn(),
-            "firefox" => Command::new("cmd").args(["/c", "start", "firefox", url]).spawn(),
+            "chrome" => {
+                // Use chrome.exe directly with the chrome:// URL
+                Command::new("chrome").arg("chrome://extensions/").spawn()
+                    .or_else(|_| Command::new("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe")
+                        .arg("chrome://extensions/").spawn())
+                    .or_else(|_| Command::new("C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe")
+                        .arg("chrome://extensions/").spawn())
+            }
+            "firefox" => {
+                Command::new("firefox").arg("about:debugging#/runtime/this-firefox").spawn()
+                    .or_else(|_| Command::new("C:\\Program Files\\Mozilla Firefox\\firefox.exe")
+                        .arg("about:debugging#/runtime/this-firefox").spawn())
+            }
             _ => return Err(format!("Unknown browser: {browser}")),
         }
     } else {
         match browser.as_str() {
-            "chrome" => Command::new("xdg-open").arg(url).spawn(),
-            "firefox" => Command::new("firefox").arg(url).spawn(),
+            "chrome" => Command::new("google-chrome").arg("chrome://extensions/").spawn()
+                .or_else(|_| Command::new("chromium-browser").arg("chrome://extensions/").spawn()),
+            "firefox" => Command::new("firefox").arg("about:debugging#/runtime/this-firefox").spawn(),
             _ => return Err(format!("Unknown browser: {browser}")),
         }
     };
