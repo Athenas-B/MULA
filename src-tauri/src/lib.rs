@@ -130,9 +130,13 @@ fn vsd_start() -> Result<(), String> {
         }
     }
 
+    // Pass configured download dir to server via env var
+    let download_dir = vsd_get_download_dir();
+
     let mut child = Command::new(&python)
         .arg(&server_path)
         .current_dir(&working_dir)
+        .env("VSD_DOWNLOAD_DIR", &download_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -221,19 +225,26 @@ fn vsd_get_logs() -> Vec<String> {
     }
 }
 
+/// Get the MULA config directory (e.g. C:\Users\<user>\AppData\Roaming\mula)
+fn get_config_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("mula"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Get the config file path for the VSD module settings
+fn get_vsd_config_path() -> std::path::PathBuf {
+    get_config_dir().join("vsd.conf")
+}
+
 #[tauri::command]
 fn vsd_get_download_dir() -> String {
-    let vsd_dir = get_vsd_server_path()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-
-    if let Some(dir) = vsd_dir {
-        let env_path = dir.join(".env");
-        if env_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&env_path) {
-                for line in content.lines() {
-                    if let Some(val) = line.strip_prefix("VSD_DOWNLOAD_DIR=") {
-                        return val.trim().to_string();
-                    }
+    let config_path = get_vsd_config_path();
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            for line in content.lines() {
+                if let Some(val) = line.strip_prefix("VSD_DOWNLOAD_DIR=") {
+                    return val.trim().to_string();
                 }
             }
         }
@@ -246,15 +257,14 @@ fn vsd_get_download_dir() -> String {
 
 #[tauri::command]
 fn vsd_set_download_dir(path: String) -> Result<(), String> {
-    let vsd_dir = get_vsd_server_path()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .ok_or("Could not find VSD module directory")?;
+    let config_path = get_vsd_config_path();
+    let config_dir = config_path.parent().unwrap();
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| format!("Failed to create config dir: {e}"))?;
 
-    let env_path = vsd_dir.join(".env");
-
-    // Read existing .env or start fresh
-    let mut lines: Vec<String> = if env_path.exists() {
-        std::fs::read_to_string(&env_path)
+    // Read existing config or start fresh
+    let mut lines: Vec<String> = if config_path.exists() {
+        std::fs::read_to_string(&config_path)
             .unwrap_or_default()
             .lines()
             .map(|l| l.to_string())
@@ -277,8 +287,8 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
         lines.push(new_line);
     }
 
-    std::fs::write(&env_path, lines.join("\n") + "\n")
-        .map_err(|e| format!("Failed to write .env: {e}"))?;
+    std::fs::write(&config_path, lines.join("\n") + "\n")
+        .map_err(|e| format!("Failed to write config: {e}"))?;
 
     // If server is running, update it live via API
     if vsd_is_running() {
