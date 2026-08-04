@@ -252,6 +252,27 @@ body {
   font-size: 1rem;
 }
 
+.toolbar-separator {
+  width: 1px;
+  height: 24px;
+  background: #ddd;
+  margin: 0 4px;
+}
+
+.browser-btn {
+  max-width: unset;
+}
+
+.chrome-icon::before {
+  content: "\1F310";
+  font-size: 1rem;
+}
+
+.firefox-icon::before {
+  content: "\1F525";
+  font-size: 1rem;
+}
+
 .vsd-log {
   flex: 1;
   margin-top: 12px;

@@ -322,6 +322,77 @@ fn urllib_post(url: &str, body: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Get the extension directory for a given browser target
+fn get_extension_dir(browser: &str) -> Option<std::path::PathBuf> {
+    let vsd_dir = get_vsd_server_path()?.parent()?.to_path_buf();
+    let ext_dir = vsd_dir.join("extension").join("dist").join(browser);
+    Some(ext_dir)
+}
+
+/// Get the extension build script path
+fn get_extension_build_script() -> Option<std::path::PathBuf> {
+    let vsd_dir = get_vsd_server_path()?.parent()?.to_path_buf();
+    let build_script = vsd_dir.join("extension").join("build.py");
+    if build_script.exists() { Some(build_script) } else { None }
+}
+
+#[tauri::command]
+fn vsd_install_extension(browser: String) -> Result<String, String> {
+    let build_script = get_extension_build_script()
+        .ok_or("Could not find extension build script")?;
+
+    let python = get_python_command();
+
+    // Build the extension
+    let output = Command::new(&python)
+        .arg(&build_script)
+        .arg(&browser)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run build script: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Build failed: {}", stderr.trim()));
+    }
+
+    let ext_dir = get_extension_dir(&browser)
+        .ok_or("Could not determine extension output directory")?;
+
+    if !ext_dir.exists() {
+        return Err(format!("Extension not found at {}", ext_dir.display()));
+    }
+
+    // Open the browser's extension management page
+    let url = match browser.as_str() {
+        "chrome" => "chrome://extensions/",
+        "firefox" => "about:debugging#/runtime/this-firefox",
+        _ => return Err(format!("Unknown browser: {browser}")),
+    };
+
+    // Try to open the URL in the target browser
+    let open_result = if cfg!(target_os = "windows") {
+        match browser.as_str() {
+            "chrome" => Command::new("cmd").args(["/c", "start", "chrome", url]).spawn(),
+            "firefox" => Command::new("cmd").args(["/c", "start", "firefox", url]).spawn(),
+            _ => return Err(format!("Unknown browser: {browser}")),
+        }
+    } else {
+        match browser.as_str() {
+            "chrome" => Command::new("xdg-open").arg(url).spawn(),
+            "firefox" => Command::new("firefox").arg(url).spawn(),
+            _ => return Err(format!("Unknown browser: {browser}")),
+        }
+    };
+
+    if let Err(e) = open_result {
+        return Err(format!("Built extension but failed to open {browser}: {e}\nLoad manually from: {}", ext_dir.display()));
+    }
+
+    Ok(ext_dir.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -336,6 +407,7 @@ pub fn run() {
             vsd_get_logs,
             vsd_get_download_dir,
             vsd_set_download_dir,
+            vsd_install_extension,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -50,9 +50,32 @@ function initVsd() {
   const toggleBtn = document.getElementById("vsd-toggle");
   toggleBtn.addEventListener("click", toggleVsd);
   document.getElementById("vsd-download-dir").addEventListener("click", changeDownloadDir);
+  document.getElementById("vsd-install-chrome").addEventListener("click", () => installExtension("chrome"));
+  document.getElementById("vsd-install-firefox").addEventListener("click", () => installExtension("firefox"));
   // Check initial state
   checkVsdStatus();
   loadDownloadDir();
+}
+
+async function installExtension(browser) {
+  const btn = document.getElementById(`vsd-install-${browser}`);
+  const originalText = btn.querySelector(".btn-text").textContent;
+  btn.disabled = true;
+  btn.querySelector(".btn-text").textContent = "Building...";
+  try {
+    const extPath = await invoke("vsd_install_extension", { browser });
+    btn.querySelector(".btn-text").textContent = "Opened!";
+    appendLog(`[Extension built: ${extPath}]\n`);
+    appendLog(`[Opened ${browser} extensions page — load unpacked from the path above]\n`);
+  } catch (err) {
+    btn.querySelector(".btn-text").textContent = "Error";
+    appendLog(`[Extension install error: ${err}]\n`);
+  } finally {
+    setTimeout(() => {
+      btn.querySelector(".btn-text").textContent = originalText;
+      btn.disabled = false;
+    }, 3000);
+  }
 }
 
 async function loadDownloadDir() {
