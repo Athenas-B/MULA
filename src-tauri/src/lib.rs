@@ -21,7 +21,7 @@ fn get_app_info() -> AppInfo {
         .unwrap_or_else(|| "unknown".to_string());
 
     AppInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIMESTAMP")),
         config_path: config_dir,
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
