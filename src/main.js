@@ -413,6 +413,7 @@ function onDriveSelect() {
     ["Serial", drive.serial || "N/A"],
     ["Type", drive.type],
     ["Bus", drive.bus_type],
+    ["Connection speed", drive.connection_speed],
     ["Media type", drive.media_type],
     ["Interface", drive.interface_type],
     ["Size", `${drive.size_text} (${drive.size.toLocaleString()} bytes)`],

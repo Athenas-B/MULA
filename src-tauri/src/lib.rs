@@ -417,6 +417,7 @@ pub struct DriveInfo {
     drive_letters: Vec<String>,
     mount_points: Vec<String>,
     health_status: String,
+    connection_speed: String,
 }
 
 fn parse_vendor_from_pnp(pnp: &str) -> Option<String> {
@@ -531,6 +532,50 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.2} {}", size, UNITS[unit_index])
 }
 
+fn format_bitrate(bits_per_sec: u64) -> String {
+    if bits_per_sec == 0 {
+        return "Unknown".to_string();
+    }
+    // Some WMI sources report the value scaled down (e.g. Mbps or 100 Mbps).
+    // Detect and normalize to bits/s for display.
+    let bps = bits_per_sec as f64;
+    if bps < 1_000_000.0 {
+        // Possibly already in Mbps? Unlikely, but handle by leaving as-is.
+    }
+    const UNITS: &[&str] = &["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+    let mut size = bps;
+    let mut unit_index = 0;
+    while size >= 1000.0 && unit_index < UNITS.len() - 1 {
+        size /= 1000.0;
+        unit_index += 1;
+    }
+    format!("{:.2} {}", size, UNITS[unit_index])
+}
+
+fn infer_connection_speed(bus_type: &str, interface_type: &str) -> String {
+    let bus = bus_type.to_lowercase();
+    let interface = interface_type.to_lowercase();
+    if bus.contains("nvme") || interface.contains("nvme") {
+        return "PCIe (varies by generation)".to_string();
+    }
+    if bus.contains("sata") || interface.contains("sata") {
+        return "Up to 6 Gbps (SATA 6 Gb/s)".to_string();
+    }
+    if bus.contains("sas") || interface.contains("sas") {
+        return "Up to 12 Gbps (SAS 12 Gb/s)".to_string();
+    }
+    if bus.contains("usb") || interface.contains("usb") {
+        return "USB (varies by port)".to_string();
+    }
+    if bus.contains("ide") || interface.contains("ide") {
+        return "Up to 133 MB/s (PATA)".to_string();
+    }
+    if bus.contains("scsi") || interface.contains("scsi") {
+        return "SCSI (varies by generation)".to_string();
+    }
+    "Unknown".to_string()
+}
+
 #[cfg(target_os = "windows")]
 fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
     #[derive(Deserialize, Debug)]
@@ -567,6 +612,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         drive_letters: Option<serde_json::Value>,
         #[serde(rename = "MountPoints")]
         mount_points: Option<serde_json::Value>,
+        #[serde(rename = "ConnectionSpeed")]
+        connection_speed: Option<u64>,
     }
 
     let script = r#"
@@ -586,6 +633,20 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
                     FirmwareVersion = $_.FirmwareVersion
                     HealthStatus = $_.HealthStatus
                 }
+            }
+        } catch {}
+
+        $speeds = @{}
+        try {
+            $devs = Get-CimInstance -ClassName Win32_SCSIControllerDevice -ErrorAction SilentlyContinue
+            foreach ($dev in $devs) {
+                $key = if ($dev.Dependent.PNPDeviceID) { $dev.Dependent.PNPDeviceID } else { $dev.Dependent.DeviceID }
+                if ($key -and $dev.NegotiatedSpeed) { $speeds[$key] = [uint64]$dev.NegotiatedSpeed }
+            }
+            $idevs = Get-CimInstance -ClassName Win32_IDEControllerDevice -ErrorAction SilentlyContinue
+            foreach ($dev in $idevs) {
+                $key = if ($dev.Dependent.PNPDeviceID) { $dev.Dependent.PNPDeviceID } else { $dev.Dependent.DeviceID }
+                if ($key -and $dev.NegotiatedSpeed) { $speeds[$key] = [uint64]$dev.NegotiatedSpeed }
             }
         } catch {}
 
@@ -647,6 +708,7 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
                 HealthStatus = $finalHealth
                 DriveLetters = if ($vol -and $vol.Letters.Count -gt 0) { @($vol.Letters) } else { $null }
                 MountPoints = if ($vol -and $vol.Mounts.Count -gt 0) { @($vol.Mounts) } else { $null }
+                ConnectionSpeed = if ($d.PNPDeviceID -and $speeds[$d.PNPDeviceID]) { $speeds[$d.PNPDeviceID] } else { $null }
             }
         }
 
@@ -701,6 +763,12 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         let bus_type = d.physical_bus_type.as_deref().or(d.interface_type.as_deref()).unwrap_or("Unknown").trim().to_string();
         let drive_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
 
+        let connection_speed_text = if d.connection_speed.unwrap_or(0) > 0 {
+            format_bitrate(d.connection_speed.unwrap())
+        } else {
+            infer_connection_speed(&bus_type, d.interface_type.as_deref().unwrap_or(""))
+        };
+
         fn value_to_strings(v: Option<serde_json::Value>) -> Vec<String> {
             match v {
                 None => vec![],
@@ -730,6 +798,7 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             drive_letters: value_to_strings(d.drive_letters),
             mount_points: value_to_strings(d.mount_points),
             health_status: d.health_status.unwrap_or_default(),
+            connection_speed: connection_speed_text,
         });
     }
 
