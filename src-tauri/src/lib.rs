@@ -935,39 +935,112 @@ fn ensure_smartctl() -> Result<std::path::PathBuf, String> {
     result
 }
 
-#[tauri::command]
-fn get_drive_smart(id: String) -> Result<String, String> {
-    let number = extract_physical_drive_number(&id)?;
-    let path = format!(r"\\.\PhysicalDrive{}", number);
+fn sd_letter_to_number(s: &str) -> u32 {
+    let mut n = 0u32;
+    for c in s.chars() {
+        n = n * 26 + ((c as u32) - ('a' as u32) + 1);
+    }
+    n.saturating_sub(1)
+}
 
-    let smartctl = ensure_smartctl()?;
+fn physical_number_from_device(device: &str) -> Option<u32> {
+    let lower = device.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("/dev/pd") {
+        rest.trim().parse().ok()
+    } else if let Some(rest) = lower.strip_prefix("pd") {
+        rest.trim().parse().ok()
+    } else if let Some(rest) = lower.strip_prefix("/dev/sd") {
+        Some(sd_letter_to_number(rest.trim()))
+    } else if let Some(rest) = lower.strip_prefix("/dev/hd") {
+        Some(sd_letter_to_number(rest.trim()))
+    } else if let Some(rest) = lower.strip_prefix(r"\\.\physicaldrive") {
+        rest.trim().parse().ok()
+    } else {
+        None
+    }
+}
 
-    let output = Command::new(&smartctl)
-        .args(["-a", &path])
+fn parse_smartctl_scan(smartctl: &std::path::Path) -> Result<Vec<(u32, String, String)>, String> {
+    let output = Command::new(smartctl)
+        .arg("--scan")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run smartctl --scan: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("smartctl --scan failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut devices = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 || parts[1] != "-d" {
+            continue;
+        }
+        let device = parts[0].to_string();
+        let dtype = parts[2].to_string();
+        if let Some(number) = physical_number_from_device(&device) {
+            devices.push((number, device, dtype));
+        }
+    }
+    Ok(devices)
+}
+
+fn run_smartctl(smartctl: &std::path::Path, args: &[&str]) -> Result<(String, String, i32), String> {
+    let output = Command::new(smartctl)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("Failed to run smartctl: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    Ok((stdout, stderr, code))
+}
 
-    if !stdout.trim().is_empty() {
-        return Ok(stdout.to_string());
+#[tauri::command]
+fn get_drive_smart(id: String) -> Result<String, String> {
+    let number = extract_physical_drive_number(&id)?;
+    let pd_path = format!(r"/dev/pd{}", number);
+
+    let smartctl = ensure_smartctl()?;
+
+    // Prefer the device and type reported by smartctl --scan, which knows
+    // whether the drive is ATA, SAT, NVMe, SCSI, etc.
+    let scan = parse_smartctl_scan(&smartctl).unwrap_or_default();
+    if let Some((_, device, dtype)) = scan.iter().find(|(n, _, _)| *n == number) {
+        let (stdout, stderr, _code) = run_smartctl(&smartctl, &["-a", "-d", dtype, device])?;
+        if !stdout.trim().is_empty() {
+            return Ok(stdout);
+        }
+        if !stderr.trim().is_empty() {
+            return Err(format!("smartctl error: {}", stderr.trim()));
+        }
     }
 
-    if !stderr.trim().is_empty() {
-        return Err(format!("smartctl error: {}", stderr.trim()));
+    // Fallback: try common device types on the /dev/pdN alias.
+    let fallback_types = ["sat", "nvme", "ata", "scsi"];
+    let mut last_error = String::new();
+    for dtype in &fallback_types {
+        let (stdout, stderr, _code) = run_smartctl(&smartctl, &["-a", "-d", dtype, &pd_path])?;
+        if !stdout.trim().is_empty() && !stderr.contains("failed") && !stderr.contains("Open failed") {
+            return Ok(stdout);
+        }
+        if !stderr.trim().is_empty() {
+            last_error = stderr.trim().to_string();
+        }
     }
 
-    if !output.status.success() {
-        return Err(format!(
-            "smartctl exited with code {}",
-            output.status.code().unwrap_or(-1)
-        ));
+    if !last_error.is_empty() {
+        return Err(format!("smartctl error: {}", last_error));
     }
 
-    Ok("No SMART data returned.".to_string())
+    Err("No SMART data available for this drive.".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
