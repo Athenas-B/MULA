@@ -43,17 +43,24 @@ fn open_config_dir() -> Result<String, String> {
 // ── VSD Server commands ──
 
 fn get_vsd_server_path() -> Option<std::path::PathBuf> {
-    // Look for the VSD server relative to known locations
-    let candidates = vec![
-        // Sibling project in CascadeProjects
-        dirs::home_dir().map(|h| h.join("CascadeProjects").join("VSD Experiment").join("companion").join("server.py")),
-        // Config-specified path (future)
-        dirs::config_dir().map(|c| c.join("mula").join("vsd_server_path.txt")),
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+
+    let candidates: Vec<std::path::PathBuf> = vec![
+        // Development: relative to project root (exe is in src-tauri/target/debug/)
+        exe_dir.join("../../../modules/vsd/server.py"),
+        // Installed: next to the executable
+        exe_dir.join("modules/vsd/server.py"),
     ];
 
-    for candidate in candidates.into_iter().flatten() {
+    // Also check legacy location
+    let mut all_candidates = candidates;
+    if let Some(home) = dirs::home_dir() {
+        all_candidates.push(home.join("CascadeProjects").join("VSD Experiment").join("companion").join("server.py"));
+    }
+
+    for candidate in all_candidates {
         if candidate.exists() {
-            return Some(candidate);
+            return candidate.canonicalize().ok().or(Some(candidate));
         }
     }
     None
