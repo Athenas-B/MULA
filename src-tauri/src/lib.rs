@@ -446,20 +446,32 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(target_os = "windows")]
 fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
     #[derive(Deserialize, Debug)]
-    #[serde(rename_all = "PascalCase")]
     struct PsDiskDrive {
+        #[serde(rename = "DeviceID", alias = "DeviceId")]
         device_id: String,
+        #[serde(rename = "Model")]
         model: String,
+        #[serde(rename = "SerialNumber")]
         serial_number: Option<String>,
+        #[serde(rename = "Manufacturer")]
         manufacturer: Option<String>,
+        #[serde(rename = "InterfaceType")]
         interface_type: Option<String>,
+        #[serde(rename = "MediaType")]
         media_type: Option<String>,
+        #[serde(rename = "Size")]
         size: Option<u64>,
+        #[serde(rename = "Partitions")]
         partitions: Option<u32>,
+        #[serde(rename = "Status")]
         status: Option<String>,
+        #[serde(rename = "FirmwareRevision")]
         firmware_revision: Option<String>,
+        #[serde(rename = "PNPDeviceID", alias = "PnpDeviceId")]
         pnp_device_id: Option<String>,
+        #[serde(rename = "PhysicalMediaType")]
         physical_media_type: Option<u16>,
+        #[serde(rename = "PhysicalBusType")]
         physical_bus_type: Option<u16>,
     }
 

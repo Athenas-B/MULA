@@ -11,8 +11,8 @@
   <body>
     <nav class="tab-bar">
       <button class="tab active" data-tab="system">System</button>
-      <button class="tab" data-tab="drivetest">Drive Test</button>
       <button class="tab" data-tab="vsd">VSD Server</button>
+      <button class="tab" data-tab="drivetest">Drive Test</button>
     </nav>
 
     <main class="tab-content">
@@ -41,29 +41,6 @@
               <td class="value mono"><a href="#" id="app-config-path" class="config-link">...</a></td>
             </tr>
           </table>
-        </div>
-      </section>
-
-      <!-- Drive Test -->
-      <section id="tab-drivetest" class="tab-panel drivetest-panel">
-        <div class="drivetest-card">
-          <h2>Drive Test</h2>
-          <p class="drivetest-desc">Select a physical drive to view details. Drives without a letter are also listed.</p>
-          <div class="drivetest-toolbar">
-            <select id="drive-select" class="drive-select">
-              <option value="">Loading drives...</option>
-            </select>
-            <button id="drive-refresh" class="vsd-btn" title="Refresh drive list">
-              <span class="btn-text">Refresh</span>
-            </button>
-          </div>
-          <div id="drive-details" class="drive-details hidden">
-            <h3>Drive Information</h3>
-            <table class="info-table drive-info-table" id="drive-info-table">
-              <tbody></tbody>
-            </table>
-          </div>
-          <div id="drive-empty" class="drive-empty">Select a drive to see details.</div>
         </div>
       </section>
 
@@ -98,6 +75,29 @@
         </div>
         <div class="vsd-log" id="vsd-log">
           <pre id="vsd-log-content">VSD Server stopped. Press Start to begin.</pre>
+        </div>
+      </section>
+
+      <!-- Drive Test -->
+      <section id="tab-drivetest" class="tab-panel drivetest-panel">
+        <div class="drivetest-card">
+          <h2>Drive Test</h2>
+          <p class="drivetest-desc">Select a physical drive to view details. Drives without a letter are also listed.</p>
+          <div class="drivetest-toolbar">
+            <select id="drive-select" class="drive-select">
+              <option value="">Loading drives...</option>
+            </select>
+            <button id="drive-refresh" class="vsd-btn" title="Refresh drive list">
+              <span class="btn-text">Refresh</span>
+            </button>
+          </div>
+          <div id="drive-details" class="drive-details hidden">
+            <h3>Drive Information</h3>
+            <table class="info-table drive-info-table" id="drive-info-table">
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="drive-empty" class="drive-empty">Select a drive to see details.</div>
         </div>
       </section>
     </main>
