@@ -62,18 +62,30 @@ async function installExtension(browser) {
   const originalText = btn.querySelector(".btn-text").textContent;
   btn.disabled = true;
   btn.querySelector(".btn-text").textContent = "Building...";
+  clearLog();
   try {
     const extPath = await invoke("vsd_install_extension", { browser });
     btn.querySelector(".btn-text").textContent = "Done";
-    appendLog(`[Extension built: ${extPath}]\n`);
     if (browser === "chrome") {
-      appendLog(`[Go to chrome://extensions → enable Developer Mode → Load unpacked → select the opened folder]\n`);
+      appendLog(`Extension built successfully!\n\n`);
+      appendLog(`Folder opened: ${extPath}\n\n`);
+      appendLog(`To install in Chrome:\n`);
+      appendLog(`  1. Open Chrome and go to chrome://extensions\n`);
+      appendLog(`  2. Enable "Developer mode" (toggle in top-right)\n`);
+      appendLog(`  3. Click "Load unpacked"\n`);
+      appendLog(`  4. Select the folder that was just opened\n`);
     } else {
-      appendLog(`[Go to about:debugging → This Firefox → Load Temporary Add-on → select manifest.json from the opened folder]\n`);
+      appendLog(`Extension built successfully!\n\n`);
+      appendLog(`Folder opened: ${extPath}\n\n`);
+      appendLog(`To install in Firefox:\n`);
+      appendLog(`  1. Open Firefox and go to about:debugging\n`);
+      appendLog(`  2. Click "This Firefox" in the sidebar\n`);
+      appendLog(`  3. Click "Load Temporary Add-on..."\n`);
+      appendLog(`  4. Select manifest.json from the opened folder\n`);
     }
   } catch (err) {
     btn.querySelector(".btn-text").textContent = "Error";
-    appendLog(`[Extension install error: ${err}]\n`);
+    appendLog(`Extension build failed: ${err}\n`);
   } finally {
     setTimeout(() => {
       btn.querySelector(".btn-text").textContent = originalText;
