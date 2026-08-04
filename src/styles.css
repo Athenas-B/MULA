@@ -126,6 +126,16 @@ body {
   word-break: break-all;
 }
 
+.config-link {
+  color: #396cd8;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.config-link:hover {
+  text-decoration: underline;
+}
+
 /* ── Placeholder for future tabs ── */
 .placeholder {
   text-align: center;
@@ -172,5 +182,9 @@ body {
 
   .subtitle {
     color: #777;
+  }
+
+  .config-link {
+    color: #5b9aff;
   }
 }

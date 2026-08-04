@@ -1,4 +1,5 @@
 const { invoke } = window.__TAURI__.core;
+const { revealItemInDir } = window.__TAURI__.opener;
 
 // Tab switching
 function initTabs() {
@@ -29,7 +30,19 @@ async function loadAppInfo() {
   }
 }
 
+// Open config directory in file explorer
+async function openConfigDir(e) {
+  e.preventDefault();
+  try {
+    const path = await invoke("open_config_dir");
+    await revealItemInDir(path);
+  } catch (err) {
+    console.error("Failed to open config directory:", err);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   initTabs();
   loadAppInfo();
+  document.getElementById("app-config-path").addEventListener("click", openConfigDir);
 });
