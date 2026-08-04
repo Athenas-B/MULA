@@ -84,14 +84,50 @@ fn vsd_start() -> Result<(), String> {
     }
 
     let server_path = get_vsd_server_path()
-        .ok_or("Could not find VSD server.py. Expected at ~/CascadeProjects/VSD Experiment/companion/server.py")?;
+        .ok_or("Could not find VSD server.py")?;
 
     let python = get_python_command();
     let working_dir = server_path.parent().unwrap().to_path_buf();
 
-    // Clear log buffer
-    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-        logs.clear();
+    // Install dependencies if needed
+    let requirements = working_dir.join("requirements.txt");
+    if requirements.exists() {
+        if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
+            logs.clear();
+            logs.push("[Checking dependencies...]\n".to_string());
+        }
+
+        let install = Command::new(&python)
+            .args(["-m", "pip", "install", "-r"])
+            .arg(&requirements)
+            .arg("--quiet")
+            .current_dir(&working_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        match install {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
+                        logs.push(format!("[pip install failed: {}]\n", stderr.trim()));
+                    }
+                    return Err(format!("Failed to install dependencies: {}", stderr.trim()));
+                }
+                if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
+                    logs.push("[Dependencies OK]\n".to_string());
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to run pip: {e}"));
+            }
+        }
+    } else {
+        // Clear log buffer
+        if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
+            logs.clear();
+        }
     }
 
     let mut child = Command::new(&python)
