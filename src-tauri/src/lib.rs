@@ -497,7 +497,7 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             }
         }
 
-        $result | ConvertTo-Json -AsArray -Depth 3 -Compress
+        ConvertTo-Json -InputObject @($result) -Depth 3 -Compress
     "#;
 
     let output = Command::new("powershell")
