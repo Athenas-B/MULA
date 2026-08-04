@@ -689,7 +689,12 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             .unwrap_or_default();
 
         let model = d.model.trim().to_string();
-        let serial = d.serial_number.as_deref().unwrap_or("").trim().to_string();
+        let serial = d.serial_number
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('.')
+            .to_string();
         let size = d.size.unwrap_or(0);
 
         let media_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
