@@ -280,6 +280,34 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
     std::fs::write(&env_path, lines.join("\n") + "\n")
         .map_err(|e| format!("Failed to write .env: {e}"))?;
 
+    // If server is running, update it live via API
+    if vsd_is_running() {
+        let body = format!(r#"{{"path":"{}"}}"#, path.replace('\\', "\\\\").replace('"', "\\\""));
+        let _ = std::thread::spawn(move || {
+            let req = urllib_post("http://127.0.0.1:8765/config/download_dir", &body);
+            if let Err(e) = req {
+                eprintln!("Failed to update running server download dir: {e}");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn urllib_post(url: &str, body: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = "127.0.0.1:8765";
+    let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+    let request = format!(
+        "POST /config/download_dir HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).map_err(|e| e.to_string())?;
+    let _ = url; // used in format above
     Ok(())
 }
 

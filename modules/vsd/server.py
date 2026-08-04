@@ -401,6 +401,24 @@ def open_file_endpoint():
     return jsonify({"ok": True})
 
 
+@app.route("/config/download_dir", methods=["GET", "POST"])
+def config_download_dir():
+    global DOWNLOAD_DIR
+    if request.method == "GET":
+        return jsonify({"download_dir": str(DOWNLOAD_DIR)})
+
+    data = request.get_json(force=True)
+    new_dir = data.get("path")
+    if not new_dir:
+        return jsonify({"error": "Missing 'path' field"}), 400
+
+    new_path = Path(new_dir)
+    new_path.mkdir(parents=True, exist_ok=True)
+    DOWNLOAD_DIR = new_path
+    logger.info(f"Download dir changed to: {DOWNLOAD_DIR}")
+    return jsonify({"ok": True, "download_dir": str(DOWNLOAD_DIR)})
+
+
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -215,6 +215,12 @@ body {
   border-radius: 1px;
 }
 
+.toolbar-label {
+  font-size: 0.8rem;
+  color: #888;
+  margin-left: 8px;
+}
+
 .vsd-btn {
   display: flex;
   align-items: center;
