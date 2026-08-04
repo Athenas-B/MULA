@@ -109,14 +109,21 @@ async function toggleVsd() {
       stopLogPolling();
       appendLog("\n[Server stopped]");
     } else {
-      await invoke("vsd_start");
+      // Update UI immediately before the async start
       updateVsdUi(true);
       clearLog();
-      appendLog("[Server starting...]\n");
+      appendLog("[Starting server...]\n");
       startLogPolling();
+
+      await invoke("vsd_start");
     }
   } catch (err) {
     appendLog(`[Error] ${err}\n`);
+    // Revert UI if start failed
+    if (!vsdRunning) {
+      updateVsdUi(false);
+      stopLogPolling();
+    }
   } finally {
     toggleBtn.disabled = false;
   }
