@@ -76,12 +76,13 @@ fn get_python_command() -> String {
 }
 
 #[tauri::command]
-fn vsd_start() -> Result<(), String> {
-    let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
+async fn vsd_start() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
 
-    if proc_guard.is_some() {
-        return Err("VSD Server is already running".to_string());
-    }
+        if proc_guard.is_some() {
+            return Err("VSD Server is already running".to_string());
+        }
 
     let server_path = get_vsd_server_path()
         .ok_or("Could not find VSD server.py")?;
@@ -176,25 +177,31 @@ fn vsd_start() -> Result<(), String> {
         });
     }
 
-    *proc_guard = Some(child);
-    Ok(())
+        *proc_guard = Some(child);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[tauri::command]
-fn vsd_stop() -> Result<(), String> {
+async fn vsd_stop() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
     let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
 
-    if let Some(mut child) = proc_guard.take() {
-        child.kill().map_err(|e| format!("Failed to stop VSD server: {e}"))?;
-        let _ = child.wait();
-        Ok(())
-    } else {
-        Err("VSD Server is not running".to_string())
-    }
+        if let Some(mut child) = proc_guard.take() {
+            child.kill().map_err(|e| format!("Failed to stop VSD server: {e}"))?;
+            let _ = child.wait();
+            Ok(())
+        } else {
+            Err("VSD Server is not running".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
-#[tauri::command]
-fn vsd_is_running() -> bool {
+fn vsd_is_running_sync() -> bool {
     if let Ok(mut proc_guard) = VSD_PROCESS.lock() {
         if let Some(child) = proc_guard.as_mut() {
             // Check if process is still alive
@@ -212,6 +219,13 @@ fn vsd_is_running() -> bool {
     } else {
         false
     }
+}
+
+#[tauri::command]
+async fn vsd_is_running() -> bool {
+    tauri::async_runtime::spawn_blocking(vsd_is_running_sync)
+        .await
+        .unwrap_or(false)
 }
 
 /// Returns new log lines since last call (drains the buffer)
@@ -298,7 +312,7 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
     write_vsd_config_value("VSD_DOWNLOAD_DIR", &path)?;
 
     // If server is running, update it live via API
-    if vsd_is_running() {
+    if vsd_is_running_sync() {
         let body = format!(r#"{{"path":"{}"}}"#, path.replace('\\', "\\\\").replace('"', "\\\""));
         let _ = std::thread::spawn(move || {
             let req = urllib_post("http://127.0.0.1:8765/config/download_dir", &body);
@@ -355,7 +369,8 @@ fn get_extension_build_script() -> Option<std::path::PathBuf> {
 }
 
 #[tauri::command]
-fn vsd_install_extension(browser: String) -> Result<String, String> {
+async fn vsd_install_extension(browser: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
     let build_script = get_extension_build_script()
         .ok_or("Could not find extension build script")?;
 
@@ -392,6 +407,9 @@ fn vsd_install_extension(browser: String) -> Result<String, String> {
     }
 
     Ok(ext_dir.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 // ── Drive Test commands ──
@@ -821,16 +839,22 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
 }
 
 #[tauri::command]
-fn list_physical_drives() -> Result<Vec<DriveInfo>, String> {
-    list_physical_drives_impl()
+async fn list_physical_drives() -> Result<Vec<DriveInfo>, String> {
+    tauri::async_runtime::spawn_blocking(list_physical_drives_impl)
+        .await
+        .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[tauri::command]
-fn get_drive_details(id: String) -> Result<DriveInfo, String> {
-    let drives = list_physical_drives_impl()?;
-    drives.into_iter()
-        .find(|d| d.id == id || d.device_id == id)
-        .ok_or_else(|| format!("Drive not found: {id}"))
+async fn get_drive_details(id: String) -> Result<DriveInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let drives = list_physical_drives_impl()?;
+        drives.into_iter()
+            .find(|d| d.id == id || d.device_id == id)
+            .ok_or_else(|| format!("Drive not found: {id}"))
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 fn extract_physical_drive_number(id: &str) -> Result<u32, String> {
@@ -1022,19 +1046,20 @@ fn normalize_serial(s: &str) -> String {
 }
 
 #[tauri::command]
-fn get_drive_smart(id: String) -> Result<String, String> {
-    let number = extract_physical_drive_number(&id)?;
-    let pd_path = format!(r"/dev/pd{}", number);
+async fn get_drive_smart(id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let number = extract_physical_drive_number(&id)?;
+        let pd_path = format!(r"/dev/pd{}", number);
 
-    let smartctl = ensure_smartctl()?;
+        let smartctl = ensure_smartctl()?;
 
-    // Look up the drive we already enumerated so we can match by serial.
-    let drives = list_physical_drives_impl()?;
-    let drive = drives
-        .into_iter()
-        .find(|d| d.id == id || d.device_id == id)
-        .ok_or_else(|| format!("Drive not found: {id}"))?;
-    let expected_serial = normalize_serial(&drive.serial);
+        // Look up the drive we already enumerated so we can match by serial.
+        let drives = list_physical_drives_impl()?;
+        let drive = drives
+            .into_iter()
+            .find(|d| d.id == id || d.device_id == id)
+            .ok_or_else(|| format!("Drive not found: {id}"))?;
+        let expected_serial = normalize_serial(&drive.serial);
 
     // Prefer the device and type reported by smartctl --scan, but verify the
     // serial before trusting the mapping.
@@ -1086,7 +1111,10 @@ fn get_drive_smart(id: String) -> Result<String, String> {
         return Err(format!("smartctl error: {}", last_error));
     }
 
-    Err("No SMART data available for this drive.".to_string())
+        Err("No SMART data available for this drive.".to_string())
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
