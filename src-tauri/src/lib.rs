@@ -418,6 +418,8 @@ pub struct DriveInfo {
     mount_points: Vec<String>,
     health_status: String,
     connection_speed: String,
+    smart_capable: String,
+    trim_capable: String,
 }
 
 fn parse_vendor_from_pnp(pnp: &str) -> Option<String> {
@@ -614,6 +616,10 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         mount_points: Option<serde_json::Value>,
         #[serde(rename = "ConnectionSpeed")]
         connection_speed: Option<u64>,
+        #[serde(rename = "SmartCapable")]
+        smart_capable: Option<String>,
+        #[serde(rename = "TrimCapable")]
+        trim_capable: Option<String>,
     }
 
     let script = r#"
@@ -709,6 +715,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
                 DriveLetters = if ($vol -and $vol.Letters.Count -gt 0) { @($vol.Letters) } else { $null }
                 MountPoints = if ($vol -and $vol.Mounts.Count -gt 0) { @($vol.Mounts) } else { $null }
                 ConnectionSpeed = if ($d.PNPDeviceID -and $speeds[$d.PNPDeviceID]) { $speeds[$d.PNPDeviceID] } else { $null }
+                SmartCapable = if (@('NVMe','SATA','SAS','SCSI','IDE','ATA','SATA','PCIe') -contains $finalBusType) { 'Yes' } else { 'Unknown' }
+                TrimCapable = if ($finalMediaType -eq 'SSD' -and @('NVMe','SATA','SAS','SCSI','IDE','ATA','PCIe') -contains $finalBusType) { 'Yes' } elseif ($finalMediaType -eq 'HDD') { 'No' } else { 'Unknown' }
             }
         }
 
@@ -799,6 +807,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             mount_points: value_to_strings(d.mount_points),
             health_status: d.health_status.unwrap_or_default(),
             connection_speed: connection_speed_text,
+            smart_capable: d.smart_capable.as_deref().unwrap_or("Unknown").to_string(),
+            trim_capable: d.trim_capable.as_deref().unwrap_or("Unknown").to_string(),
         });
     }
 

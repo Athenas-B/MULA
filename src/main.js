@@ -421,6 +421,8 @@ function onDriveSelect() {
     ["Drive letters", fmtList(drive.drive_letters)],
     ["Mount points", fmtList(drive.mount_points)],
     ["Health", drive.health_status || "N/A"],
+    ["SMART capable", drive.smart_capable || "Unknown"],
+    ["TRIM capable", drive.trim_capable || "Unknown"],
     ["Status", drive.status],
     ["Firmware", drive.firmware || "N/A"],
     ["PNP ID", drive.pnp_device_id || "N/A"],
