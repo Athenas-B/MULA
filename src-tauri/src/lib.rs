@@ -1003,6 +1003,24 @@ fn run_smartctl(smartctl: &std::path::Path, args: &[&str]) -> Result<(String, St
     Ok((stdout, stderr, code))
 }
 
+fn parse_smartctl_serial(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let lower = line.to_lowercase();
+        if let Some(idx) = lower.find("serial number") {
+            let after = &line[idx + "serial number".len()..];
+            let after = after.trim_start_matches(':').trim();
+            if !after.is_empty() && after != "[no information found]" && after != "unknown" {
+                return Some(after.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_serial(s: &str) -> String {
+    s.to_lowercase().trim().trim_end_matches('.').replace(' ', "")
+}
+
 #[tauri::command]
 fn get_drive_smart(id: String) -> Result<String, String> {
     let number = extract_physical_drive_number(&id)?;
@@ -1010,11 +1028,39 @@ fn get_drive_smart(id: String) -> Result<String, String> {
 
     let smartctl = ensure_smartctl()?;
 
-    // Prefer the device and type reported by smartctl --scan, which knows
-    // whether the drive is ATA, SAT, NVMe, SCSI, etc.
+    // Look up the drive we already enumerated so we can match by serial.
+    let drives = list_physical_drives_impl()?;
+    let drive = drives
+        .into_iter()
+        .find(|d| d.id == id || d.device_id == id)
+        .ok_or_else(|| format!("Drive not found: {id}"))?;
+    let expected_serial = normalize_serial(&drive.serial);
+
+    // Prefer the device and type reported by smartctl --scan, but verify the
+    // serial before trusting the mapping.
     let scan = parse_smartctl_scan(&smartctl).unwrap_or_default();
-    if let Some((_, device, dtype)) = scan.iter().find(|(n, _, _)| *n == number) {
-        let (stdout, stderr, _code) = run_smartctl(&smartctl, &["-a", "-d", dtype, device])?;
+    let mut matched: Option<(String, String)> = None;
+
+    for (_n, device, dtype) in &scan {
+        let (info, _err, _code) = run_smartctl(&smartctl, &["-i", "-d", dtype, device])?;
+        if let Some(sn) = parse_smartctl_serial(&info) {
+            if normalize_serial(&sn) == expected_serial {
+                matched = Some((device.clone(), dtype.clone()));
+                break;
+            }
+        }
+    }
+
+    // If no serial match, fall back to the scan entry with the same
+    // physical number, then to brute-force device types on /dev/pdN.
+    if matched.is_none() {
+        if let Some((_, device, dtype)) = scan.iter().find(|(n, _, _)| *n == number) {
+            matched = Some((device.clone(), dtype.clone()));
+        }
+    }
+
+    if let Some((device, dtype)) = matched {
+        let (stdout, stderr, _code) = run_smartctl(&smartctl, &["-a", "-d", &dtype, &device])?;
         if !stdout.trim().is_empty() {
             return Ok(stdout);
         }
