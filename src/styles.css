@@ -57,8 +57,10 @@ body {
 /* ── Tab content ── */
 .tab-content {
   flex: 1;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 24px;
+  display: flex;
+  flex-direction: column;
 }
 
 .tab-panel {
@@ -67,6 +69,11 @@ body {
 
 .tab-panel.active {
   display: block;
+  overflow-y: auto;
+}
+
+.tab-panel.vsd-panel.active {
+  display: flex;
 }
 
 /* ── About card ── */
@@ -137,15 +144,95 @@ body {
   text-decoration: underline;
 }
 
-/* ── Placeholder for future tabs ── */
-.placeholder {
-  text-align: center;
-  padding-top: 80px;
-  color: #999;
+/* ── VSD Server tab ── */
+.vsd-panel {
+  display: none;
+  flex-direction: column;
+  height: 100%;
 }
 
-.placeholder h2 {
-  margin-bottom: 8px;
+.vsd-panel.active {
+  display: flex;
+}
+
+.vsd-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #e0e0e0;
+  flex-shrink: 0;
+}
+
+.vsd-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+
+.vsd-toggle.stopped {
+  background: #22c55e;
+  color: #fff;
+}
+
+.vsd-toggle.stopped:hover {
+  background: #16a34a;
+}
+
+.vsd-toggle.running {
+  background: #ef4444;
+  color: #fff;
+}
+
+.vsd-toggle.running:hover {
+  background: #dc2626;
+}
+
+.toggle-icon::before {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+}
+
+.vsd-toggle.stopped .toggle-icon::before {
+  border-left: 8px solid #fff;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+}
+
+.vsd-toggle.running .toggle-icon::before {
+  width: 8px;
+  height: 10px;
+  background: #fff;
+  border-radius: 1px;
+}
+
+.vsd-log {
+  flex: 1;
+  margin-top: 12px;
+  background: #1a1a1a;
+  border-radius: 8px;
+  padding: 12px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.vsd-log pre {
+  margin: 0;
+  font-family: "Cascadia Code", "Fira Code", monospace;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* ── Dark mode ── */
@@ -187,5 +274,9 @@ body {
 
   .config-link {
     color: #5b9aff;
+  }
+
+  .vsd-toolbar {
+    border-bottom-color: #3a3a3a;
   }
 }

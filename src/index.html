@@ -43,11 +43,16 @@
         </div>
       </section>
 
-      <!-- VSD Server (placeholder) -->
-      <section id="tab-vsd" class="tab-panel">
-        <div class="placeholder">
-          <h2>VSD Server</h2>
-          <p>Coming soon.</p>
+      <!-- VSD Server -->
+      <section id="tab-vsd" class="tab-panel vsd-panel">
+        <div class="vsd-toolbar">
+          <button id="vsd-toggle" class="vsd-toggle stopped" title="Start VSD Server">
+            <span class="toggle-icon"></span>
+            <span class="toggle-label">Start</span>
+          </button>
+        </div>
+        <div class="vsd-log" id="vsd-log">
+          <pre id="vsd-log-content">VSD Server stopped. Press Start to begin.</pre>
         </div>
       </section>
     </main>
