@@ -354,7 +354,8 @@ async function loadDrives() {
     for (const d of cachedDrives) {
       const opt = document.createElement("option");
       opt.value = d.id;
-      opt.textContent = `${d.model} (${d.size_text})`;
+      const letters = d.drive_letters?.length ? ` [${d.drive_letters.join(" ")}]` : "";
+      opt.textContent = `${d.model} (${d.size_text})${letters}`;
       select.appendChild(opt);
     }
 
@@ -394,17 +395,22 @@ function onDriveSelect() {
     return;
   }
 
+  const fmtList = (arr) => (arr?.length ? arr.join(", ") : "None");
+
   const fields = [
     ["Device", drive.device_id],
     ["Vendor", drive.vendor],
     ["Model", drive.model],
     ["Serial", drive.serial || "N/A"],
     ["Type", drive.type],
-    ["Media type", drive.media_type],
     ["Bus", drive.bus_type],
+    ["Media type", drive.media_type],
     ["Interface", drive.interface_type],
     ["Size", `${drive.size_text} (${drive.size.toLocaleString()} bytes)`],
     ["Partitions", drive.partitions.toString()],
+    ["Drive letters", fmtList(drive.drive_letters)],
+    ["Mount points", fmtList(drive.mount_points)],
+    ["Health", drive.health_status || "N/A"],
     ["Status", drive.status],
     ["Firmware", drive.firmware || "N/A"],
     ["PNP ID", drive.pnp_device_id || "N/A"],

@@ -414,6 +414,9 @@ pub struct DriveInfo {
     firmware: String,
     pnp_device_id: String,
     device_id: String,
+    drive_letters: Vec<String>,
+    mount_points: Vec<String>,
+    health_status: String,
 }
 
 fn parse_vendor_from_pnp(pnp: &str) -> Option<String> {
@@ -427,6 +430,91 @@ fn parse_vendor_from_pnp(pnp: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn is_real_vendor(v: &str) -> bool {
+    let v = v.trim().to_uppercase();
+    if v.is_empty() {
+        return false;
+    }
+    const NON_VENDORS: &[&str] = &[
+        "NVME", "SCSI", "IDE", "SATA", "SAS", "USB", "RAID", "STORAGE",
+        "MICROSOFT", "VBOX", "VMWARE", "QEMU", "HYPER", "VIRTUAL", "GENERIC",
+        "INTEL RST", "AMD", "MARVELL", "LSI", "ADAPTEC", "BROADCOM",
+    ];
+    !NON_VENDORS.contains(&v.as_str())
+}
+
+fn guess_vendor_from_model(model: &str) -> Option<String> {
+    if model.is_empty() {
+        return None;
+    }
+    let first_token = model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("")
+        .to_uppercase();
+    let prefix: String = first_token.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+
+    // Exact full-token matches
+    let exact_vendor = match first_token.as_str() {
+        "SAMSUNG" => "Samsung",
+        "INTEL" => "Intel",
+        "TOSHIBA" => "Toshiba",
+        "SANDISK" => "SanDisk",
+        "KINGSTON" => "Kingston",
+        "MICRON" => "Micron",
+        "CRUCIAL" => "Crucial",
+        "SEAGATE" => "Seagate",
+        "MAXTOR" => "Maxtor",
+        "HITACHI" => "Hitachi",
+        "HGST" => "HGST",
+        "ADATA" => "ADATA",
+        "CORSAIR" => "Corsair",
+        "TRANSCEND" => "Transcend",
+        "LEXAR" => "Lexar",
+        "APACER" => "Apacer",
+        "KIOXIA" => "Kioxia",
+        "SABRENT" => "Sabrent",
+        "TEAM" => "Team",
+        "ASU" => "ADATA",
+        "XPG" => "ADATA",
+        "SP" => "Silicon Power",
+        "TS" => "Transcend",
+        "CSSD" => "Corsair",
+        "WDS" => "Western Digital",
+        "T253" => "Team",
+        "NM" => "Lexar",
+        _ => "",
+    };
+    if !exact_vendor.is_empty() {
+        return Some(exact_vendor.to_string());
+    }
+
+    // Prefix matches
+    let vendor = match prefix.as_str() {
+        "ST" | "STX" => "Seagate",
+        "WD" | "WDC" => "Western Digital",
+        "SK" | "SKHYNIX" | "HFS" | "HFM" => "SK hynix",
+        "PNY" | "CS" => "PNY",
+        "SSDPE" => "Intel",
+        "CT" => "Crucial",
+        "THNS" | "KXG" | "XQ" => "Toshiba",
+        "SD" | "SDSS" => "SanDisk",
+        "SA400" | "KC" | "SUV" | "SH" | "SKC" => "Kingston",
+        "MTFD" | "MT" => "Micron",
+        "HTS" | "HUA" => "Hitachi",
+        "HUS" | "HUH" | "HM" => "HGST",
+        "SU" | "ASU" | "XPG" => "ADATA",
+        "SP" | "SPCC" => "Silicon Power",
+        "TS" => "Transcend",
+        "CSSD" => "Corsair",
+        "WDS" => "Western Digital",
+        "T253" => "Team",
+        "NM" | "NQ" | "NS" => "Lexar",
+        _ => return None,
+    };
+    Some(vendor.to_string())
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -470,46 +558,100 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         #[serde(rename = "PNPDeviceID", alias = "PnpDeviceId")]
         pnp_device_id: Option<String>,
         #[serde(rename = "PhysicalMediaType")]
-        physical_media_type: Option<u16>,
+        physical_media_type: Option<String>,
         #[serde(rename = "PhysicalBusType")]
-        physical_bus_type: Option<u16>,
+        physical_bus_type: Option<String>,
+        #[serde(rename = "HealthStatus")]
+        health_status: Option<String>,
+        #[serde(rename = "DriveLetters")]
+        drive_letters: Option<Vec<String>>,
+        #[serde(rename = "MountPoints")]
+        mount_points: Option<Vec<String>>,
     }
 
     let script = r#"
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $OutputEncoding = [System.Text.Encoding]::UTF8
+        Import-Module Storage -ErrorAction SilentlyContinue
+
         $physical = @{}
         try {
-            Get-PhysicalDisk | ForEach-Object {
-                $physical[[int]$_.Number] = @{ MediaType = [int]$_.MediaType; BusType = [int]$_.BusType }
+            Get-PhysicalDisk -ErrorAction SilentlyContinue | ForEach-Object {
+                $physical[[string]$_.DeviceId] = @{
+                    Model = $_.Model
+                    SerialNumber = $_.SerialNumber
+                    Manufacturer = $_.Manufacturer
+                    MediaType = $_.MediaType
+                    BusType = $_.BusType
+                    FirmwareVersion = $_.FirmwareVersion
+                    HealthStatus = $_.HealthStatus
+                }
             }
         } catch {}
 
-        $disks = Get-CimInstance -ClassName Win32_DiskDrive |
+        $volumes = @{}
+        try {
+            Get-Partition -ErrorAction SilentlyContinue | ForEach-Object {
+                $diskNum = [string]$_.DiskNumber
+                if ($diskNum -eq $null) { continue }
+                if (-not $volumes[$diskNum]) { $volumes[$diskNum] = @{ Letters = @(); Mounts = @() } }
+
+                if ($_.DriveLetter) {
+                    $letter = ($_.DriveLetter.ToString() + ':')
+                    if (-not $volumes[$diskNum].Letters.Contains($letter)) { $volumes[$diskNum].Letters += $letter }
+                }
+
+                if ($_.AccessPaths) {
+                    foreach ($ap in $_.AccessPaths) {
+                        if ($ap -match '^([A-Za-z]):\\$') {
+                            $letter = ($matches[1] + ':')
+                            if (-not $volumes[$diskNum].Letters.Contains($letter)) { $volumes[$diskNum].Letters += $letter }
+                        } elseif ($ap -and -not $ap.StartsWith('\\?\Volume')) {
+                            $volumes[$diskNum].Mounts += $ap
+                        }
+                    }
+                }
+            }
+        } catch {}
+
+        $disks = Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction SilentlyContinue |
             Select-Object DeviceID, Model, SerialNumber, Manufacturer, InterfaceType, MediaType, Size, Partitions, Status, FirmwareRevision, PNPDeviceID, Index
 
         $result = foreach ($d in $disks) {
             $ph = $null
-            if ($d.Index -ne $null) {
-                $ph = $physical[[int]$d.Index]
-            }
+            if ($d.Index -ne $null) { $ph = $physical[[string]$d.Index] }
+            $vol = $null
+            if ($d.Index -ne $null) { $vol = $volumes[[string]$d.Index] }
+
+            $finalModel = if ($ph -and $ph.Model) { $ph.Model } else { $d.Model }
+            $finalSerial = if ($ph -and $ph.SerialNumber) { $ph.SerialNumber } else { $d.SerialNumber }
+            $finalFirmware = if ($ph -and $ph.FirmwareVersion) { $ph.FirmwareVersion } else { $d.FirmwareRevision }
+            $finalMediaType = if ($ph -and $ph.MediaType) { $ph.MediaType } else { $d.MediaType }
+            $finalBusType = if ($ph -and $ph.BusType) { $ph.BusType } else { $d.InterfaceType }
+            $finalHealth = if ($ph -and $ph.HealthStatus) { $ph.HealthStatus } else { $null }
+
             [PSCustomObject]@{
                 DeviceID = $d.DeviceID
-                Model = $d.Model
-                SerialNumber = $d.SerialNumber
-                Manufacturer = $d.Manufacturer
+                Model = $finalModel
+                SerialNumber = $finalSerial
+                Manufacturer = if ($ph -and $ph.Manufacturer) { $ph.Manufacturer } else { $d.Manufacturer }
                 InterfaceType = $d.InterfaceType
                 MediaType = $d.MediaType
                 Size = [uint64]$d.Size
                 Partitions = [uint32]$d.Partitions
                 Status = $d.Status
-                FirmwareRevision = $d.FirmwareRevision
+                FirmwareRevision = $finalFirmware
                 PNPDeviceID = $d.PNPDeviceID
-                Index = [uint32]$d.Index
-                PhysicalMediaType = if ($ph) { $ph.MediaType } else { $null }
-                PhysicalBusType = if ($ph) { $ph.BusType } else { $null }
+                PhysicalMediaType = $finalMediaType
+                PhysicalBusType = $finalBusType
+                HealthStatus = $finalHealth
+                DriveLetters = if ($vol -and $vol.Letters.Count -gt 0) { $vol.Letters } else { $null }
+                MountPoints = if ($vol -and $vol.Mounts.Count -gt 0) { $vol.Mounts } else { $null }
             }
         }
 
-        ConvertTo-Json -InputObject @($result) -Depth 3 -Compress
+        $json = ConvertTo-Json -InputObject @($result) -Depth 3 -Compress
+        Write-Output $json
     "#;
 
     let output = Command::new("powershell")
@@ -531,47 +673,28 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
     let mut result = Vec::new();
     for d in drives {
         let pnp = d.pnp_device_id.as_deref().unwrap_or("");
-        let vendor = parse_vendor_from_pnp(pnp)
-            .or_else(|| d.manufacturer.as_ref().map(|m| m.trim().to_string()))
+        let pnp_vendor = parse_vendor_from_pnp(pnp).filter(|v| is_real_vendor(v));
+        let manufacturer = d.manufacturer.as_ref().and_then(|m| {
+            let trimmed = m.trim();
+            if trimmed.is_empty() || trimmed.starts_with('(') || trimmed.to_lowercase().contains("standard") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let vendor = guess_vendor_from_model(&d.model)
+            .or(pnp_vendor)
+            .or(manufacturer)
             .unwrap_or_default();
 
         let model = d.model.trim().to_string();
         let serial = d.serial_number.as_deref().unwrap_or("").trim().to_string();
         let size = d.size.unwrap_or(0);
 
-        let (media_type, bus_type, drive_type) = if let (Some(mt), Some(bt)) = (d.physical_media_type, d.physical_bus_type) {
-            let type_str = match mt {
-                1 => "HDD",
-                2 => "SSD",
-                3 => "SCM",
-                5 => "SSHD",
-                _ => "Unknown",
-            };
-            let bus = match bt {
-                1 => "SCSI",
-                2 => "ATA",
-                3 => "ATAPI",
-                4 => "ATA",
-                6 => "USB",
-                7 => "RAID",
-                8 => "IDE",
-                9 => "SAS",
-                10 => "SATA",
-                11 => "SD",
-                12 => "MMC",
-                13 => "NVMe",
-                14 => "FC",
-                15 => "ISCSI",
-                16 => "SAS",
-                17 => "PCIe",
-                _ => "Unknown",
-            };
-            (type_str.to_string(), bus.to_string(), type_str.to_string())
-        } else {
-            let media = d.media_type.as_deref().unwrap_or("Unknown").to_string();
-            let bus = d.interface_type.as_deref().unwrap_or("Unknown").to_string();
-            (media.clone(), bus, media)
-        };
+        let media_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
+        let bus_type = d.physical_bus_type.as_deref().or(d.interface_type.as_deref()).unwrap_or("Unknown").trim().to_string();
+        let drive_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
 
         result.push(DriveInfo {
             id: d.device_id.clone(),
@@ -589,6 +712,9 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             status: d.status.as_deref().unwrap_or("Unknown").to_string(),
             firmware: d.firmware_revision.as_deref().unwrap_or("").to_string(),
             pnp_device_id: pnp.to_string(),
+            drive_letters: d.drive_letters.unwrap_or_default(),
+            mount_points: d.mount_points.unwrap_or_default(),
+            health_status: d.health_status.unwrap_or_default(),
         });
     }
 
