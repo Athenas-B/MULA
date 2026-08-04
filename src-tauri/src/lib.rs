@@ -5,7 +5,6 @@ use std::sync::Mutex;
 
 static VSD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static VSD_LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static VSD_DEPS_INSTALLED: Mutex<bool> = Mutex::new(false);
 
 #[derive(Serialize)]
 pub struct AppInfo {
