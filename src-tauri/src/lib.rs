@@ -850,23 +850,104 @@ fn extract_physical_drive_number(id: &str) -> Result<u32, String> {
         .map_err(|_| format!("Could not parse drive number from: {id}"))
 }
 
+fn find_smartctl() -> Option<std::path::PathBuf> {
+    let known_paths = [
+        r"C:\Program Files\smartmontools\bin\smartctl.exe",
+        r"C:\Program Files (x86)\smartmontools\bin\smartctl.exe",
+    ];
+    for p in &known_paths {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    // Try PATH
+    if Command::new("smartctl").arg("--version").output().is_ok() {
+        return Some(std::path::PathBuf::from("smartctl"));
+    }
+    None
+}
+
+fn find_winget() -> Option<std::path::PathBuf> {
+    if let Ok(output) = Command::new("where").arg("winget").output() {
+        let out = String::from_utf8_lossy(&output.stdout);
+        let first = out.lines().next().map(|s| s.trim().to_string());
+        if let Some(p) = first {
+            if !p.is_empty() && std::path::Path::new(&p).exists() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        }
+    }
+    // Try a direct winget invocation
+    if Command::new("winget").arg("--version").output().is_ok() {
+        return Some(std::path::PathBuf::from("winget"));
+    }
+    None
+}
+
+fn install_smartctl() -> Result<std::path::PathBuf, String> {
+    if cfg!(not(target_os = "windows")) {
+        return Err("smartctl not found. Please install smartmontools using your package manager.".to_string());
+    }
+
+    let winget = find_winget().ok_or("winget not found. Please install smartmontools manually from https://www.smartmontools.org/")?;
+
+    let output = Command::new(&winget)
+        .args([
+            "install",
+            "--id", "smartmontools.smartmontools",
+            "-e",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+            "--disable-interactivity",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run winget: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "winget install failed.\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    find_smartctl().ok_or_else(|| "smartmontools was installed but smartctl could not be found. Restart MULA or add C:\\Program Files\\smartmontools\\bin to PATH.".to_string())
+}
+
+fn ensure_smartctl() -> Result<std::path::PathBuf, String> {
+    static SMARTCTL_PATH: std::sync::Mutex<Option<Result<std::path::PathBuf, String>>> = std::sync::Mutex::new(None);
+
+    let mut guard = SMARTCTL_PATH.lock().map_err(|e| e.to_string())?;
+    if let Some(result) = guard.as_ref() {
+        return result.clone();
+    }
+
+    let result = find_smartctl()
+        .map(Ok)
+        .unwrap_or_else(|| install_smartctl())
+        .clone();
+    *guard = Some(result.clone());
+    result
+}
+
 #[tauri::command]
 fn get_drive_smart(id: String) -> Result<String, String> {
     let number = extract_physical_drive_number(&id)?;
     let path = format!(r"\\.\PhysicalDrive{}", number);
 
-    let output = Command::new("smartctl")
+    let smartctl = ensure_smartctl()?;
+
+    let output = Command::new(&smartctl)
         .args(["-a", &path])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "smartctl not found. Please install smartmontools and add it to PATH.".to_string()
-            } else {
-                format!("Failed to run smartctl: {e}")
-            }
-        })?;
+        .map_err(|e| format!("Failed to run smartctl: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
