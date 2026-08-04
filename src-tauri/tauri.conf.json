@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MULA",
-  "version": "1.0.0",
   "identifier": "com.athenas-b.mula",
   "build": {
     "frontendDist": "../src"
