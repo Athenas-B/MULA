@@ -404,6 +404,13 @@ def open_file_endpoint():
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Suppress Flask/Werkzeug dev server banner ("Press CTRL+C to quit", etc.)
+    import click
+    def _no_echo(*args, **kwargs):
+        pass
+    click.echo = _no_echo
+    click.secho = _no_echo
+
     logger.info(f"VSD Server starting on http://{SERVER_HOST}:{SERVER_PORT}")
     logger.info(f"Download dir: {DOWNLOAD_DIR}")
     logger.info(f"ffmpeg: {FFMPEG_PATH}")
