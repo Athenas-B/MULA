@@ -317,10 +317,19 @@ let cachedDrives = [];
 async function initDriveTest() {
   const select = document.getElementById("drive-select");
   const refreshBtn = document.getElementById("drive-refresh");
+  const toggle = document.getElementById("drive-toggle");
+  const content = document.getElementById("drive-info-content");
   if (!select || !refreshBtn) return;
 
   select.addEventListener("change", onDriveSelect);
   refreshBtn.addEventListener("click", loadDrives);
+  if (toggle && content) {
+    toggle.addEventListener("click", () => {
+      const collapsed = content.classList.toggle("collapsed");
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+      toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
+    });
+  }
   await loadDrives();
 }
 

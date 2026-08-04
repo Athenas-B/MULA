@@ -91,11 +91,16 @@
               <span class="btn-text">Refresh</span>
             </button>
           </div>
-          <div id="drive-details" class="drive-details hidden">
-            <h3>Drive Information</h3>
-            <table class="info-table drive-info-table" id="drive-info-table">
-              <tbody></tbody>
-            </table>
+          <div id="drive-details" class="drive-details">
+            <button id="drive-toggle" class="drive-toggle" aria-expanded="true">
+              <span class="toggle-icon">-</span>
+              <span class="toggle-text">Drive Information</span>
+            </button>
+            <div class="drive-info-content" id="drive-info-content">
+              <table class="info-table drive-info-table" id="drive-info-table">
+                <tbody></tbody>
+              </table>
+            </div>
           </div>
           <div id="drive-empty" class="drive-empty">Select a drive to see details.</div>
         </div>
