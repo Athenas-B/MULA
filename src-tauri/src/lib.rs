@@ -225,44 +225,29 @@ fn vsd_get_logs() -> Vec<String> {
     }
 }
 
-/// Get the MULA config directory (e.g. C:\Users\<user>\AppData\Roaming\mula)
-fn get_config_dir() -> std::path::PathBuf {
-    dirs::config_dir()
-        .map(|p| p.join("mula"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
-/// Get the config file path for the VSD module settings
-fn get_vsd_config_path() -> std::path::PathBuf {
-    get_config_dir().join("vsd.conf")
-}
-
-#[tauri::command]
-fn vsd_get_download_dir() -> String {
-    let config_path = get_vsd_config_path();
+/// Read a key from vsd.conf
+fn read_vsd_config_value(key: &str) -> Option<String> {
+    let config_path = get_config_dir().join("vsd.conf");
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
+            let prefix = format!("{key}=");
             for line in content.lines() {
-                if let Some(val) = line.strip_prefix("VSD_DOWNLOAD_DIR=") {
-                    return val.trim().to_string();
+                if let Some(val) = line.strip_prefix(&prefix) {
+                    return Some(val.trim().to_string());
                 }
             }
         }
     }
-
-    dirs::home_dir()
-        .map(|h| h.join("Downloads").join("VSD").to_string_lossy().to_string())
-        .unwrap_or_default()
+    None
 }
 
-#[tauri::command]
-fn vsd_set_download_dir(path: String) -> Result<(), String> {
-    let config_path = get_vsd_config_path();
+/// Write a key=value to vsd.conf (update if exists, append if not)
+fn write_vsd_config_value(key: &str, value: &str) -> Result<(), String> {
+    let config_path = get_config_dir().join("vsd.conf");
     let config_dir = config_path.parent().unwrap();
     std::fs::create_dir_all(config_dir)
         .map_err(|e| format!("Failed to create config dir: {e}"))?;
 
-    // Read existing config or start fresh
     let mut lines: Vec<String> = if config_path.exists() {
         std::fs::read_to_string(&config_path)
             .unwrap_or_default()
@@ -273,11 +258,11 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
         vec![]
     };
 
-    // Update or add the VSD_DOWNLOAD_DIR line
-    let new_line = format!("VSD_DOWNLOAD_DIR={path}");
+    let new_line = format!("{key}={value}");
+    let prefix = format!("{key}=");
     let mut found = false;
     for line in lines.iter_mut() {
-        if line.starts_with("VSD_DOWNLOAD_DIR=") {
+        if line.starts_with(&prefix) {
             *line = new_line.clone();
             found = true;
             break;
@@ -289,6 +274,28 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
 
     std::fs::write(&config_path, lines.join("\n") + "\n")
         .map_err(|e| format!("Failed to write config: {e}"))?;
+    Ok(())
+}
+
+/// Get the MULA config directory (e.g. C:\Users\<user>\AppData\Roaming\mula)
+fn get_config_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("mula"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+#[tauri::command]
+fn vsd_get_download_dir() -> String {
+    read_vsd_config_value("VSD_DOWNLOAD_DIR").unwrap_or_else(|| {
+        dirs::home_dir()
+            .map(|h| h.join("Downloads").join("VSD").to_string_lossy().to_string())
+            .unwrap_or_default()
+    })
+}
+
+#[tauri::command]
+fn vsd_set_download_dir(path: String) -> Result<(), String> {
+    write_vsd_config_value("VSD_DOWNLOAD_DIR", &path)?;
 
     // If server is running, update it live via API
     if vsd_is_running() {
@@ -302,6 +309,18 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn vsd_get_autostart() -> bool {
+    read_vsd_config_value("VSD_AUTOSTART")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn vsd_set_autostart(enabled: bool) -> Result<(), String> {
+    write_vsd_config_value("VSD_AUTOSTART", if enabled { "true" } else { "false" })
 }
 
 fn urllib_post(url: &str, body: &str) -> Result<(), String> {
@@ -389,6 +408,8 @@ pub fn run() {
             vsd_get_logs,
             vsd_get_download_dir,
             vsd_set_download_dir,
+            vsd_get_autostart,
+            vsd_set_autostart,
             vsd_install_extension,
         ])
         .run(tauri::generate_context!())

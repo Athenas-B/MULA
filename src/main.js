@@ -46,15 +46,43 @@ async function openConfigDir(e) {
 let vsdRunning = false;
 let vsdLogInterval = null;
 
-function initVsd() {
+async function initVsd() {
   const toggleBtn = document.getElementById("vsd-toggle");
   toggleBtn.addEventListener("click", toggleVsd);
   document.getElementById("vsd-download-dir").addEventListener("click", changeDownloadDir);
   document.getElementById("vsd-install-chrome").addEventListener("click", () => installExtension("chrome"));
   document.getElementById("vsd-install-firefox").addEventListener("click", () => installExtension("firefox"));
+  document.getElementById("vsd-autostart").addEventListener("change", toggleAutostart);
   // Check initial state
   checkVsdStatus();
   loadDownloadDir();
+  loadAutostart();
+}
+
+async function loadAutostart() {
+  try {
+    const enabled = await invoke("vsd_get_autostart");
+    document.getElementById("vsd-autostart").checked = enabled;
+    if (enabled && !vsdRunning) {
+      // Auto-start the server
+      updateVsdUi(true);
+      clearLog();
+      appendLog("[Autostart: starting server...]\n");
+      startLogPolling();
+      await invoke("vsd_start");
+    }
+  } catch (e) {
+    console.error("Failed to load autostart setting:", e);
+  }
+}
+
+async function toggleAutostart() {
+  const enabled = document.getElementById("vsd-autostart").checked;
+  try {
+    await invoke("vsd_set_autostart", { enabled });
+  } catch (e) {
+    console.error("Failed to save autostart setting:", e);
+  }
 }
 
 async function installExtension(browser) {
