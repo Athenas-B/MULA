@@ -67,14 +67,19 @@ async function loadDownloadDir() {
 
 async function changeDownloadDir() {
   try {
+    const currentDir = document.getElementById("vsd-dir-label").textContent;
     const selected = await openDialog({
       directory: true,
       title: "Select download location",
+      defaultPath: currentDir !== "..." ? currentDir : undefined,
     });
     if (selected) {
       await invoke("vsd_set_download_dir", { path: selected });
       document.getElementById("vsd-dir-label").textContent = selected;
       document.getElementById("vsd-download-dir").title = selected;
+      if (vsdRunning) {
+        appendLog(`[Download dir changed to: ${selected}]\n`);
+      }
     }
   } catch (e) {
     console.error("Failed to change download dir:", e);
