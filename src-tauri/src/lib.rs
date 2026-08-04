@@ -645,8 +645,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
                 PhysicalMediaType = $finalMediaType
                 PhysicalBusType = $finalBusType
                 HealthStatus = $finalHealth
-                DriveLetters = if ($vol -and $vol.Letters.Count -gt 0) { $vol.Letters } else { $null }
-                MountPoints = if ($vol -and $vol.Mounts.Count -gt 0) { $vol.Mounts } else { $null }
+                DriveLetters = if ($vol -and $vol.Letters.Count -gt 0) { @($vol.Letters) } else { $null }
+                MountPoints = if ($vol -and $vol.Mounts.Count -gt 0) { @($vol.Mounts) } else { $null }
             }
         }
 
