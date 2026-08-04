@@ -146,7 +146,6 @@ fn vsd_start() -> Result<(), String> {
                 if let Ok(line) = line {
                     if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
                         logs.push(format!("{line}\n"));
-                        // Keep max 1000 lines
                         if logs.len() > 1000 {
                             logs.drain(0..100);
                         }

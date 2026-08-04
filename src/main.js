@@ -127,16 +127,72 @@ async function pollLogs() {
   }
 }
 
+// ANSI color code to CSS color mapping
+const ANSI_COLORS = {
+  30: "#4d4d4d", 31: "#e74c3c", 32: "#2ecc71", 33: "#f39c12",
+  34: "#3498db", 35: "#9b59b6", 36: "#1abc9c", 37: "#ecf0f1",
+  90: "#7f8c8d", 91: "#ff6b6b", 92: "#55efc4", 93: "#ffeaa7",
+  94: "#74b9ff", 95: "#a29bfe", 96: "#81ecec", 97: "#ffffff",
+};
+
+function ansiToHtml(text) {
+  let html = "";
+  let i = 0;
+  let openSpan = false;
+
+  while (i < text.length) {
+    if (text[i] === "\x1b" && text[i + 1] === "[") {
+      // Parse ANSI sequence
+      let j = i + 2;
+      while (j < text.length && text[j] !== "m") j++;
+      const codes = text.slice(i + 2, j).split(";").map(Number);
+      i = j + 1;
+
+      if (openSpan) {
+        html += "</span>";
+        openSpan = false;
+      }
+
+      for (const code of codes) {
+        if (code === 0) {
+          // Reset
+        } else if (code === 1) {
+          html += '<span style="font-weight:bold">';
+          openSpan = true;
+        } else if (ANSI_COLORS[code]) {
+          html += `<span style="color:${ANSI_COLORS[code]}">`;
+          openSpan = true;
+        }
+      }
+    } else if (text[i] === "<") {
+      html += "&lt;";
+      i++;
+    } else if (text[i] === ">") {
+      html += "&gt;";
+      i++;
+    } else if (text[i] === "&") {
+      html += "&amp;";
+      i++;
+    } else {
+      html += text[i];
+      i++;
+    }
+  }
+
+  if (openSpan) html += "</span>";
+  return html;
+}
+
 function appendLog(text) {
   const logEl = document.getElementById("vsd-log-content");
-  logEl.textContent += text;
+  logEl.innerHTML += ansiToHtml(text);
   // Auto-scroll to bottom
   const logContainer = document.getElementById("vsd-log");
   logContainer.scrollTop = logContainer.scrollHeight;
 }
 
 function clearLog() {
-  document.getElementById("vsd-log-content").textContent = "";
+  document.getElementById("vsd-log-content").innerHTML = "";
 }
 
 window.addEventListener("DOMContentLoaded", () => {
