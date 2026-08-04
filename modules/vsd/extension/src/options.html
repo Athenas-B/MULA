@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>VSD Options</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 20px; max-width: 600px; }
+    label { display: block; margin-bottom: 12px; }
+    input { width: 100%; padding: 4px; }
+    button { padding: 6px 12px; }
+    #msg { margin-top: 10px; color: green; }
+  </style>
+</head>
+<body>
+  <h1>VSD Options</h1>
+  <label>
+    Companion server URL
+    <input type="text" id="serverUrl" value="http://127.0.0.1:8765">
+  </label>
+  <button id="save">Save</button>
+  <div id="msg"></div>
+  <script src="options.js"></script>
+</body>
+</html>

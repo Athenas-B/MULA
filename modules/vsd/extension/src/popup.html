@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <h1>VSD</h1>
+    <button id="copyLogs">Copy logs</button>
+    <button id="clearLogs">Clear logs</button>
+    <button id="popout">Pop out</button>
+  </div>
+  <label class="detection-toggle">
+    <input type="checkbox" id="detectionEnabled" checked>
+    <span class="switch"></span>
+    Detection enabled
+  </label>
+  <div id="status">Scanning...</div>
+  <ul id="streams"></ul>
+  <div class="clear-row">
+    <button id="clear">Clear list</button>
+    <button id="clearSaved">Clear saved</button>
+    <label class="protect-label">
+      <input type="checkbox" id="protectActive" checked>
+      Protect active downloads
+    </label>
+  </div>
+  <script src="errorlog.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

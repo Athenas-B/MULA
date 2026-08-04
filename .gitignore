@@ -26,3 +26,4 @@ dist-ssr
 # Module env files (user-specific)
 modules/vsd/.env
 modules/vsd/logs/
+modules/vsd/extension/dist/
