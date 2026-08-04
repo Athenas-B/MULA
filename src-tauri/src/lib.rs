@@ -364,35 +364,13 @@ fn vsd_install_extension(browser: String) -> Result<String, String> {
         return Err(format!("Extension not found at {}", ext_dir.display()));
     }
 
-    // Open the browser's extension management page
-    let open_result = if cfg!(target_os = "windows") {
-        match browser.as_str() {
-            "chrome" => {
-                // Use chrome.exe directly with the chrome:// URL
-                Command::new("chrome").arg("chrome://extensions/").spawn()
-                    .or_else(|_| Command::new("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe")
-                        .arg("chrome://extensions/").spawn())
-                    .or_else(|_| Command::new("C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe")
-                        .arg("chrome://extensions/").spawn())
-            }
-            "firefox" => {
-                Command::new("firefox").arg("about:debugging#/runtime/this-firefox").spawn()
-                    .or_else(|_| Command::new("C:\\Program Files\\Mozilla Firefox\\firefox.exe")
-                        .arg("about:debugging#/runtime/this-firefox").spawn())
-            }
-            _ => return Err(format!("Unknown browser: {browser}")),
-        }
+    // Open the built extension folder in the file explorer
+    if cfg!(target_os = "windows") {
+        let _ = Command::new("explorer").arg(&ext_dir).spawn();
+    } else if cfg!(target_os = "macos") {
+        let _ = Command::new("open").arg(&ext_dir).spawn();
     } else {
-        match browser.as_str() {
-            "chrome" => Command::new("google-chrome").arg("chrome://extensions/").spawn()
-                .or_else(|_| Command::new("chromium-browser").arg("chrome://extensions/").spawn()),
-            "firefox" => Command::new("firefox").arg("about:debugging#/runtime/this-firefox").spawn(),
-            _ => return Err(format!("Unknown browser: {browser}")),
-        }
-    };
-
-    if let Err(e) = open_result {
-        return Err(format!("Built extension but failed to open {browser}: {e}\nLoad manually from: {}", ext_dir.display()));
+        let _ = Command::new("xdg-open").arg(&ext_dir).spawn();
     }
 
     Ok(ext_dir.to_string_lossy().to_string())

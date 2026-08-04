@@ -64,9 +64,13 @@ async function installExtension(browser) {
   btn.querySelector(".btn-text").textContent = "Building...";
   try {
     const extPath = await invoke("vsd_install_extension", { browser });
-    btn.querySelector(".btn-text").textContent = "Opened!";
+    btn.querySelector(".btn-text").textContent = "Done";
     appendLog(`[Extension built: ${extPath}]\n`);
-    appendLog(`[Opened ${browser} extensions page — load unpacked from the path above]\n`);
+    if (browser === "chrome") {
+      appendLog(`[Go to chrome://extensions → enable Developer Mode → Load unpacked → select the opened folder]\n`);
+    } else {
+      appendLog(`[Go to about:debugging → This Firefox → Load Temporary Add-on → select manifest.json from the opened folder]\n`);
+    }
   } catch (err) {
     btn.querySelector(".btn-text").textContent = "Error";
     appendLog(`[Extension install error: ${err}]\n`);
