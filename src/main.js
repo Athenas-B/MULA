@@ -319,6 +319,8 @@ async function initDriveTest() {
   const refreshBtn = document.getElementById("drive-refresh");
   const toggle = document.getElementById("drive-toggle");
   const content = document.getElementById("drive-info-content");
+  const smartToggle = document.getElementById("smart-toggle");
+  const smartContent = document.getElementById("smart-content");
   if (!select || !refreshBtn) return;
 
   select.addEventListener("change", onDriveSelect);
@@ -329,6 +331,9 @@ async function initDriveTest() {
       toggle.setAttribute("aria-expanded", String(!collapsed));
       toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
     });
+  }
+  if (smartToggle && smartContent) {
+    smartToggle.addEventListener("click", () => onSmartToggle(smartToggle, smartContent));
   }
   await loadDrives();
 }
@@ -383,12 +388,51 @@ async function loadDrives() {
   }
 }
 
+let smartLoadedId = null;
+
+async function onSmartToggle(toggle, content) {
+  const select = document.getElementById("drive-select");
+  const smartData = document.getElementById("smart-data");
+  const smartStatus = document.getElementById("smart-status");
+  const id = select.value;
+
+  const collapsed = content.classList.toggle("collapsed");
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
+
+  if (!collapsed && id && smartLoadedId !== id) {
+    smartData.textContent = "";
+    smartStatus.textContent = "Loading SMART data...";
+    smartStatus.classList.remove("hidden");
+    try {
+      const data = await invoke("get_drive_smart", { id });
+      smartData.textContent = data;
+      smartLoadedId = id;
+    } catch (err) {
+      smartData.textContent = `Error: ${err}`;
+    } finally {
+      smartStatus.classList.add("hidden");
+    }
+  }
+}
+
 function onDriveSelect() {
   const select = document.getElementById("drive-select");
   const id = select.value;
   const empty = document.getElementById("drive-empty");
   const details = document.getElementById("drive-details");
   const tbody = document.querySelector("#drive-info-table tbody");
+  const smartToggle = document.getElementById("smart-toggle");
+  const smartContent = document.getElementById("smart-content");
+  const smartData = document.getElementById("smart-data");
+
+  smartLoadedId = null;
+  smartData.textContent = "Select a drive and expand to load SMART data.";
+  if (smartContent) smartContent.classList.add("collapsed");
+  if (smartToggle) {
+    smartToggle.setAttribute("aria-expanded", "false");
+    smartToggle.querySelector(".toggle-icon").textContent = "+";
+  }
 
   if (!id) {
     empty.classList.remove("hidden");

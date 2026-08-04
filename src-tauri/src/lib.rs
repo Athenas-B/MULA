@@ -833,6 +833,62 @@ fn get_drive_details(id: String) -> Result<DriveInfo, String> {
         .ok_or_else(|| format!("Drive not found: {id}"))
 }
 
+fn extract_physical_drive_number(id: &str) -> Result<u32, String> {
+    let upper = id.to_uppercase();
+    let prefix = r"\\.\PHYSICALDRIVE";
+    let num_str = if upper.starts_with(prefix) {
+        &id[prefix.len()..]
+    } else if upper.starts_with("PHYSICALDRIVE") {
+        &id["PHYSICALDRIVE".len()..]
+    } else {
+        return Err(format!("Unrecognized drive device ID: {id}"));
+    };
+
+    num_str
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("Could not parse drive number from: {id}"))
+}
+
+#[tauri::command]
+fn get_drive_smart(id: String) -> Result<String, String> {
+    let number = extract_physical_drive_number(&id)?;
+    let path = format!(r"\\.\PhysicalDrive{}", number);
+
+    let output = Command::new("smartctl")
+        .args(["-a", &path])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "smartctl not found. Please install smartmontools and add it to PATH.".to_string()
+            } else {
+                format!("Failed to run smartctl: {e}")
+            }
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !stdout.trim().is_empty() {
+        return Ok(stdout.to_string());
+    }
+
+    if !stderr.trim().is_empty() {
+        return Err(format!("smartctl error: {}", stderr.trim()));
+    }
+
+    if !output.status.success() {
+        return Err(format!(
+            "smartctl exited with code {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    Ok("No SMART data returned.".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -852,6 +908,7 @@ pub fn run() {
             vsd_install_extension,
             list_physical_drives,
             get_drive_details,
+            get_drive_smart,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

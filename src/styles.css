@@ -418,6 +418,30 @@ body {
   display: none;
 }
 
+.smart-section {
+  margin-top: 18px;
+}
+
+.smart-status {
+  color: #666;
+  font-size: 0.85rem;
+  margin-bottom: 6px;
+}
+
+.smart-pre {
+  background: #1a1a1a;
+  color: #d4d4d4;
+  border-radius: 8px;
+  padding: 12px;
+  font-family: "Cascadia Code", "Fira Code", monospace;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  max-height: 360px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .drive-info-table {
   width: 100%;
   border-collapse: collapse;
@@ -509,6 +533,10 @@ body {
 
   .drive-toggle .toggle-icon {
     background: #3a3a3a;
+  }
+
+  .smart-status {
+    color: #aaa;
   }
 
   .drive-empty {
