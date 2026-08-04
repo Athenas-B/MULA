@@ -221,10 +221,73 @@ fn vsd_get_logs() -> Vec<String> {
     }
 }
 
+#[tauri::command]
+fn vsd_get_download_dir() -> String {
+    let vsd_dir = get_vsd_server_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    if let Some(dir) = vsd_dir {
+        let env_path = dir.join(".env");
+        if env_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&env_path) {
+                for line in content.lines() {
+                    if let Some(val) = line.strip_prefix("VSD_DOWNLOAD_DIR=") {
+                        return val.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    dirs::home_dir()
+        .map(|h| h.join("Downloads").join("VSD").to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn vsd_set_download_dir(path: String) -> Result<(), String> {
+    let vsd_dir = get_vsd_server_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .ok_or("Could not find VSD module directory")?;
+
+    let env_path = vsd_dir.join(".env");
+
+    // Read existing .env or start fresh
+    let mut lines: Vec<String> = if env_path.exists() {
+        std::fs::read_to_string(&env_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Update or add the VSD_DOWNLOAD_DIR line
+    let new_line = format!("VSD_DOWNLOAD_DIR={path}");
+    let mut found = false;
+    for line in lines.iter_mut() {
+        if line.starts_with("VSD_DOWNLOAD_DIR=") {
+            *line = new_line.clone();
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        lines.push(new_line);
+    }
+
+    std::fs::write(&env_path, lines.join("\n") + "\n")
+        .map_err(|e| format!("Failed to write .env: {e}"))?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             open_config_dir,
@@ -232,6 +295,8 @@ pub fn run() {
             vsd_stop,
             vsd_is_running,
             vsd_get_logs,
+            vsd_get_download_dir,
+            vsd_set_download_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

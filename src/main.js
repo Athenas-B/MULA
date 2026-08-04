@@ -1,5 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { revealItemInDir } = window.__TAURI__.opener;
+const { open: openDialog } = window.__TAURI__.dialog;
 
 // Tab switching
 function initTabs() {
@@ -48,8 +49,36 @@ let vsdLogInterval = null;
 function initVsd() {
   const toggleBtn = document.getElementById("vsd-toggle");
   toggleBtn.addEventListener("click", toggleVsd);
+  document.getElementById("vsd-download-dir").addEventListener("click", changeDownloadDir);
   // Check initial state
   checkVsdStatus();
+  loadDownloadDir();
+}
+
+async function loadDownloadDir() {
+  try {
+    const dir = await invoke("vsd_get_download_dir");
+    document.getElementById("vsd-dir-label").textContent = dir;
+    document.getElementById("vsd-download-dir").title = dir;
+  } catch (e) {
+    console.error("Failed to load download dir:", e);
+  }
+}
+
+async function changeDownloadDir() {
+  try {
+    const selected = await openDialog({
+      directory: true,
+      title: "Select download location",
+    });
+    if (selected) {
+      await invoke("vsd_set_download_dir", { path: selected });
+      document.getElementById("vsd-dir-label").textContent = selected;
+      document.getElementById("vsd-download-dir").title = selected;
+    }
+  } catch (e) {
+    console.error("Failed to change download dir:", e);
+  }
 }
 
 async function checkVsdStatus() {

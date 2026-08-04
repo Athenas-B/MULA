@@ -215,6 +215,37 @@ body {
   border-radius: 1px;
 }
 
+.vsd-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 0.8rem;
+  cursor: pointer;
+  color: inherit;
+  max-width: 300px;
+  overflow: hidden;
+}
+
+.vsd-btn:hover {
+  border-color: #396cd8;
+  background: rgba(57, 108, 216, 0.05);
+}
+
+.vsd-btn .btn-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.folder-icon::before {
+  content: "\1F4C1";
+  font-size: 1rem;
+}
+
 .vsd-log {
   flex: 1;
   margin-top: 12px;
@@ -278,5 +309,14 @@ body {
 
   .vsd-toolbar {
     border-bottom-color: #3a3a3a;
+  }
+
+  .vsd-btn {
+    border-color: #555;
+  }
+
+  .vsd-btn:hover {
+    border-color: #5b9aff;
+    background: rgba(91, 154, 255, 0.1);
   }
 }
