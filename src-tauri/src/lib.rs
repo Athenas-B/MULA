@@ -564,9 +564,9 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         #[serde(rename = "HealthStatus")]
         health_status: Option<String>,
         #[serde(rename = "DriveLetters")]
-        drive_letters: Option<Vec<String>>,
+        drive_letters: Option<serde_json::Value>,
         #[serde(rename = "MountPoints")]
-        mount_points: Option<Vec<String>>,
+        mount_points: Option<serde_json::Value>,
     }
 
     let script = r#"
@@ -696,6 +696,16 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         let bus_type = d.physical_bus_type.as_deref().or(d.interface_type.as_deref()).unwrap_or("Unknown").trim().to_string();
         let drive_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
 
+        fn value_to_strings(v: Option<serde_json::Value>) -> Vec<String> {
+            match v {
+                None => vec![],
+                Some(serde_json::Value::Null) => vec![],
+                Some(serde_json::Value::String(s)) => vec![s],
+                Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+                Some(_) => vec![],
+            }
+        }
+
         result.push(DriveInfo {
             id: d.device_id.clone(),
             device_id: d.device_id,
@@ -712,8 +722,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             status: d.status.as_deref().unwrap_or("Unknown").to_string(),
             firmware: d.firmware_revision.as_deref().unwrap_or("").to_string(),
             pnp_device_id: pnp.to_string(),
-            drive_letters: d.drive_letters.unwrap_or_default(),
-            mount_points: d.mount_points.unwrap_or_default(),
+            drive_letters: value_to_strings(d.drive_letters),
+            mount_points: value_to_strings(d.mount_points),
             health_status: d.health_status.unwrap_or_default(),
         });
     }
