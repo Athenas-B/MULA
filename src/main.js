@@ -307,5 +307,113 @@ window.addEventListener("DOMContentLoaded", () => {
   initTabs();
   loadAppInfo();
   initVsd();
+  initDriveTest();
   document.getElementById("app-config-path").addEventListener("click", openConfigDir);
 });
+
+// ── Drive Test ──
+let cachedDrives = [];
+
+async function initDriveTest() {
+  const select = document.getElementById("drive-select");
+  const refreshBtn = document.getElementById("drive-refresh");
+  if (!select || !refreshBtn) return;
+
+  select.addEventListener("change", onDriveSelect);
+  refreshBtn.addEventListener("click", loadDrives);
+  await loadDrives();
+}
+
+async function loadDrives() {
+  const select = document.getElementById("drive-select");
+  const empty = document.getElementById("drive-empty");
+  const details = document.getElementById("drive-details");
+  const tbody = document.querySelector("#drive-info-table tbody");
+
+  select.disabled = true;
+  select.innerHTML = '<option value="">Loading drives...</option>';
+
+  try {
+    const drives = await invoke("list_physical_drives");
+    cachedDrives = drives || [];
+    select.innerHTML = '';
+
+    if (cachedDrives.length === 0) {
+      select.innerHTML = '<option value="">No physical drives found</option>';
+      empty.textContent = "No physical drives found.";
+      empty.classList.remove("hidden");
+      details.classList.add("hidden");
+      return;
+    }
+
+    const defaultOpt = document.createElement("option");
+    defaultOpt.value = "";
+    defaultOpt.textContent = "Select a drive...";
+    select.appendChild(defaultOpt);
+
+    for (const d of cachedDrives) {
+      const opt = document.createElement("option");
+      opt.value = d.id;
+      opt.textContent = `${d.model} (${d.size_text})`;
+      select.appendChild(opt);
+    }
+
+    empty.classList.remove("hidden");
+    empty.textContent = "Select a drive to see details.";
+    details.classList.add("hidden");
+    tbody.innerHTML = "";
+  } catch (err) {
+    console.error("Failed to list drives:", err);
+    select.innerHTML = '<option value="">Failed to load drives</option>';
+    empty.textContent = `Error: ${err}`;
+    empty.classList.remove("hidden");
+    details.classList.add("hidden");
+  } finally {
+    select.disabled = false;
+  }
+}
+
+function onDriveSelect() {
+  const select = document.getElementById("drive-select");
+  const id = select.value;
+  const empty = document.getElementById("drive-empty");
+  const details = document.getElementById("drive-details");
+  const tbody = document.querySelector("#drive-info-table tbody");
+
+  if (!id) {
+    empty.classList.remove("hidden");
+    details.classList.add("hidden");
+    tbody.innerHTML = "";
+    return;
+  }
+
+  const drive = cachedDrives.find((d) => d.id === id);
+  if (!drive) {
+    empty.classList.remove("hidden");
+    details.classList.add("hidden");
+    return;
+  }
+
+  const fields = [
+    ["Device", drive.device_id],
+    ["Vendor", drive.vendor],
+    ["Model", drive.model],
+    ["Serial", drive.serial || "N/A"],
+    ["Type", drive.type],
+    ["Media type", drive.media_type],
+    ["Bus", drive.bus_type],
+    ["Interface", drive.interface_type],
+    ["Size", `${drive.size_text} (${drive.size.toLocaleString()} bytes)`],
+    ["Partitions", drive.partitions.toString()],
+    ["Status", drive.status],
+    ["Firmware", drive.firmware || "N/A"],
+    ["PNP ID", drive.pnp_device_id || "N/A"],
+  ];
+
+  tbody.innerHTML = fields
+    .map(([label, value]) => `<tr><td class="label">${label}</td><td class="value">${value || "N/A"}</td></tr>`)
+    .join("");
+
+  empty.classList.add("hidden");
+  details.classList.remove("hidden");
+}

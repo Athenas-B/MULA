@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -394,6 +394,213 @@ fn vsd_install_extension(browser: String) -> Result<String, String> {
     Ok(ext_dir.to_string_lossy().to_string())
 }
 
+// ── Drive Test commands ──
+
+#[derive(Serialize, Clone)]
+pub struct DriveInfo {
+    id: String,
+    model: String,
+    vendor: String,
+    serial: String,
+    #[serde(rename = "type")]
+    drive_type: String,
+    media_type: String,
+    bus_type: String,
+    interface_type: String,
+    size: u64,
+    size_text: String,
+    partitions: u32,
+    status: String,
+    firmware: String,
+    pnp_device_id: String,
+    device_id: String,
+}
+
+fn parse_vendor_from_pnp(pnp: &str) -> Option<String> {
+    // e.g. SCSI\DISK&VEN_WDC&PROD_WD3003FZEX-00Z4S\...
+    if let Some(start) = pnp.find("VEN_") {
+        let rest = &pnp[start + 4..];
+        let end = rest.find('&').or_else(|| rest.find('\\')).unwrap_or(rest.len());
+        let vendor = &rest[..end];
+        if !vendor.is_empty() {
+            return Some(vendor.to_string());
+        }
+    }
+    None
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+    format!("{:.2} {}", size, UNITS[unit_index])
+}
+
+#[cfg(target_os = "windows")]
+fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "PascalCase")]
+    struct PsDiskDrive {
+        device_id: String,
+        model: String,
+        serial_number: Option<String>,
+        manufacturer: Option<String>,
+        interface_type: Option<String>,
+        media_type: Option<String>,
+        size: Option<u64>,
+        partitions: Option<u32>,
+        status: Option<String>,
+        firmware_revision: Option<String>,
+        pnp_device_id: Option<String>,
+        physical_media_type: Option<u16>,
+        physical_bus_type: Option<u16>,
+    }
+
+    let script = r#"
+        $physical = @{}
+        try {
+            Get-PhysicalDisk | ForEach-Object {
+                $physical[[int]$_.Number] = @{ MediaType = [int]$_.MediaType; BusType = [int]$_.BusType }
+            }
+        } catch {}
+
+        $disks = Get-CimInstance -ClassName Win32_DiskDrive |
+            Select-Object DeviceID, Model, SerialNumber, Manufacturer, InterfaceType, MediaType, Size, Partitions, Status, FirmwareRevision, PNPDeviceID, Index
+
+        $result = foreach ($d in $disks) {
+            $ph = $null
+            if ($d.Index -ne $null) {
+                $ph = $physical[[int]$d.Index]
+            }
+            [PSCustomObject]@{
+                DeviceID = $d.DeviceID
+                Model = $d.Model
+                SerialNumber = $d.SerialNumber
+                Manufacturer = $d.Manufacturer
+                InterfaceType = $d.InterfaceType
+                MediaType = $d.MediaType
+                Size = [uint64]$d.Size
+                Partitions = [uint32]$d.Partitions
+                Status = $d.Status
+                FirmwareRevision = $d.FirmwareRevision
+                PNPDeviceID = $d.PNPDeviceID
+                Index = [uint32]$d.Index
+                PhysicalMediaType = if ($ph) { $ph.MediaType } else { $null }
+                PhysicalBusType = if ($ph) { $ph.BusType } else { $null }
+            }
+        }
+
+        $result | ConvertTo-Json -AsArray -Depth 3 -Compress
+    "#;
+
+    let output = Command::new("powershell")
+        .args(["-ExecutionPolicy", "Bypass", "-Command", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run PowerShell drive query: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("PowerShell drive query failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let drives: Vec<PsDiskDrive> = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Failed to parse drive data: {e}"))?;
+
+    let mut result = Vec::new();
+    for d in drives {
+        let pnp = d.pnp_device_id.as_deref().unwrap_or("");
+        let vendor = parse_vendor_from_pnp(pnp)
+            .or_else(|| d.manufacturer.as_ref().map(|m| m.trim().to_string()))
+            .unwrap_or_default();
+
+        let model = d.model.trim().to_string();
+        let serial = d.serial_number.as_deref().unwrap_or("").trim().to_string();
+        let size = d.size.unwrap_or(0);
+
+        let (media_type, bus_type, drive_type) = if let (Some(mt), Some(bt)) = (d.physical_media_type, d.physical_bus_type) {
+            let type_str = match mt {
+                1 => "HDD",
+                2 => "SSD",
+                3 => "SCM",
+                5 => "SSHD",
+                _ => "Unknown",
+            };
+            let bus = match bt {
+                1 => "SCSI",
+                2 => "ATA",
+                3 => "ATAPI",
+                4 => "ATA",
+                6 => "USB",
+                7 => "RAID",
+                8 => "IDE",
+                9 => "SAS",
+                10 => "SATA",
+                11 => "SD",
+                12 => "MMC",
+                13 => "NVMe",
+                14 => "FC",
+                15 => "ISCSI",
+                16 => "SAS",
+                17 => "PCIe",
+                _ => "Unknown",
+            };
+            (type_str.to_string(), bus.to_string(), type_str.to_string())
+        } else {
+            let media = d.media_type.as_deref().unwrap_or("Unknown").to_string();
+            let bus = d.interface_type.as_deref().unwrap_or("Unknown").to_string();
+            (media.clone(), bus, media)
+        };
+
+        result.push(DriveInfo {
+            id: d.device_id.clone(),
+            device_id: d.device_id,
+            model,
+            vendor,
+            serial,
+            drive_type,
+            media_type,
+            bus_type,
+            interface_type: d.interface_type.as_deref().unwrap_or("Unknown").to_string(),
+            size,
+            size_text: format_bytes(size),
+            partitions: d.partitions.unwrap_or(0),
+            status: d.status.as_deref().unwrap_or("Unknown").to_string(),
+            firmware: d.firmware_revision.as_deref().unwrap_or("").to_string(),
+            pnp_device_id: pnp.to_string(),
+        });
+    }
+
+    Ok(result)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
+    Ok(vec![])
+}
+
+#[tauri::command]
+fn list_physical_drives() -> Result<Vec<DriveInfo>, String> {
+    list_physical_drives_impl()
+}
+
+#[tauri::command]
+fn get_drive_details(id: String) -> Result<DriveInfo, String> {
+    let drives = list_physical_drives_impl()?;
+    drives.into_iter()
+        .find(|d| d.id == id || d.device_id == id)
+        .ok_or_else(|| format!("Drive not found: {id}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -411,6 +618,8 @@ pub fn run() {
             vsd_get_autostart,
             vsd_set_autostart,
             vsd_install_extension,
+            list_physical_drives,
+            get_drive_details,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
