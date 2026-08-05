@@ -1074,12 +1074,18 @@ fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<St
     let out_ps = out_path.to_string_lossy().replace("\\", "/");
     let err_ps = err_path.to_string_lossy().replace("\\", "/");
 
-    // This script runs inside an elevated PowerShell. It starts smartctl with
-    // stdout/stderr redirected to files, because Start-Process -Verb runAs cannot
-    // use -RedirectStandardOutput itself.
+    // The elevated PowerShell runs this script. It starts smartctl with stdout/stderr
+    // redirected to files, because Start-Process -Verb runAs cannot use -RedirectStandardOutput.
+    // A try/catch writes any PowerShell error to the same stderr file for diagnostics.
     let script = format!(
-        r#"Start-Process -FilePath '{}' -ArgumentList {} -Wait -NoNewWindow -RedirectStandardOutput '{}' -RedirectStandardError '{}'"#,
-        smartctl_ps, arg_list, out_ps, err_ps
+        r#"try {{
+    $p = Start-Process -FilePath '{}' -ArgumentList {} -Wait -NoNewWindow -PassThru -RedirectStandardOutput '{}' -RedirectStandardError '{}'
+    exit $p.ExitCode
+}} catch {{
+    $_.Exception.Message | Out-File -FilePath '{}' -Encoding utf8
+    exit 1
+}}"#,
+        smartctl_ps, arg_list, out_ps, err_ps, err_ps
     );
     std::fs::write(&script_path, &script)
         .map_err(|e| format!("Failed to write smartctl script: {e}"))?;
@@ -1090,6 +1096,10 @@ fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<St
         script_ps
     );
 
+    log::info!("Elevated smartctl script: {}", script_path.display());
+    log::info!("Elevated smartctl script contents: {}", script);
+    log::info!("Elevated smartctl launch: {}", ps);
+
     let output = Command::new("powershell")
         .args(["-ExecutionPolicy", "Bypass", "-Command", &ps])
         .stdout(Stdio::piped())
@@ -1097,13 +1107,25 @@ fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<St
         .output()
         .map_err(|e| format!("Failed to start elevated smartctl: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("smartctl elevation failed: {}", stderr.trim()));
-    }
+    let ps_stdout = String::from_utf8_lossy(&output.stdout);
+    let ps_stderr = String::from_utf8_lossy(&output.stderr);
+    log::info!(
+        "Elevated smartctl PowerShell finished: success={}, stdout={}, stderr={}",
+        output.status.success(),
+        ps_stdout,
+        ps_stderr
+    );
 
-    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    let stdout = std::fs::read_to_string(&out_path)
+        .map_err(|e| format!("Failed to read smartctl stdout file '{}': {}", out_path.display(), e))?;
+    let stderr = std::fs::read_to_string(&err_path)
+        .map_err(|e| format!("Failed to read smartctl stderr file '{}': {}", err_path.display(), e))?;
+    log::info!(
+        "Elevated smartctl output: stdout_len={}, stderr_len={}",
+        stdout.len(),
+        stderr.len()
+    );
+
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
     let _ = std::fs::remove_file(&script_path);
