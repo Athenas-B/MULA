@@ -444,6 +444,7 @@ async function onSmartRetryAdmin() {
     smartData.textContent = data;
     smartLoadedId = id;
   } catch (err) {
+    console.error(err);
     smartData.textContent = `Error: ${err}`;
   } finally {
     smartStatus.classList.add("hidden");
@@ -475,6 +476,7 @@ async function onSmartToggle(toggle, content) {
         smartAdmin.classList.remove("hidden");
       }
     } catch (err) {
+      console.error(err);
       smartData.textContent = `Error: ${err}`;
       if (smartAdmin && needsAdminRights(err)) {
         smartAdmin.classList.remove("hidden");

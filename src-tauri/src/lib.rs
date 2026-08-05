@@ -1062,19 +1062,32 @@ fn smartctl_temp_file(suffix: &str) -> std::path::PathBuf {
 fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let out_path = smartctl_temp_file("out");
     let err_path = smartctl_temp_file("err");
+    let script_path = smartctl_temp_file("ps1");
 
-    let smartctl_ps = smartctl.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    // Use forward slashes so we don't need to double-escape Windows paths in PowerShell.
+    let smartctl_ps = smartctl.to_string_lossy().replace("\\", "/");
     let arg_list = args
         .iter()
-        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .map(|a| format!("'{}'", a.replace("'", "''")))
         .collect::<Vec<_>>()
         .join(",");
-    let out_ps = out_path.to_string_lossy().replace('\\', "\\\\");
-    let err_ps = err_path.to_string_lossy().replace('\\', "\\\\");
+    let out_ps = out_path.to_string_lossy().replace("\\", "/");
+    let err_ps = err_path.to_string_lossy().replace("\\", "/");
 
-    let ps = format!(
-        "Start-Process -FilePath \"{}\" -ArgumentList {} -Verb runAs -Wait -RedirectStandardOutput \"{}\" -RedirectStandardError \"{}\"",
+    // This script runs inside an elevated PowerShell. It starts smartctl with
+    // stdout/stderr redirected to files, because Start-Process -Verb runAs cannot
+    // use -RedirectStandardOutput itself.
+    let script = format!(
+        r#"Start-Process -FilePath '{}' -ArgumentList {} -Wait -NoNewWindow -RedirectStandardOutput '{}' -RedirectStandardError '{}'"#,
         smartctl_ps, arg_list, out_ps, err_ps
+    );
+    std::fs::write(&script_path, &script)
+        .map_err(|e| format!("Failed to write smartctl script: {e}"))?;
+
+    let script_ps = script_path.to_string_lossy().replace("\\", "/");
+    let ps = format!(
+        r#"Start-Process -FilePath "powershell" -ArgumentList '-ExecutionPolicy','Bypass','-File','{}' -Verb runAs -Wait"#,
+        script_ps
     );
 
     let output = Command::new("powershell")
@@ -1093,6 +1106,7 @@ fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<St
     let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
+    let _ = std::fs::remove_file(&script_path);
 
     if !stdout.trim().is_empty() {
         return Ok(stdout);
@@ -1184,16 +1198,24 @@ fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String
 
 #[tauri::command]
 async fn get_drive_smart(id: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, false))
+    let res = tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, false))
         .await
-        .map_err(|e| format!("Background task failed: {e}"))?
+        .map_err(|e| format!("Background task failed: {e}"))?;
+    if let Err(ref e) = res {
+        log::error!("get_drive_smart failed: {}", e);
+    }
+    res
 }
 
 #[tauri::command]
 async fn get_drive_smart_elevated(id: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, true))
+    let res = tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, true))
         .await
-        .map_err(|e| format!("Background task failed: {e}"))?
+        .map_err(|e| format!("Background task failed: {e}"))?;
+    if let Err(ref e) = res {
+        log::error!("get_drive_smart_elevated failed: {}", e);
+    }
+    res
 }
 
 #[tauri::command]

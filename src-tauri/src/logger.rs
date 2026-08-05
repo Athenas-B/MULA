@@ -75,8 +75,24 @@ pub fn init() -> Result<(), log::SetLoggerError> {
     let (tx, rx) = channel::<String>();
     let path = log_path();
 
+    // Load any existing log file so we keep history across restarts.
+    let mut initial_lines: VecDeque<String> = VecDeque::with_capacity(MAX_LINES + 1);
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            for line in content.lines() {
+                if !line.trim().is_empty() {
+                    initial_lines.push_back(line.to_string());
+                }
+            }
+        }
+    }
+    while initial_lines.len() > MAX_LINES {
+        initial_lines.pop_front();
+    }
+
     thread::spawn(move || {
-        let mut lines: VecDeque<String> = VecDeque::with_capacity(MAX_LINES + 1);
+        let mut lines = initial_lines;
+        let _ = write_log_lines(&path, &lines);
         loop {
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(msg) => {
