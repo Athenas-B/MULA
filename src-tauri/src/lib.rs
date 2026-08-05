@@ -1050,19 +1050,19 @@ fn normalize_serial(s: &str) -> String {
     s.to_lowercase().trim().trim_end_matches('.').replace(' ', "")
 }
 
-fn smartctl_temp_file(suffix: &str) -> std::path::PathBuf {
+fn smartctl_temp_file(name: &str) -> std::path::PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("mula_smart_{pid}_{ts}_{suffix}.txt"))
+    std::env::temp_dir().join(format!("mula_smart_{pid}_{ts}_{name}"))
 }
 
 fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let out_path = smartctl_temp_file("out");
-    let err_path = smartctl_temp_file("err");
-    let script_path = smartctl_temp_file("ps1");
+    let out_path = smartctl_temp_file("out.txt");
+    let err_path = smartctl_temp_file("err.txt");
+    let script_path = smartctl_temp_file("script.ps1");
 
     // Use forward slashes so we don't need to double-escape Windows paths in PowerShell.
     let smartctl_ps = smartctl.to_string_lossy().replace("\\", "/");
