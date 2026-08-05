@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use chrono::Local;
 use std::sync::Mutex;
@@ -1255,6 +1256,31 @@ async fn save_smart_snapshot(id: String, label: String) -> Result<String, String
 }
 
 #[tauri::command]
+async fn format_drive(id: String) -> Result<String, String> {
+    let escaped_id = id.replace("'", "''");
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$deviceId = '{}'
+$disks = Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction SilentlyContinue | Where-Object {{ $_.DeviceID -eq $deviceId }}
+if (-not $disks) {{ throw "Disk not found for device '$deviceId'" }}
+$diskNumber = $disks[0].Index
+$disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
+if (-not $disk) {{ throw "Disk $diskNumber not found" }}
+Clear-Disk -Number $diskNumber -RemoveData -RemoveOEM -Confirm:$false
+$part = New-Partition -DiskNumber $diskNumber -UseMaximumSize -AssignDriveLetter
+Format-Volume -DriveLetter $part.DriveLetter -FileSystem NTFS -NewFileSystemLabel 'MULA' -Confirm:$false -Full
+"Formatted drive " + $part.DriveLetter + ": as NTFS (full format complete)""#,
+        escaped_id
+    );
+
+    tauri::async_runtime::spawn_blocking(move || {
+        elevated_helper::run_elevated_with_timeout(Path::new("powershell"), &["-Command", &script, "-ExecutionPolicy", "Bypass"], None)
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))? 
+}
+
+#[tauri::command]
 async fn log_message(level: String, message: String) {
     logger::log_message(&level, &message);
 }
@@ -1292,6 +1318,7 @@ pub fn run() {
             get_drive_test_status,
             get_drive_test_status_elevated,
             save_smart_snapshot,
+            format_drive,
             log_message,
         ])
         .on_window_event(|_window, event| {

@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static ELEVATED_HELPER: Mutex<Option<ElevatedHelper>> = Mutex::new(None);
 
@@ -129,7 +129,15 @@ pub fn stop_helper() {
     }
 }
 
-pub fn run_elevated(smartctl: &Path, args: &[&str]) -> Result<String, String> {
+pub fn run_elevated(exe: &Path, args: &[&str]) -> Result<String, String> {
+    run_elevated_with_timeout(exe, args, Some(Duration::from_secs(60)))
+}
+
+pub fn run_elevated_with_timeout(
+    exe: &Path,
+    args: &[&str],
+    timeout: Option<Duration>,
+) -> Result<String, String> {
     let mut guard = ELEVATED_HELPER
         .lock()
         .map_err(|_| "Elevated helper lock poisoned")?;
@@ -150,7 +158,7 @@ pub fn run_elevated(smartctl: &Path, args: &[&str]) -> Result<String, String> {
     let err_file = helper.cmd_dir.join(format!("err_{uuid}.txt"));
 
     let cmd = ElevatedCommand {
-        exe: ps_path(smartctl),
+        exe: ps_path(exe),
         args: args.iter().map(|a| a.to_string()).collect(),
         out: ps_path(&out_file),
         err: ps_path(&err_file),
@@ -166,18 +174,20 @@ pub fn run_elevated(smartctl: &Path, args: &[&str]) -> Result<String, String> {
     std::fs::rename(&tmp_file, &cmd_file)
         .map_err(|e| format!("Failed to rename helper command file: {e}"))?;
 
-    log::info!("Sent elevated smartctl command: {}", cmd_file.display());
+    log::info!("Sent elevated command: {}", cmd_file.display());
 
-    for _ in 0..600 {
+    let start = Instant::now();
+    loop {
         if done_file.exists() {
             break;
         }
+        if let Some(t) = timeout {
+            if start.elapsed() >= t {
+                log::error!("Elevated helper did not respond for {}", cmd_file.display());
+                return Err("Elevated helper did not respond".to_string());
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
-    }
-
-    if !done_file.exists() {
-        log::error!("Elevated helper did not respond for {}", cmd_file.display());
-        return Err("Elevated helper did not respond".to_string());
     }
 
     let _ = std::fs::remove_file(&done_file);
@@ -202,8 +212,8 @@ pub fn run_elevated(smartctl: &Path, args: &[&str]) -> Result<String, String> {
     if !stdout.trim().is_empty() {
         Ok(stdout)
     } else if !stderr.trim().is_empty() {
-        Err(format!("smartctl error: {}", stderr.trim()))
+        Err(format!("command error: {}", stderr.trim()))
     } else {
-        Err("smartctl returned no output".to_string())
+        Err("command returned no output".to_string())
     }
 }

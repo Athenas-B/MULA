@@ -343,6 +343,7 @@ async function initDriveTest() {
   const smartRetry = document.getElementById("smart-retry-admin");
   const smartRunTest = document.getElementById("smart-run-test");
   const smartCheckStatus = document.getElementById("smart-check-status");
+  const formatBtn = document.getElementById("drive-format-btn");
   if (!select || !refreshBtn) return;
 
   select.addEventListener("change", onDriveSelect);
@@ -365,6 +366,9 @@ async function initDriveTest() {
   }
   if (smartCheckStatus) {
     smartCheckStatus.addEventListener("click", () => onCheckDriveTestStatus());
+  }
+  if (formatBtn) {
+    formatBtn.addEventListener("click", () => onFormatDrive());
   }
 
   await loadDrives();
@@ -652,6 +656,52 @@ async function onCheckDriveTestStatus() {
   }
 }
 
+async function onFormatDrive() {
+  const select = document.getElementById("drive-select");
+  const formatStatus = document.getElementById("drive-format-status");
+  const formatBtn = document.getElementById("drive-format-btn");
+  const id = select.value;
+  if (!id) return;
+
+  stopTestProgressPolling();
+
+  const drive = cachedDrives.find((d) => d.id === id);
+  const driveLabel = drive ? `${drive.vendor || ""} ${drive.model || ""} ${drive.serial || ""}`.trim() || id : id;
+
+  const confirmed = window.confirm(
+    `WARNING: This will permanently erase ALL data on the selected drive.\n\n` +
+      `Drive: ${driveLabel}\n\n` +
+      `This action will remove all partitions, create a new single partition, and perform a full format.\n` +
+      `It cannot be undone.\n\nDo you want to continue?`
+  );
+  if (!confirmed) return;
+
+  if (formatStatus) {
+    formatStatus.textContent = "Formatting... This may take a long time. Do not close the app.";
+    formatStatus.className = "drive-format-status";
+  }
+  if (formatBtn) formatBtn.disabled = true;
+
+  try {
+    const result = await invoke("format_drive", { id });
+    await loadDrives();
+    if (select) select.value = id;
+    onDriveSelect();
+    if (formatStatus) {
+      formatStatus.textContent = result;
+      formatStatus.className = "drive-format-status success";
+    }
+  } catch (err) {
+    console.error(err);
+    if (formatStatus) {
+      formatStatus.textContent = `Error: ${err}`;
+      formatStatus.className = "drive-format-status error";
+    }
+  } finally {
+    if (formatBtn) formatBtn.disabled = false;
+  }
+}
+
 async function onSmartToggle(toggle, content) {
   const select = document.getElementById("drive-select");
   const smartData = document.getElementById("smart-data");
@@ -702,6 +752,8 @@ function onDriveSelect() {
   const smartTest = document.getElementById("smart-test");
   const runBtn = document.getElementById("smart-run-test");
   const checkBtn = document.getElementById("smart-check-status");
+  const formatSection = document.getElementById("drive-format");
+  const formatStatus = document.getElementById("drive-format-status");
 
   smartLoadedId = null;
   smartData.textContent = "Select a drive and expand to load SMART data.";
@@ -714,6 +766,10 @@ function onDriveSelect() {
 
   if (!id) {
     if (smartTest) smartTest.classList.add("hidden");
+    if (formatSection) {
+      formatSection.classList.add("hidden");
+      formatStatus.textContent = "";
+    }
     empty.classList.remove("hidden");
     details.classList.add("hidden");
     tbody.innerHTML = "";
@@ -757,6 +813,10 @@ function onDriveSelect() {
 
   if (smartTest) {
     smartTest.classList.remove("hidden");
+  }
+  if (formatSection) {
+    formatSection.classList.remove("hidden");
+    if (formatStatus) formatStatus.textContent = "";
   }
   if (runBtn) runBtn.disabled = false;
   if (checkBtn) checkBtn.disabled = false;
