@@ -421,6 +421,16 @@ async function loadDrives() {
 }
 
 let smartLoadedId = null;
+let testPollInterval = null;
+let testPollNoProgressCount = 0;
+
+function stopTestProgressPolling() {
+  if (testPollInterval) {
+    clearInterval(testPollInterval);
+    testPollInterval = null;
+  }
+  testPollNoProgressCount = 0;
+}
 
 function needsAdminRights(text) {
   const t = String(text).toLowerCase();
@@ -478,6 +488,8 @@ async function onRunDriveTest() {
     return;
   }
 
+  stopTestProgressPolling();
+
   if (testStatus) {
     testStatus.textContent = "Starting tests with administrator privileges...";
     testStatus.className = "smart-test-status";
@@ -520,6 +532,10 @@ async function onRunDriveTest() {
     if (testStatus) {
       testStatus.className = hasError ? "smart-test-status error" : "smart-test-status success";
     }
+
+    if (!hasError) {
+      setTimeout(() => startTestProgressPolling(id), 2000);
+    }
   } catch (err) {
     console.error(err);
     if (testStatus) {
@@ -528,6 +544,74 @@ async function onRunDriveTest() {
     }
   } finally {
     if (runBtn) runBtn.disabled = false;
+  }
+}
+
+function extractSelfTestProgress(full) {
+  const statusRegex = /(?:Self-test execution status|Self-test status):[\s\S]*?(?=\n(?:SMART|Self-test Log|={3,})|$)/i;
+  const logRegex = /(?:SMART (?:Extended )?Self-test log|Self-test Log)[\s\S]*?(?=\n(?:SMART|={3,})|$)/i;
+  const statusMatch = full.match(statusRegex);
+  const logMatch = full.match(logRegex);
+  const status = statusMatch ? statusMatch[0].trim() : "Self-test status not available";
+  const log = logMatch ? logMatch[0].trim() : "No self-test log available";
+  const lowerStatus = status.toLowerCase();
+  const inProgress =
+    lowerStatus.includes("in progress") &&
+    !lowerStatus.includes("no self-test in progress") &&
+    !lowerStatus.includes("no selftest in progress");
+  return { text: `${status}\n\n${log}`, inProgress };
+}
+
+function startTestProgressPolling(id) {
+  stopTestProgressPolling();
+  const testStatus = document.getElementById("smart-test-status");
+  if (testStatus) {
+    testStatus.textContent = "Monitoring self-test progress...";
+    testStatus.className = "smart-test-status";
+  }
+  pollTestStatus(id);
+  testPollInterval = setInterval(() => pollTestStatus(id), 10000);
+}
+
+async function pollTestStatus(id) {
+  const select = document.getElementById("drive-select");
+  const testStatus = document.getElementById("smart-test-status");
+  if (!id || select.value !== id) {
+    stopTestProgressPolling();
+    return;
+  }
+
+  try {
+    const full = await invoke("get_drive_smart_elevated", { id });
+    const { text, inProgress } = extractSelfTestProgress(full);
+    const hasFailed = text.toLowerCase().includes("failed");
+
+    if (testStatus) {
+      testStatus.textContent = `Monitoring self-test progress... (updates every 10s)\n\n${text}`;
+      testStatus.className = hasFailed ? "smart-test-status error" : "smart-test-status";
+    }
+
+    if (hasFailed) {
+      stopTestProgressPolling();
+      return;
+    }
+
+    if (inProgress) {
+      testPollNoProgressCount = 0;
+    } else {
+      testPollNoProgressCount += 1;
+      if (testPollNoProgressCount >= 2) {
+        if (testStatus) testStatus.className = "smart-test-status success";
+        stopTestProgressPolling();
+      }
+    }
+  } catch (err) {
+    console.error(err);
+    if (testStatus) {
+      testStatus.textContent = `Error checking status: ${err}`;
+      testStatus.className = "smart-test-status error";
+    }
+    stopTestProgressPolling();
   }
 }
 
@@ -545,13 +629,14 @@ async function onCheckDriveTestStatus() {
   if (checkBtn) checkBtn.disabled = true;
 
   try {
-    const data = await invoke("get_drive_test_status_elevated", { id });
-    if (String(data).toLowerCase().includes("failed")) {
-      throw data;
+    const full = await invoke("get_drive_smart_elevated", { id });
+    const { text, inProgress } = extractSelfTestProgress(full);
+    if (text.toLowerCase().includes("failed")) {
+      throw text;
     }
     if (testStatus) {
-      testStatus.textContent = data;
-      testStatus.className = "smart-test-status success";
+      testStatus.textContent = text;
+      testStatus.className = inProgress ? "smart-test-status" : "smart-test-status success";
     }
   } catch (err) {
     console.error(err);
@@ -601,6 +686,7 @@ async function onSmartToggle(toggle, content) {
 }
 
 function onDriveSelect() {
+  stopTestProgressPolling();
   const select = document.getElementById("drive-select");
   const id = select.value;
   const empty = document.getElementById("drive-empty");
