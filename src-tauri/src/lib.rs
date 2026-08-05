@@ -1141,7 +1141,7 @@ fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<St
     Err("smartctl returned no output".to_string())
 }
 
-fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String> {
+fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Result<String, String> {
     let number = extract_physical_drive_number(&id)?;
     let pd_path = format!(r"/dev/pd{}", number);
 
@@ -1177,11 +1177,11 @@ fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String
         }
     }
 
-    let run_a = |smartctl: &std::path::Path, args: &[&str]| -> Result<String, String> {
+    let run_a = |smartctl: &std::path::Path, base_args: &[&str]| -> Result<String, String> {
         if elevated {
-            run_smartctl_elevated(smartctl, args)
+            run_smartctl_elevated(smartctl, base_args)
         } else {
-            let (stdout, stderr, _code) = run_smartctl(smartctl, args)?;
+            let (stdout, stderr, _code) = run_smartctl(smartctl, base_args)?;
             if !stdout.trim().is_empty() {
                 Ok(stdout)
             } else if !stderr.trim().is_empty() {
@@ -1193,7 +1193,9 @@ fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String
     };
 
     if let Some((device, dtype)) = matched {
-        let out = run_a(&smartctl, &["-a", "-d", &dtype, &device])?;
+        let mut args: Vec<&str> = extra_args.to_vec();
+        args.extend(["-d", &dtype, &device]);
+        let out = run_a(&smartctl, &args)?;
         if out.trim().is_empty() {
             return Err("smartctl returned no output".to_string());
         }
@@ -1204,7 +1206,9 @@ fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String
     let fallback_types = ["sat", "nvme", "ata", "scsi"];
     let mut last_error = String::new();
     for dtype in &fallback_types {
-        match run_a(&smartctl, &["-a", "-d", dtype, &pd_path]) {
+        let mut args: Vec<&str> = extra_args.to_vec();
+        args.extend(["-d", dtype, &pd_path]);
+        match run_a(&smartctl, &args) {
             Ok(out) if !out.trim().is_empty() && !out.to_lowercase().contains("open failed") => {
                 return Ok(out);
             }
@@ -1217,7 +1221,11 @@ fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String
         return Err(format!("smartctl error: {}", last_error.trim()));
     }
 
-    Err("No SMART data available for this drive.".to_string())
+    Err("smartctl command did not produce output for this drive.".to_string())
+}
+
+fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String> {
+    run_smartctl_on_drive(id, elevated, &["-a"])
 }
 
 #[tauri::command]
@@ -1238,6 +1246,32 @@ async fn get_drive_smart_elevated(id: String) -> Result<String, String> {
         .map_err(|e| format!("Background task failed: {e}"))?;
     if let Err(ref e) = res {
         log::error!("get_drive_smart_elevated failed: {}", e);
+    }
+    res
+}
+
+#[tauri::command]
+async fn run_drive_test(id: String, test_type: String) -> Result<String, String> {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        run_smartctl_on_drive(id, false, &["-t", &test_type])
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?;
+    if let Err(ref e) = res {
+        log::error!("run_drive_test failed: {}", e);
+    }
+    res
+}
+
+#[tauri::command]
+async fn run_drive_test_elevated(id: String, test_type: String) -> Result<String, String> {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        run_smartctl_on_drive(id, true, &["-t", &test_type])
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?;
+    if let Err(ref e) = res {
+        log::error!("run_drive_test_elevated failed: {}", e);
     }
     res
 }
@@ -1275,6 +1309,8 @@ pub fn run() {
             get_drive_details,
             get_drive_smart,
             get_drive_smart_elevated,
+            run_drive_test,
+            run_drive_test_elevated,
             log_message,
         ])
         .run(tauri::generate_context!())
