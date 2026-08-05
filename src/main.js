@@ -493,7 +493,11 @@ async function onRunDriveTest(elevated) {
       testStatus.textContent = "Test started. Use Check status to see progress.";
       testStatus.className = "smart-test-status success";
     }
-    if (adminBtn) adminBtn.classList.add("hidden");
+    if (runBtn) runBtn.disabled = false;
+    if (adminBtn) {
+      adminBtn.disabled = false;
+      adminBtn.classList.add("hidden");
+    }
   } catch (err) {
     console.error(err);
     if (testStatus) {
@@ -536,7 +540,11 @@ async function onCheckDriveTestStatus(elevated) {
       testStatus.textContent = data;
       testStatus.className = "smart-test-status success";
     }
-    if (adminBtn) adminBtn.classList.add("hidden");
+    if (checkBtn) checkBtn.disabled = false;
+    if (adminBtn) {
+      adminBtn.disabled = false;
+      adminBtn.classList.add("hidden");
+    }
   } catch (err) {
     console.error(err);
     if (testStatus) {
@@ -568,6 +576,22 @@ async function onSmartToggle(toggle, content) {
   toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
 
   if (smartAdmin) smartAdmin.classList.add("hidden");
+  const runBtn = document.getElementById("smart-run-test");
+  const runAdminBtn = document.getElementById("smart-run-test-admin");
+  const checkBtn = document.getElementById("smart-check-status");
+  const checkAdminBtn = document.getElementById("smart-check-status-admin");
+
+  if (runBtn) runBtn.disabled = false;
+  if (runAdminBtn) {
+    runAdminBtn.disabled = false;
+    runAdminBtn.classList.add("hidden");
+  }
+  if (checkBtn) checkBtn.disabled = false;
+  if (checkAdminBtn) {
+    checkAdminBtn.disabled = false;
+    checkAdminBtn.classList.add("hidden");
+  }
+
   if (smartTest) {
     if (collapsed || !id) {
       smartTest.classList.add("hidden");
