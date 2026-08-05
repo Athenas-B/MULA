@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use windows::core::HSTRING;
-use windows::Win32::Foundation::{RECT, COLORREF};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{DesktopWallpaper, DESKTOP_WALLPAPER_POSITION, IDesktopWallpaper};
 
@@ -57,18 +57,26 @@ pub fn get_monitors() -> Result<Vec<Monitor>, String> {
             CoTaskMemFree(Some(id_pwstr.as_ptr() as *const _));
 
             let id_hstring = HSTRING::from(&id);
-            let rect: RECT = wallpaper.GetMonitorRECT(&id_hstring)
-                .map_err(|e| format!("Failed to get monitor rect: {e}"))?;
+            match wallpaper.GetMonitorRECT(&id_hstring) {
+                Ok(rect) => {
+                    monitors.push(Monitor {
+                        id,
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                        width: rect.right - rect.left,
+                        height: rect.bottom - rect.top,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Skipping monitor {id}: could not get monitor rect: {e}");
+                }
+            }
+        }
 
-            monitors.push(Monitor {
-                id,
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-                width: rect.right - rect.left,
-                height: rect.bottom - rect.top,
-            });
+        if monitors.is_empty() {
+            return Err("No active monitors were found".to_string());
         }
 
         Ok(monitors)
