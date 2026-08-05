@@ -367,16 +367,6 @@ async function initDriveTest() {
     smartCheckStatus.addEventListener("click", () => onCheckDriveTestStatus());
   }
 
-  document.querySelectorAll('input[name="smart-test-type"]').forEach((cb) => {
-    cb.addEventListener("change", () => {
-      if (cb.checked) {
-        document.querySelectorAll('input[name="smart-test-type"]').forEach((other) => {
-          if (other !== cb) other.checked = false;
-        });
-      }
-    });
-  });
-
   await loadDrives();
 }
 
@@ -472,33 +462,63 @@ async function onSmartRetryAdmin() {
 
 async function onRunDriveTest() {
   const select = document.getElementById("drive-select");
-  const testType = document.querySelector('input[name="smart-test-type"]:checked');
+  const testCheckboxes = document.querySelectorAll('input[name="smart-test-type"]:checked');
+  const saveBefore = document.querySelector('input[name="smart-test-save"][value="before"]')?.checked;
+  const saveAfter = document.querySelector('input[name="smart-test-save"][value="after"]')?.checked;
   const testStatus = document.getElementById("smart-test-status");
   const runBtn = document.getElementById("smart-run-test");
   const id = select.value;
-  const type = testType?.value;
-  if (!id || !type) {
+  const types = Array.from(testCheckboxes).map((cb) => cb.value);
+
+  if (!id || types.length === 0) {
     if (testStatus) {
-      testStatus.textContent = "Select a test type to run";
+      testStatus.textContent = "Select at least one test type to run";
       testStatus.className = "smart-test-status error";
     }
     return;
   }
 
   if (testStatus) {
-    testStatus.textContent = "Starting test with administrator privileges...";
+    testStatus.textContent = "Starting tests with administrator privileges...";
     testStatus.className = "smart-test-status";
   }
   if (runBtn) runBtn.disabled = true;
 
+  const lines = [];
+  let hasError = false;
+
+  const appendLine = (line, isError) => {
+    lines.push(line);
+    if (isError) hasError = true;
+    if (testStatus) testStatus.textContent = lines.join("\n");
+  };
+
   try {
-    const data = await invoke("run_drive_test_elevated", { id, testType: type });
-    if (String(data).toLowerCase().includes("failed")) {
-      throw data;
+    if (saveBefore) {
+      const path = await invoke("save_smart_snapshot", { id, label: "before" });
+      appendLine(`SMART snapshot saved before tests:\n  ${path}`);
     }
+
+    for (const type of types) {
+      try {
+        const data = await invoke("run_drive_test_elevated", { id, testType: type });
+        if (String(data).toLowerCase().includes("failed")) {
+          appendLine(`${type}: failed\n  ${data}`, true);
+        } else {
+          appendLine(`${type}: started\n  ${data}`);
+        }
+      } catch (err) {
+        appendLine(`${type}: error - ${err}`, true);
+      }
+    }
+
+    if (saveAfter) {
+      const path = await invoke("save_smart_snapshot", { id, label: "after" });
+      appendLine(`SMART snapshot saved after tests:\n  ${path}`);
+    }
+
     if (testStatus) {
-      testStatus.textContent = "Test started. Use Check status to see progress.";
-      testStatus.className = "smart-test-status success";
+      testStatus.className = hasError ? "smart-test-status error" : "smart-test-status success";
     }
   } catch (err) {
     console.error(err);

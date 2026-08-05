@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use chrono::Local;
 use std::sync::Mutex;
 
 mod elevated_helper;
@@ -1215,8 +1216,46 @@ async fn get_drive_test_status_elevated(id: String) -> Result<String, String> {
     res
 }
 
+fn sanitize_for_path(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
 #[tauri::command]
-fn log_message(level: String, message: String) {
+async fn save_smart_snapshot(id: String, label: String) -> Result<String, String> {
+    let id_for_drive = id.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        run_smartctl_on_drive(id_for_drive, true, &["-a"])
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?;
+
+    if let Err(ref e) = res {
+        log::error!("save_smart_snapshot failed: {}", e);
+        return res;
+    }
+
+    let data = res?;
+
+    let config_dir = dirs::config_dir()
+        .map(|p| p.join("mula"))
+        .ok_or("Could not determine config directory")?;
+    let drive_dir = config_dir.join("snapshots").join(sanitize_for_path(&id));
+    std::fs::create_dir_all(&drive_dir)
+        .map_err(|e| format!("Failed to create snapshot directory: {e}"))?;
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("smart_{label}_{timestamp}.txt");
+    let path = drive_dir.join(&filename);
+    std::fs::write(&path, data)
+        .map_err(|e| format!("Failed to write snapshot file: {e}"))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn log_message(level: String, message: String) {
     logger::log_message(&level, &message);
 }
 
@@ -1252,6 +1291,7 @@ pub fn run() {
             run_drive_test_elevated,
             get_drive_test_status,
             get_drive_test_status_elevated,
+            save_smart_snapshot,
             log_message,
         ])
         .on_window_event(|_window, event| {
