@@ -327,6 +327,7 @@ window.addEventListener("DOMContentLoaded", () => {
   loadAppInfo();
   initVsd();
   initDriveTest();
+  initWallchanger();
   document.getElementById("app-config-path").addEventListener("click", openConfigDir);
 });
 
@@ -851,4 +852,237 @@ function onDriveSelect() {
 
   empty.classList.add("hidden");
   details.classList.remove("hidden");
+}
+
+// ── Wall Changer ──
+let wcSettings = null;
+let wcSelectedSourceIndex = -1;
+
+async function initWallchanger() {
+  document.getElementById("wc-toggle")?.addEventListener("click", wcToggleService);
+  document.getElementById("wc-change-now")?.addEventListener("click", wcChangeNow);
+  document.getElementById("wc-apply")?.addEventListener("click", wcApply);
+  document.getElementById("wc-save")?.addEventListener("click", wcSaveSettings);
+  document.getElementById("wc-add-folder")?.addEventListener("click", wcAddFolder);
+  document.getElementById("wc-remove-source")?.addEventListener("click", wcRemoveSource);
+  document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
+  document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
+
+  for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-separate-queues", "wc-one-monitor"]) {
+    document.getElementById(id)?.addEventListener("change", () => {
+      wcUpdateModelFromUi();
+    });
+  }
+
+  await wcLoadSettings();
+  await wcLoadStatus();
+  await wcLoadMonitors();
+}
+
+async function wcLoadSettings() {
+  try {
+    wcSettings = await invoke("wc_get_settings");
+    wcRenderSettings();
+    wcRenderSources();
+  } catch (err) {
+    wcShowMessage(`Error loading settings: ${err}`, "error");
+  }
+}
+
+function wcRenderSettings() {
+  document.getElementById("wc-interval").value = wcSettings.interval_minutes;
+  document.getElementById("wc-max-level").value = wcSettings.maximum_source_level;
+  document.getElementById("wc-rotation").value = wcSettings.rotation_mode;
+  document.getElementById("wc-scaling").value = wcSettings.scaling_mode;
+  document.getElementById("wc-separate-queues").checked = wcSettings.use_separate_monitor_queues;
+  document.getElementById("wc-one-monitor").checked = wcSettings.change_one_monitor_per_interval;
+}
+
+function wcRenderSources() {
+  const container = document.getElementById("wc-sources");
+  container.innerHTML = "";
+
+  wcSettings.source_folders.forEach((source, index) => {
+    const row = document.createElement("div");
+    row.className = `wallchanger-source${index === wcSelectedSourceIndex ? " selected" : ""}`;
+    row.innerHTML = `
+      <input type="checkbox" ${source.enabled ? "checked" : ""} title="Enabled">
+      <input type="text" value="${source.path}" placeholder="Folder or URL" readonly>
+      <input type="number" min="1" max="10" value="${source.level}" title="Level">
+      <label class="wallchanger-option" title="Include subfolders">
+        <input type="checkbox" ${source.include_subfolders ? "checked" : ""}>
+        <span>Subfolders</span>
+      </label>
+    `;
+
+    row.addEventListener("click", (e) => {
+      if (e.target.tagName === "INPUT") return;
+      wcSelectedSourceIndex = index;
+      wcRenderSources();
+      wcUpdateToolbar();
+    });
+
+    row.querySelector('input[type="checkbox"]').addEventListener("change", (e) => {
+      wcSettings.source_folders[index].enabled = e.target.checked;
+    });
+
+    row.querySelector('input[type="number"]').addEventListener("change", (e) => {
+      wcSettings.source_folders[index].level = Math.min(10, Math.max(1, parseInt(e.target.value, 10) || 1));
+    });
+
+    row.querySelector('input[type="text"]').addEventListener("change", (e) => {
+      wcSettings.source_folders[index].path = e.target.value.trim();
+    });
+
+    const subCheck = row.querySelectorAll('input[type="checkbox"]')[1];
+    if (subCheck) {
+      subCheck.addEventListener("change", (e) => {
+        wcSettings.source_folders[index].include_subfolders = e.target.checked;
+      });
+    }
+
+    container.appendChild(row);
+  });
+
+  wcUpdateToolbar();
+}
+
+function wcUpdateToolbar() {
+  const hasSelection = wcSelectedSourceIndex >= 0 && wcSelectedSourceIndex < wcSettings.source_folders.length;
+  document.getElementById("wc-remove-source").disabled = !hasSelection;
+  document.getElementById("wc-move-up").disabled = !hasSelection || wcSelectedSourceIndex === 0;
+  document.getElementById("wc-move-down").disabled = !hasSelection || wcSelectedSourceIndex === wcSettings.source_folders.length - 1;
+}
+
+function wcUpdateModelFromUi() {
+  if (!wcSettings) return;
+  wcSettings.interval_minutes = Math.min(1440, Math.max(1, parseInt(document.getElementById("wc-interval").value, 10) || 30));
+  wcSettings.maximum_source_level = Math.min(10, Math.max(1, parseInt(document.getElementById("wc-max-level").value, 10) || 10));
+  wcSettings.rotation_mode = document.getElementById("wc-rotation").value;
+  wcSettings.scaling_mode = document.getElementById("wc-scaling").value;
+  wcSettings.use_separate_monitor_queues = document.getElementById("wc-separate-queues").checked;
+  wcSettings.change_one_monitor_per_interval = document.getElementById("wc-one-monitor").checked;
+}
+
+async function wcAddFolder() {
+  try {
+    const folder = await openDialog({ directory: true });
+    if (!folder) return;
+    wcSettings.source_folders.push({
+      path: folder,
+      enabled: true,
+      include_subfolders: true,
+      level: 5,
+      wallhaven_page_limit: 1,
+      wallhaven_purity: "110",
+    });
+    wcRenderSources();
+  } catch (err) {
+    wcShowMessage(`Error adding folder: ${err}`, "error");
+  }
+}
+
+function wcRemoveSource() {
+  if (wcSelectedSourceIndex < 0) return;
+  wcSettings.source_folders.splice(wcSelectedSourceIndex, 1);
+  wcSelectedSourceIndex = Math.min(wcSelectedSourceIndex, wcSettings.source_folders.length - 1);
+  wcRenderSources();
+}
+
+function wcMoveSource(delta) {
+  if (wcSelectedSourceIndex < 0) return;
+  const newIndex = wcSelectedSourceIndex + delta;
+  if (newIndex < 0 || newIndex >= wcSettings.source_folders.length) return;
+  const [moved] = wcSettings.source_folders.splice(wcSelectedSourceIndex, 1);
+  wcSettings.source_folders.splice(newIndex, 0, moved);
+  wcSelectedSourceIndex = newIndex;
+  wcRenderSources();
+}
+
+async function wcSaveSettings() {
+  try {
+    wcUpdateModelFromUi();
+    await invoke("wc_save_settings", { settings: wcSettings });
+    wcShowMessage("Settings saved.", "success");
+    await wcLoadStatus();
+  } catch (err) {
+    wcShowMessage(`Error saving settings: ${err}`, "error");
+  }
+}
+
+async function wcApply() {
+  try {
+    wcUpdateModelFromUi();
+    await invoke("wc_save_settings", { settings: wcSettings });
+    const result = await invoke("wc_apply");
+    wcShowMessage(result, "success");
+    await wcLoadSettings();
+  } catch (err) {
+    wcShowMessage(`Error applying wallpaper: ${err}`, "error");
+  }
+}
+
+async function wcChangeNow() {
+  try {
+    wcUpdateModelFromUi();
+    await invoke("wc_save_settings", { settings: wcSettings });
+    const result = await invoke("wc_change_now");
+    wcShowMessage(result, "success");
+    await wcLoadSettings();
+  } catch (err) {
+    wcShowMessage(`Error changing wallpaper: ${err}`, "error");
+  }
+}
+
+async function wcToggleService() {
+  try {
+    const running = await invoke("wc_toggle_service");
+    wcUpdateToggleUi(running);
+  } catch (err) {
+    wcShowMessage(`Error toggling service: ${err}`, "error");
+  }
+}
+
+async function wcLoadStatus() {
+  try {
+    const status = await invoke("wc_get_status");
+    wcUpdateToggleUi(status.running);
+  } catch (err) {
+    wcShowMessage(`Error loading status: ${err}`, "error");
+  }
+}
+
+function wcUpdateToggleUi(running) {
+  const btn = document.getElementById("wc-toggle");
+  const label = document.getElementById("wc-toggle-label");
+  const status = document.getElementById("wc-status");
+  if (running) {
+    btn.classList.add("running");
+    btn.classList.remove("stopped");
+    label.textContent = "Stop";
+    status.textContent = "running";
+  } else {
+    btn.classList.add("stopped");
+    btn.classList.remove("running");
+    label.textContent = "Start";
+    status.textContent = "stopped";
+  }
+}
+
+async function wcLoadMonitors() {
+  try {
+    const monitors = await invoke("wc_get_monitors");
+    const list = document.getElementById("wc-monitors");
+    list.innerHTML = monitors
+      .map((m, i) => `<li>Monitor ${i + 1}: ${m.width} x ${m.height}</li>`)
+      .join("");
+  } catch (err) {
+    wcShowMessage(`Error loading monitors: ${err}`, "error");
+  }
+}
+
+function wcShowMessage(text, kind) {
+  const el = document.getElementById("wc-message");
+  el.textContent = text;
+  el.className = `wallchanger-message${kind ? " " + kind : ""}`;
 }

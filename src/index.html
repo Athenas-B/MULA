@@ -13,6 +13,7 @@
       <button class="tab active" data-tab="system">System</button>
       <button class="tab" data-tab="vsd">VSD Server</button>
       <button class="tab" data-tab="drivetest">Drive Test</button>
+      <button class="tab" data-tab="wallchanger">Wall Changer</button>
     </nav>
 
     <main class="tab-content">
@@ -155,6 +156,78 @@
             </div>
           </div>
           <div id="drive-empty" class="drive-empty">Select a drive to see details.</div>
+        </div>
+      </section>
+
+      <!-- Wall Changer -->
+      <section id="tab-wallchanger" class="tab-panel wallchanger-panel">
+        <div class="wallchanger-card">
+          <h2>Wall Changer</h2>
+
+          <div class="wallchanger-toolbar">
+            <button id="wc-toggle" class="vsd-toggle stopped">
+              <span class="toggle-icon"></span>
+              <span class="toggle-label" id="wc-toggle-label">Start</span>
+            </button>
+            <button id="wc-change-now" class="vsd-btn">Change now</button>
+            <button id="wc-apply" class="vsd-btn">Apply now</button>
+            <span id="wc-status" class="wallchanger-status">stopped</span>
+          </div>
+
+          <div class="wallchanger-section">
+            <h3>Settings</h3>
+            <div class="wallchanger-row">
+              <label for="wc-interval">Interval (minutes)</label>
+              <input type="number" id="wc-interval" min="1" max="1440" value="30">
+            </div>
+            <div class="wallchanger-row">
+              <label for="wc-max-level">Max source level</label>
+              <input type="number" id="wc-max-level" min="1" max="10" value="10">
+            </div>
+            <div class="wallchanger-row">
+              <label for="wc-rotation">Rotation</label>
+              <select id="wc-rotation">
+                <option value="Random">Random</option>
+                <option value="Sequence">Sequence</option>
+              </select>
+            </div>
+            <div class="wallchanger-row">
+              <label for="wc-scaling">Scaling</label>
+              <select id="wc-scaling">
+                <option value="Fill">Fill screen</option>
+                <option value="FitInsideScreen">Fit inside screen</option>
+              </select>
+            </div>
+            <div class="wallchanger-row">
+              <label class="wallchanger-option">
+                <input type="checkbox" id="wc-separate-queues">
+                <span>Separate queue per monitor</span>
+              </label>
+              <label class="wallchanger-option">
+                <input type="checkbox" id="wc-one-monitor">
+                <span>Change one monitor per interval</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="wallchanger-section">
+            <h3>Sources</h3>
+            <div class="wallchanger-sources" id="wc-sources"></div>
+            <div class="wallchanger-source-toolbar">
+              <button id="wc-add-folder" class="vsd-btn">Add folder</button>
+              <button id="wc-remove-source" class="vsd-btn" disabled>Remove</button>
+              <button id="wc-move-up" class="vsd-btn" disabled>Up</button>
+              <button id="wc-move-down" class="vsd-btn" disabled>Down</button>
+            </div>
+          </div>
+
+          <div class="wallchanger-section">
+            <h3>Monitors</h3>
+            <ul id="wc-monitors" class="wallchanger-monitors"></ul>
+          </div>
+
+          <button id="wc-save" class="vsd-btn primary">Save settings</button>
+          <div id="wc-message" class="wallchanger-message"></div>
         </div>
       </section>
     </main>

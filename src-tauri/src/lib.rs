@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 mod elevated_helper;
 mod logger;
+mod wallchanger;
 
 static VSD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static VSD_LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1320,11 +1321,77 @@ pub fn run() {
             save_smart_snapshot,
             format_drive,
             log_message,
+            wallchanger::wc_get_settings,
+            wallchanger::wc_save_settings,
+            wallchanger::wc_get_monitors,
+            wallchanger::wc_apply,
+            wallchanger::wc_change_now,
+            wallchanger::wc_start_service,
+            wallchanger::wc_stop_service,
+            wallchanger::wc_toggle_service,
+            wallchanger::wc_get_status,
         ])
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 elevated_helper::stop_helper();
             }
+        })
+        .setup(|app| {
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::TrayIconBuilder;
+            use tauri::Manager;
+
+            let show = MenuItem::with_id(app, "show", "Show MULA", true, None::<&str>)?;
+            let change = MenuItem::with_id(app, "change", "Change wallpaper", true, None::<&str>)?;
+            let start = MenuItem::with_id(app, "start", "Start", true, None::<&str>)?;
+            let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
+
+            let menu = Menu::with_items(app, &[&show, &change, &start, &stop, &quit])?;
+
+            TrayIconBuilder::with_id("wallchanger-tray")
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Wall Changer")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "change" => {
+                        let _ = wallchanger::settings::load().and_then(|mut s| {
+                            wallchanger::service::apply(&mut s, false)
+                        });
+                    }
+                    "start" => {
+                        let _ = wallchanger::service::start();
+                        let _ = wallchanger::settings::load().and_then(|mut s| {
+                            s.change_service_running = true;
+                            wallchanger::settings::save(&s)
+                        });
+                    }
+                    "stop" => {
+                        let _ = wallchanger::service::stop();
+                        let _ = wallchanger::settings::load().and_then(|mut s| {
+                            s.change_service_running = false;
+                            wallchanger::settings::save(&s)
+                        });
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+
+            // Resume the wallpaper service if it was running.
+            if let Ok(settings) = wallchanger::settings::load() {
+                if settings.change_service_running {
+                    let _ = wallchanger::service::start();
+                }
+            }
+
+            Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
