@@ -1116,10 +1116,12 @@ fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<St
         ps_stderr
     );
 
-    let stdout = std::fs::read_to_string(&out_path)
+    let stdout_bytes = std::fs::read(&out_path)
         .map_err(|e| format!("Failed to read smartctl stdout file '{}': {}", out_path.display(), e))?;
-    let stderr = std::fs::read_to_string(&err_path)
+    let stderr_bytes = std::fs::read(&err_path)
         .map_err(|e| format!("Failed to read smartctl stderr file '{}': {}", err_path.display(), e))?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
     log::info!(
         "Elevated smartctl output: stdout_len={}, stderr_len={}",
         stdout.len(),
