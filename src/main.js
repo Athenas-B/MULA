@@ -477,7 +477,7 @@ async function onRunDriveTest(elevated) {
   if (adminBtn) adminBtn.disabled = true;
 
   try {
-    const data = await invoke(elevated ? "run_drive_test_elevated" : "run_drive_test", { id, test_type: type });
+    const data = await invoke(elevated ? "run_drive_test_elevated" : "run_drive_test", { id, testType: type });
     if (testStatus) {
       testStatus.textContent = data;
       testStatus.className = "smart-test-status success";
