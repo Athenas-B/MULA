@@ -548,8 +548,8 @@ async function onRunDriveTest() {
 }
 
 function extractSelfTestProgress(full) {
-  const statusRegex = /(?:Self-test execution status|Self-test status):[\s\S]*?(?=\n(?:SMART|Self-test Log|={3,})|$)/i;
-  const logRegex = /(?:SMART (?:Extended )?Self-test log|Self-test Log)[\s\S]*?(?=\n(?:SMART|={3,})|$)/i;
+  const statusRegex = /(?:Self-test execution status|Self-test status):[\s\S]*?(?=\n[A-Z]|$)/i;
+  const logRegex = /(?:SMART (?:Extended )?Self-test log|Self-test Log|No Self-tests Logged)[\s\S]*?(?=\n(?:SMART|={3,})|$)/i;
   const statusMatch = full.match(statusRegex);
   const logMatch = full.match(logRegex);
   const status = statusMatch ? statusMatch[0].trim() : "Self-test status not available";
@@ -559,7 +559,8 @@ function extractSelfTestProgress(full) {
     lowerStatus.includes("in progress") &&
     !lowerStatus.includes("no self-test in progress") &&
     !lowerStatus.includes("no selftest in progress");
-  return { text: `${status}\n\n${log}`, inProgress };
+  const hasFailed = lowerStatus.includes("failed");
+  return { status, log, text: `${status}\n\n${log}`, inProgress, hasFailed };
 }
 
 function startTestProgressPolling(id) {
@@ -583,11 +584,16 @@ async function pollTestStatus(id) {
 
   try {
     const full = await invoke("get_drive_smart_elevated", { id });
-    const { text, inProgress } = extractSelfTestProgress(full);
-    const hasFailed = text.toLowerCase().includes("failed");
+    const { status, log, inProgress, hasFailed } = extractSelfTestProgress(full);
+
+    let header = inProgress
+      ? "Monitoring self-test progress... (updates every 10s)"
+      : hasFailed
+      ? "Self-test failed"
+      : "Self-test finished";
 
     if (testStatus) {
-      testStatus.textContent = `Monitoring self-test progress... (updates every 10s)\n\n${text}`;
+      testStatus.textContent = `${header}\n\n${status}\n\n${log}`;
       testStatus.className = hasFailed ? "smart-test-status error" : "smart-test-status";
     }
 
@@ -630,13 +636,10 @@ async function onCheckDriveTestStatus() {
 
   try {
     const full = await invoke("get_drive_smart_elevated", { id });
-    const { text, inProgress } = extractSelfTestProgress(full);
-    if (text.toLowerCase().includes("failed")) {
-      throw text;
-    }
+    const { text, inProgress, hasFailed } = extractSelfTestProgress(full);
     if (testStatus) {
       testStatus.textContent = text;
-      testStatus.className = inProgress ? "smart-test-status" : "smart-test-status success";
+      testStatus.className = hasFailed ? "smart-test-status error" : inProgress ? "smart-test-status" : "smart-test-status success";
     }
   } catch (err) {
     console.error(err);
