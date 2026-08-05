@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod logger;
 
@@ -1049,21 +1050,72 @@ fn normalize_serial(s: &str) -> String {
     s.to_lowercase().trim().trim_end_matches('.').replace(' ', "")
 }
 
-#[tauri::command]
-async fn get_drive_smart(id: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let number = extract_physical_drive_number(&id)?;
-        let pd_path = format!(r"/dev/pd{}", number);
+fn smartctl_temp_file(suffix: &str) -> std::path::PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("mula_smart_{pid}_{ts}_{suffix}.txt"))
+}
 
-        let smartctl = ensure_smartctl()?;
+fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let out_path = smartctl_temp_file("out");
+    let err_path = smartctl_temp_file("err");
 
-        // Look up the drive we already enumerated so we can match by serial.
-        let drives = list_physical_drives_impl()?;
-        let drive = drives
-            .into_iter()
-            .find(|d| d.id == id || d.device_id == id)
-            .ok_or_else(|| format!("Drive not found: {id}"))?;
-        let expected_serial = normalize_serial(&drive.serial);
+    let smartctl_ps = smartctl.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let arg_list = args
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let out_ps = out_path.to_string_lossy().replace('\\', "\\\\");
+    let err_ps = err_path.to_string_lossy().replace('\\', "\\\\");
+
+    let ps = format!(
+        "Start-Process -FilePath \"{}\" -ArgumentList {} -Verb runAs -Wait -RedirectStandardOutput \"{}\" -RedirectStandardError \"{}\"",
+        smartctl_ps, arg_list, out_ps, err_ps
+    );
+
+    let output = Command::new("powershell")
+        .args(["-ExecutionPolicy", "Bypass", "-Command", &ps])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to start elevated smartctl: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("smartctl elevation failed: {}", stderr.trim()));
+    }
+
+    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+
+    if !stdout.trim().is_empty() {
+        return Ok(stdout);
+    }
+    if !stderr.trim().is_empty() {
+        return Err(format!("smartctl error: {}", stderr.trim()));
+    }
+    Err("smartctl returned no output".to_string())
+}
+
+fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String> {
+    let number = extract_physical_drive_number(&id)?;
+    let pd_path = format!(r"/dev/pd{}", number);
+
+    let smartctl = ensure_smartctl()?;
+
+    // Look up the drive we already enumerated so we can match by serial.
+    let drives = list_physical_drives_impl()?;
+    let drive = drives
+        .into_iter()
+        .find(|d| d.id == id || d.device_id == id)
+        .ok_or_else(|| format!("Drive not found: {id}"))?;
+    let expected_serial = normalize_serial(&drive.serial);
 
     // Prefer the device and type reported by smartctl --scan, but verify the
     // serial before trusting the mapping.
@@ -1080,45 +1132,68 @@ async fn get_drive_smart(id: String) -> Result<String, String> {
         }
     }
 
-    // If no serial match, fall back to the scan entry with the same
-    // physical number, then to brute-force device types on /dev/pdN.
+    // If no serial match, fall back to the scan entry with the same physical number.
     if matched.is_none() {
         if let Some((_, device, dtype)) = scan.iter().find(|(n, _, _)| *n == number) {
             matched = Some((device.clone(), dtype.clone()));
         }
     }
 
+    let run_a = |smartctl: &std::path::Path, args: &[&str]| -> Result<String, String> {
+        if elevated {
+            run_smartctl_elevated(smartctl, args)
+        } else {
+            let (stdout, stderr, _code) = run_smartctl(smartctl, args)?;
+            if !stdout.trim().is_empty() {
+                Ok(stdout)
+            } else if !stderr.trim().is_empty() {
+                Err(format!("smartctl error: {}", stderr.trim()))
+            } else {
+                Err("smartctl returned no output".to_string())
+            }
+        }
+    };
+
     if let Some((device, dtype)) = matched {
-        let (stdout, stderr, _code) = run_smartctl(&smartctl, &["-a", "-d", &dtype, &device])?;
-        if !stdout.trim().is_empty() {
-            return Ok(stdout);
+        let out = run_a(&smartctl, &["-a", "-d", &dtype, &device])?;
+        if out.trim().is_empty() {
+            return Err("smartctl returned no output".to_string());
         }
-        if !stderr.trim().is_empty() {
-            return Err(format!("smartctl error: {}", stderr.trim()));
-        }
+        return Ok(out);
     }
 
     // Fallback: try common device types on the /dev/pdN alias.
     let fallback_types = ["sat", "nvme", "ata", "scsi"];
     let mut last_error = String::new();
     for dtype in &fallback_types {
-        let (stdout, stderr, _code) = run_smartctl(&smartctl, &["-a", "-d", dtype, &pd_path])?;
-        if !stdout.trim().is_empty() && !stderr.contains("failed") && !stderr.contains("Open failed") {
-            return Ok(stdout);
-        }
-        if !stderr.trim().is_empty() {
-            last_error = stderr.trim().to_string();
+        match run_a(&smartctl, &["-a", "-d", dtype, &pd_path]) {
+            Ok(out) if !out.trim().is_empty() && !out.to_lowercase().contains("open failed") => {
+                return Ok(out);
+            }
+            Ok(out) => last_error = out,
+            Err(e) => last_error = e,
         }
     }
 
     if !last_error.is_empty() {
-        return Err(format!("smartctl error: {}", last_error));
+        return Err(format!("smartctl error: {}", last_error.trim()));
     }
 
-        Err("No SMART data available for this drive.".to_string())
-    })
-    .await
-    .map_err(|e| format!("Background task failed: {e}"))?
+    Err("No SMART data available for this drive.".to_string())
+}
+
+#[tauri::command]
+async fn get_drive_smart(id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, false))
+        .await
+        .map_err(|e| format!("Background task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn get_drive_smart_elevated(id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, true))
+        .await
+        .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1126,26 +1201,7 @@ fn log_message(level: String, message: String) {
     logger::log_message(&level, &message);
 }
 
-#[tauri::command]
-fn restart_as_admin() -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Could not determine application path: {e}"))?;
-    let exe_str = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-    let ps = format!("Start-Process -FilePath \"{}\" -Verb runAs", exe_str);
 
-    // Give the new process a moment to be requested before exiting.
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        std::process::exit(0);
-    });
-
-    std::process::Command::new("powershell")
-        .args(["-ExecutionPolicy", "Bypass", "-Command", &ps])
-        .spawn()
-        .map_err(|e| format!("Failed to request elevation: {e}"))?;
-
-    Ok(())
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1172,8 +1228,8 @@ pub fn run() {
             list_physical_drives,
             get_drive_details,
             get_drive_smart,
+            get_drive_smart_elevated,
             log_message,
-            restart_as_admin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -356,7 +356,7 @@ async function initDriveTest() {
     smartToggle.addEventListener("click", () => onSmartToggle(smartToggle, smartContent));
   }
   if (smartRetry) {
-    smartRetry.addEventListener("click", () => invoke("restart_as_admin"));
+    smartRetry.addEventListener("click", () => onSmartRetryAdmin());
   }
   await loadDrives();
 }
@@ -425,6 +425,29 @@ function needsAdminRights(text) {
     t.includes("elevation") ||
     t.includes("permission")
   );
+}
+
+async function onSmartRetryAdmin() {
+  const select = document.getElementById("drive-select");
+  const smartData = document.getElementById("smart-data");
+  const smartStatus = document.getElementById("smart-status");
+  const smartAdmin = document.getElementById("smart-admin");
+  const id = select.value;
+  if (!id) return;
+
+  if (smartAdmin) smartAdmin.classList.add("hidden");
+  smartData.textContent = "";
+  smartStatus.textContent = "Loading SMART data with administrator privileges...";
+  smartStatus.classList.remove("hidden");
+  try {
+    const data = await invoke("get_drive_smart_elevated", { id });
+    smartData.textContent = data;
+    smartLoadedId = id;
+  } catch (err) {
+    smartData.textContent = `Error: ${err}`;
+  } finally {
+    smartStatus.classList.add("hidden");
+  }
 }
 
 async function onSmartToggle(toggle, content) {
