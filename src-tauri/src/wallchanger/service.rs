@@ -1,5 +1,5 @@
 use super::images::{is_eligible_source, load_images};
-use super::monitors::{apply_display_settings, get_monitors, set_wallpaper_for_monitor};
+use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, set_wallpaper_for_monitor, try_disable_windows_slideshow};
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor};
 use super::settings::{load, save, Settings};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +96,7 @@ pub fn apply(settings: &mut Settings, change_one_monitor_only: bool) -> Result<S
 
     let monitors = get_monitors()?;
     apply_display_settings(&settings.scaling_mode, settings.background_color_argb)?;
+    handle_windows_slideshow_conflict(settings);
 
     if monitors.is_empty() {
         return Err("No monitors found".to_string());
@@ -161,6 +162,24 @@ fn select_target_monitors<'a>(
         (vec![&monitors[index]], Some(next))
     } else {
         (monitors.iter().collect(), None)
+    }
+}
+
+fn handle_windows_slideshow_conflict(settings: &Settings) {
+    if !settings.disable_windows_slideshow_when_running {
+        return;
+    }
+
+    match is_windows_slideshow_enabled() {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Err(e) = try_disable_windows_slideshow() {
+                log::warn!("Windows slideshow is enabled but could not be disabled: {e}");
+            }
+        }
+        Err(e) => {
+            log::warn!("Could not detect Windows slideshow state: {e}");
+        }
     }
 }
 

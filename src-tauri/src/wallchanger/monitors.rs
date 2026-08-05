@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
-use windows::Win32::UI::Shell::{DesktopWallpaper, DESKTOP_WALLPAPER_POSITION, IDesktopWallpaper};
+use windows::Win32::UI::Shell::{DesktopWallpaper, DESKTOP_WALLPAPER_POSITION, DSS_ENABLED, IDesktopWallpaper};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Monitor {
@@ -124,4 +124,56 @@ fn argb_to_colorref(argb: i32) -> u32 {
     let g = (argb >> 8) & 0xFF;
     let b = argb & 0xFF;
     (b as u32) << 16 | (g as u32) << 8 | (r as u32)
+}
+
+pub fn is_windows_slideshow_enabled() -> Result<bool, String> {
+    initialize_com()?;
+    let wallpaper = create_desktop_wallpaper()?;
+
+    unsafe {
+        let state = wallpaper.GetStatus()
+            .map_err(|e| format!("Failed to get wallpaper status: {e}"))?;
+        Ok(state.contains(DSS_ENABLED))
+    }
+}
+
+fn get_wallpaper_for_monitor(wallpaper: &IDesktopWallpaper, monitor_id: &HSTRING) -> Result<String, String> {
+    unsafe {
+        let path_pwstr = wallpaper.GetWallpaper(monitor_id)
+            .map_err(|e| format!("Failed to get current wallpaper: {e}"))?;
+        let path = path_pwstr.to_string()
+            .map_err(|e| format!("Failed to read wallpaper path: {e}"))?;
+        CoTaskMemFree(Some(path_pwstr.as_ptr() as *const _));
+        Ok(path)
+    }
+}
+
+pub fn try_disable_windows_slideshow() -> Result<(), String> {
+    initialize_com()?;
+    let wallpaper = create_desktop_wallpaper()?;
+
+    unsafe {
+        let count = wallpaper.GetMonitorDevicePathCount()
+            .map_err(|e| format!("Failed to get monitor count: {e}"))?;
+
+        for i in 0..count {
+            let id_pwstr = wallpaper.GetMonitorDevicePathAt(i)
+                .map_err(|e| format!("Failed to get monitor device path: {e}"))?;
+            let id = id_pwstr.to_string()
+                .map_err(|e| format!("Failed to read monitor id: {e}"))?;
+            CoTaskMemFree(Some(id_pwstr.as_ptr() as *const _));
+
+            let id_hstring = HSTRING::from(&id);
+            let current = match get_wallpaper_for_monitor(&wallpaper, &id_hstring) {
+                Ok(p) if !p.is_empty() => p,
+                _ => continue,
+            };
+
+            let current_hstring = HSTRING::from(&current);
+            wallpaper.SetWallpaper(&id_hstring, &current_hstring)
+                .map_err(|e| format!("Failed to reapply wallpaper to stop slideshow: {e}"))?;
+        }
+    }
+
+    Ok(())
 }
