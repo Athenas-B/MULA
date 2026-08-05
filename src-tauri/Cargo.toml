@@ -1,6 +1,6 @@
 [package]
 name = "mula"
-version = "1.0.0"
+version = "2.0.0"
 description = "MULA - Managed Utility Local Automator"
 authors = ["Athenas-B"]
 edition = "2021"
