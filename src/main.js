@@ -85,7 +85,6 @@ async function loadAutostart() {
     if (enabled && !vsdRunning) {
       // Auto-start the server
       updateVsdUi(true);
-      clearLog();
       appendLog("[Autostart: starting server...]\n");
       startLogPolling();
       await invoke("vsd_start");
@@ -199,7 +198,6 @@ async function toggleVsd() {
     } else {
       // Update UI immediately before the async start
       updateVsdUi(true);
-      clearLog();
       appendLog("[Starting server...]\n");
       startLogPolling();
 
