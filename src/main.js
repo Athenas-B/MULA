@@ -343,6 +343,8 @@ async function initDriveTest() {
   const smartRetry = document.getElementById("smart-retry-admin");
   const smartRunTest = document.getElementById("smart-run-test");
   const smartRunTestAdmin = document.getElementById("smart-run-test-admin");
+  const smartCheckStatus = document.getElementById("smart-check-status");
+  const smartCheckStatusAdmin = document.getElementById("smart-check-status-admin");
   if (!select || !refreshBtn) return;
 
   select.addEventListener("change", onDriveSelect);
@@ -365,6 +367,12 @@ async function initDriveTest() {
   }
   if (smartRunTestAdmin) {
     smartRunTestAdmin.addEventListener("click", () => onRunDriveTest(true));
+  }
+  if (smartCheckStatus) {
+    smartCheckStatus.addEventListener("click", () => onCheckDriveTestStatus(false));
+  }
+  if (smartCheckStatusAdmin) {
+    smartCheckStatusAdmin.addEventListener("click", () => onCheckDriveTestStatus(true));
   }
   await loadDrives();
 }
@@ -478,6 +486,52 @@ async function onRunDriveTest(elevated) {
 
   try {
     const data = await invoke(elevated ? "run_drive_test_elevated" : "run_drive_test", { id, testType: type });
+    if (needsAdminRights(data) || String(data).toLowerCase().includes("failed")) {
+      throw data;
+    }
+    if (testStatus) {
+      testStatus.textContent = "Test started. Use Check status to see progress.";
+      testStatus.className = "smart-test-status success";
+    }
+    if (adminBtn) adminBtn.classList.add("hidden");
+  } catch (err) {
+    console.error(err);
+    if (testStatus) {
+      testStatus.textContent = `Error: ${err}`;
+      testStatus.className = "smart-test-status error";
+    }
+    if (runBtn) runBtn.disabled = false;
+    if (adminBtn) {
+      adminBtn.disabled = false;
+      if (needsAdminRights(err)) {
+        adminBtn.classList.remove("hidden");
+      } else {
+        adminBtn.classList.add("hidden");
+      }
+    }
+  }
+}
+
+async function onCheckDriveTestStatus(elevated) {
+  const select = document.getElementById("drive-select");
+  const testStatus = document.getElementById("smart-test-status");
+  const checkBtn = document.getElementById("smart-check-status");
+  const adminBtn = document.getElementById("smart-check-status-admin");
+  const id = select.value;
+  if (!id) return;
+
+  if (testStatus) {
+    testStatus.textContent = elevated ? "Checking test status with administrator privileges..." : "Checking test status...";
+    testStatus.className = "smart-test-status";
+  }
+  if (checkBtn) checkBtn.disabled = true;
+  if (adminBtn) adminBtn.disabled = true;
+
+  try {
+    const data = await invoke(elevated ? "get_drive_test_status_elevated" : "get_drive_test_status", { id });
+    if (needsAdminRights(data) || String(data).toLowerCase().includes("failed")) {
+      throw data;
+    }
     if (testStatus) {
       testStatus.textContent = data;
       testStatus.className = "smart-test-status success";
@@ -489,7 +543,7 @@ async function onRunDriveTest(elevated) {
       testStatus.textContent = `Error: ${err}`;
       testStatus.className = "smart-test-status error";
     }
-    if (runBtn) runBtn.disabled = false;
+    if (checkBtn) checkBtn.disabled = false;
     if (adminBtn) {
       adminBtn.disabled = false;
       if (needsAdminRights(err)) {

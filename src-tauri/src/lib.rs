@@ -1277,6 +1277,32 @@ async fn run_drive_test_elevated(id: String, test_type: String) -> Result<String
 }
 
 #[tauri::command]
+async fn get_drive_test_status(id: String) -> Result<String, String> {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        run_smartctl_on_drive(id, false, &["-l", "selftest"])
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?;
+    if let Err(ref e) = res {
+        log::error!("get_drive_test_status failed: {}", e);
+    }
+    res
+}
+
+#[tauri::command]
+async fn get_drive_test_status_elevated(id: String) -> Result<String, String> {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        run_smartctl_on_drive(id, true, &["-l", "selftest"])
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?;
+    if let Err(ref e) = res {
+        log::error!("get_drive_test_status_elevated failed: {}", e);
+    }
+    res
+}
+
+#[tauri::command]
 fn log_message(level: String, message: String) {
     logger::log_message(&level, &message);
 }
@@ -1311,6 +1337,8 @@ pub fn run() {
             get_drive_smart_elevated,
             run_drive_test,
             run_drive_test_elevated,
+            get_drive_test_status,
+            get_drive_test_status_elevated,
             log_message,
         ])
         .run(tauri::generate_context!())

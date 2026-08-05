@@ -485,6 +485,8 @@ body {
   font-size: 0.85rem;
   color: #333;
   min-height: 1.2em;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .smart-test-status.error {
