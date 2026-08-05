@@ -413,15 +413,17 @@ async function loadDrives() {
 
 let smartLoadedId = null;
 
-function isAdminPrivilegeError(err) {
-  const text = String(err).toLowerCase();
+function needsAdminRights(text) {
+  const t = String(text).toLowerCase();
   return (
-    text.includes("error=5") ||
-    text.includes("access is denied") ||
-    text.includes("access denied") ||
-    text.includes("administrator") ||
-    text.includes("elevation") ||
-    text.includes("permission")
+    t.includes("error=5") ||
+    t.includes("access is denied") ||
+    t.includes("access denied") ||
+    t.includes("admin rights") ||
+    t.includes("requires admin") ||
+    t.includes("administrator") ||
+    t.includes("elevation") ||
+    t.includes("permission")
   );
 }
 
@@ -446,9 +448,12 @@ async function onSmartToggle(toggle, content) {
       const data = await invoke("get_drive_smart", { id });
       smartData.textContent = data;
       smartLoadedId = id;
+      if (smartAdmin && needsAdminRights(data)) {
+        smartAdmin.classList.remove("hidden");
+      }
     } catch (err) {
       smartData.textContent = `Error: ${err}`;
-      if (smartAdmin && isAdminPrivilegeError(err)) {
+      if (smartAdmin && needsAdminRights(err)) {
         smartAdmin.classList.remove("hidden");
       }
     } finally {
