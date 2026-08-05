@@ -427,6 +427,28 @@ async function loadDrives() {
 let smartLoadedId = null;
 let testPollInterval = null;
 let testPollNoProgressCount = 0;
+let formatTimer = null;
+
+function stopFormatTimer() {
+  if (formatTimer) {
+    clearInterval(formatTimer);
+    formatTimer = null;
+  }
+}
+
+function startFormatTimer(statusEl) {
+  stopFormatTimer();
+  const start = Date.now();
+  formatTimer = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - start) / 1000);
+    const m = Math.floor(elapsed / 60).toString().padStart(2, "0");
+    const s = (elapsed % 60).toString().padStart(2, "0");
+    if (statusEl) {
+      statusEl.textContent = `Formatting... (elapsed ${m}:${s}). Do not close the app.`;
+      statusEl.className = "drive-format-status";
+    }
+  }, 1000);
+}
 
 function stopTestProgressPolling() {
   if (testPollInterval) {
@@ -564,7 +586,9 @@ function extractSelfTestProgress(full) {
     !lowerStatus.includes("no self-test in progress") &&
     !lowerStatus.includes("no selftest in progress");
   const hasFailed = lowerStatus.includes("failed");
-  return { status, log, text: `${status}\n\n${log}`, inProgress, hasFailed };
+  const progressMatch = status.match(/(\d+)%\s*(?:remaining|left)/i);
+  const progress = progressMatch ? `${progressMatch[1]}% remaining` : null;
+  return { status, log, text: `${status}\n\n${log}`, inProgress, hasFailed, progress };
 }
 
 function startTestProgressPolling(id) {
@@ -588,13 +612,18 @@ async function pollTestStatus(id) {
 
   try {
     const full = await invoke("get_drive_smart_elevated", { id });
-    const { status, log, inProgress, hasFailed } = extractSelfTestProgress(full);
+    const { status, log, inProgress, hasFailed, progress } = extractSelfTestProgress(full);
 
-    let header = inProgress
-      ? "Monitoring self-test progress... (updates every 10s)"
-      : hasFailed
-      ? "Self-test failed"
-      : "Self-test finished";
+    let header;
+    if (inProgress) {
+      header = progress
+        ? `Monitoring self-test progress... (${progress}, updates every 10s)`
+        : "Monitoring self-test progress... (updates every 10s)";
+    } else if (hasFailed) {
+      header = "Self-test failed";
+    } else {
+      header = "Self-test finished";
+    }
 
     if (testStatus) {
       testStatus.textContent = `${header}\n\n${status}\n\n${log}`;
@@ -676,14 +705,12 @@ async function onFormatDrive() {
   );
   if (!confirmed) return;
 
-  if (formatStatus) {
-    formatStatus.textContent = "Formatting... This may take a long time. Do not close the app.";
-    formatStatus.className = "drive-format-status";
-  }
   if (formatBtn) formatBtn.disabled = true;
+  startFormatTimer(formatStatus);
 
   try {
     const result = await invoke("format_drive", { id });
+    stopFormatTimer();
     await loadDrives();
     if (select) select.value = id;
     onDriveSelect();
@@ -692,6 +719,7 @@ async function onFormatDrive() {
       formatStatus.className = "drive-format-status success";
     }
   } catch (err) {
+    stopFormatTimer();
     console.error(err);
     if (formatStatus) {
       formatStatus.textContent = `Error: ${err}`;
