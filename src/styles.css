@@ -749,21 +749,6 @@ body {
   color: #28a745;
 }
 
-.vsd-toggle.running {
-  color: #28a745;
-  border-color: #28a745;
-}
-
-.vsd-toggle.stopped {
-  color: #dc3545;
-  border-color: #dc3545;
-}
-
-.vsd-toggle .toggle-icon::before {
-  content: "\25CF";
-  font-size: 0.8rem;
-}
-
 /* ── Dark mode ── */
 @media (prefers-color-scheme: dark) {
   :root {
