@@ -109,7 +109,6 @@ async function installExtension(browser) {
   const originalText = btn.querySelector(".btn-text").textContent;
   btn.disabled = true;
   btn.querySelector(".btn-text").textContent = "Building...";
-  clearLog();
   try {
     const extPath = await invoke("vsd_install_extension", { browser });
     btn.querySelector(".btn-text").textContent = "Done";
