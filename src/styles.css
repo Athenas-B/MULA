@@ -472,13 +472,27 @@ body {
   margin-bottom: 10px;
 }
 
-.smart-test-select {
-  padding: 6px 10px;
-  border: 1px solid #ced4da;
-  border-radius: 6px;
-  background: #fff;
+.smart-test-types {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.smart-test-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 0.85rem;
-  min-width: 180px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.smart-test-option input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
 }
 
 .smart-test-status {
@@ -630,6 +644,10 @@ body {
 
   .smart-test-status {
     color: #ddd;
+  }
+
+  .smart-test-option {
+    color: #f5f5f5;
   }
 
   .drive-empty {

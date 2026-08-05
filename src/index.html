@@ -92,6 +92,25 @@
             </button>
           </div>
           <div id="drive-details" class="drive-details">
+            <div id="smart-test" class="smart-test hidden">
+              <h4 class="smart-test-title">SMART self-test</h4>
+              <div class="smart-test-row">
+                <div class="smart-test-types">
+                  <label class="smart-test-option">
+                    <input type="checkbox" name="smart-test-type" value="short" checked>
+                    <span>Short self-test</span>
+                  </label>
+                  <label class="smart-test-option">
+                    <input type="checkbox" name="smart-test-type" value="long">
+                    <span>Long/extended self-test</span>
+                  </label>
+                </div>
+                <button id="smart-run-test" class="vsd-btn">Run test</button>
+                <button id="smart-check-status" class="vsd-btn">Check status</button>
+              </div>
+              <div id="smart-test-status" class="smart-test-status"></div>
+            </div>
+
             <button id="drive-toggle" class="drive-toggle" aria-expanded="true">
               <span class="toggle-icon">-</span>
               <span class="toggle-text">Drive Information</span>
@@ -115,18 +134,6 @@
                   <button id="smart-retry-admin" class="vsd-btn">
                     <span class="btn-text">Load with Administrator</span>
                   </button>
-                </div>
-                <div id="smart-test" class="smart-test hidden">
-                  <h4 class="smart-test-title">SMART self-test</h4>
-                  <div class="smart-test-row">
-                    <select id="smart-test-type" class="smart-test-select">
-                      <option value="short">Short self-test</option>
-                      <option value="long">Long/extended self-test</option>
-                    </select>
-                    <button id="smart-run-test" class="vsd-btn">Run test</button>
-                    <button id="smart-check-status" class="vsd-btn">Check status</button>
-                  </div>
-                  <div id="smart-test-status" class="smart-test-status"></div>
                 </div>
               </div>
             </div>

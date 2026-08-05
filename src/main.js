@@ -366,6 +366,17 @@ async function initDriveTest() {
   if (smartCheckStatus) {
     smartCheckStatus.addEventListener("click", () => onCheckDriveTestStatus());
   }
+
+  document.querySelectorAll('input[name="smart-test-type"]').forEach((cb) => {
+    cb.addEventListener("change", () => {
+      if (cb.checked) {
+        document.querySelectorAll('input[name="smart-test-type"]').forEach((other) => {
+          if (other !== cb) other.checked = false;
+        });
+      }
+    });
+  });
+
   await loadDrives();
 }
 
@@ -461,12 +472,18 @@ async function onSmartRetryAdmin() {
 
 async function onRunDriveTest() {
   const select = document.getElementById("drive-select");
-  const testType = document.getElementById("smart-test-type");
+  const testType = document.querySelector('input[name="smart-test-type"]:checked');
   const testStatus = document.getElementById("smart-test-status");
   const runBtn = document.getElementById("smart-run-test");
   const id = select.value;
-  const type = testType.value;
-  if (!id || !type) return;
+  const type = testType?.value;
+  if (!id || !type) {
+    if (testStatus) {
+      testStatus.textContent = "Select a test type to run";
+      testStatus.className = "smart-test-status error";
+    }
+    return;
+  }
 
   if (testStatus) {
     testStatus.textContent = "Starting test with administrator privileges...";
@@ -532,7 +549,6 @@ async function onSmartToggle(toggle, content) {
   const smartData = document.getElementById("smart-data");
   const smartStatus = document.getElementById("smart-status");
   const smartAdmin = document.getElementById("smart-admin");
-  const smartTest = document.getElementById("smart-test");
   const id = select.value;
 
   const collapsed = content.classList.toggle("collapsed");
@@ -540,19 +556,6 @@ async function onSmartToggle(toggle, content) {
   toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
 
   if (smartAdmin) smartAdmin.classList.add("hidden");
-  const runBtn = document.getElementById("smart-run-test");
-  const checkBtn = document.getElementById("smart-check-status");
-
-  if (runBtn) runBtn.disabled = false;
-  if (checkBtn) checkBtn.disabled = false;
-
-  if (smartTest) {
-    if (collapsed || !id) {
-      smartTest.classList.add("hidden");
-    } else {
-      smartTest.classList.remove("hidden");
-    }
-  }
 
   if (!collapsed && id && smartLoadedId !== id) {
     smartData.textContent = "";
@@ -588,18 +591,20 @@ function onDriveSelect() {
   const smartData = document.getElementById("smart-data");
   const smartAdmin = document.getElementById("smart-admin");
   const smartTest = document.getElementById("smart-test");
+  const runBtn = document.getElementById("smart-run-test");
+  const checkBtn = document.getElementById("smart-check-status");
 
   smartLoadedId = null;
   smartData.textContent = "Select a drive and expand to load SMART data.";
   if (smartContent) smartContent.classList.add("collapsed");
   if (smartAdmin) smartAdmin.classList.add("hidden");
-  if (smartTest) smartTest.classList.add("hidden");
   if (smartToggle) {
     smartToggle.setAttribute("aria-expanded", "false");
     smartToggle.querySelector(".toggle-icon").textContent = "+";
   }
 
   if (!id) {
+    if (smartTest) smartTest.classList.add("hidden");
     empty.classList.remove("hidden");
     details.classList.add("hidden");
     tbody.innerHTML = "";
@@ -640,6 +645,12 @@ function onDriveSelect() {
   tbody.innerHTML = fields
     .map(([label, value]) => `<tr><td class="label">${label}</td><td class="value">${value || "N/A"}</td></tr>`)
     .join("");
+
+  if (smartTest) {
+    smartTest.classList.remove("hidden");
+  }
+  if (runBtn) runBtn.disabled = false;
+  if (checkBtn) checkBtn.disabled = false;
 
   empty.classList.add("hidden");
   details.classList.remove("hidden");
