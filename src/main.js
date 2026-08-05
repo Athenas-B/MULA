@@ -868,7 +868,7 @@ async function initWallchanger() {
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
 
-  for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-separate-queues", "wc-one-monitor"]) {
+  for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-separate-queues", "wc-unique-queues", "wc-one-monitor"]) {
     document.getElementById(id)?.addEventListener("change", () => {
       wcUpdateModelFromUi();
     });
@@ -895,6 +895,7 @@ function wcRenderSettings() {
   document.getElementById("wc-rotation").value = wcSettings.rotation_mode;
   document.getElementById("wc-scaling").value = wcSettings.scaling_mode;
   document.getElementById("wc-separate-queues").checked = wcSettings.use_separate_monitor_queues;
+  document.getElementById("wc-unique-queues").checked = wcSettings.keep_image_in_single_monitor_queue;
   document.getElementById("wc-one-monitor").checked = wcSettings.change_one_monitor_per_interval;
 }
 
@@ -961,6 +962,7 @@ function wcUpdateModelFromUi() {
   wcSettings.rotation_mode = document.getElementById("wc-rotation").value;
   wcSettings.scaling_mode = document.getElementById("wc-scaling").value;
   wcSettings.use_separate_monitor_queues = document.getElementById("wc-separate-queues").checked;
+  wcSettings.keep_image_in_single_monitor_queue = document.getElementById("wc-unique-queues").checked;
   wcSettings.change_one_monitor_per_interval = document.getElementById("wc-one-monitor").checked;
 }
 

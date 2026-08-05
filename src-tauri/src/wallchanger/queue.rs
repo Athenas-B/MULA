@@ -137,22 +137,49 @@ pub fn build_queues(images: &[ImageInfo], monitors: &[Monitor], settings: &Setti
             })
             .collect();
 
-        shared.sort_by(|a, b| {
-            a.last_resort
-                .cmp(&b.last_resort)
-                .then(a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
-        });
-
+        shared.sort_by(rank_sort);
         queues.insert("shared".to_string(), shared);
         return queues;
     }
 
-    for monitor in monitors {
-        let key = get_queue_key(settings, monitors.len(), &monitor.id, false);
-        queues.insert(key, rank_images_for_monitor(images, monitor, settings));
+    if settings.keep_image_in_single_monitor_queue {
+        // Assign each image to exactly one monitor queue (the one it fits best).
+        for image in images {
+            let mut best: Option<(String, RankedImage)> = None;
+            for monitor in monitors {
+                let (score, last_resort) = score_image(image, monitor, settings);
+                let key = get_queue_key(settings, monitors.len(), &monitor.id, false);
+                if best.is_none() || score < best.as_ref().unwrap().1.score {
+                    best = Some((key, RankedImage {
+                        image: image.clone(),
+                        score,
+                        last_resort,
+                    }));
+                }
+            }
+            if let Some((key, ranked)) = best {
+                queues.entry(key).or_default().push(ranked);
+            }
+        }
+
+        for queue in queues.values_mut() {
+            queue.sort_by(rank_sort);
+        }
+    } else {
+        // Each monitor gets its own queue containing all images.
+        for monitor in monitors {
+            let key = get_queue_key(settings, monitors.len(), &monitor.id, false);
+            queues.insert(key, rank_images_for_monitor(images, monitor, settings));
+        }
     }
 
     queues
+}
+
+fn rank_sort(a: &RankedImage, b: &RankedImage) -> std::cmp::Ordering {
+    a.last_resort
+        .cmp(&b.last_resort)
+        .then(a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 pub fn ensure_queue_state<'a>(
