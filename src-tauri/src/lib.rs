@@ -3,6 +3,8 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
+mod logger;
+
 static VSD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static VSD_LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -149,6 +151,7 @@ async fn vsd_start() -> Result<(), String> {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 if let Ok(line) = line {
+                    log::info!("[VSD] {line}");
                     if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
                         logs.push(format!("{line}\n"));
                         if logs.len() > 1000 {
@@ -166,6 +169,7 @@ async fn vsd_start() -> Result<(), String> {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 if let Ok(line) = line {
+                    log::info!("[VSD] {line}");
                     if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
                         logs.push(format!("{line}\n"));
                         if logs.len() > 1000 {
@@ -317,7 +321,7 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
         let _ = std::thread::spawn(move || {
             let req = urllib_post("http://127.0.0.1:8765/config/download_dir", &body);
             if let Err(e) = req {
-                eprintln!("Failed to update running server download dir: {e}");
+                log::error!("Failed to update running server download dir: {e}");
             }
         });
     }
@@ -1117,8 +1121,17 @@ async fn get_drive_smart(id: String) -> Result<String, String> {
     .map_err(|e| format!("Background task failed: {e}"))?
 }
 
+#[tauri::command]
+fn log_message(level: String, message: String) {
+    logger::log_message(&level, &message);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = logger::init();
+
+    log::info!("MULA starting");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1137,6 +1150,7 @@ pub fn run() {
             list_physical_drives,
             get_drive_details,
             get_drive_smart,
+            log_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

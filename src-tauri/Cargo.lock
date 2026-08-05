@@ -2004,6 +2004,7 @@ version = "1.0.0"
 dependencies = [
  "chrono",
  "dirs",
+ "log",
  "serde",
  "serde_json",
  "tauri",

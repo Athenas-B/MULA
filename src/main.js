@@ -2,6 +2,25 @@ const { invoke } = window.__TAURI__.core;
 const { revealItemInDir } = window.__TAURI__.opener;
 const { open: openDialog } = window.__TAURI__.dialog;
 
+// Forward console messages to the Rust file logger
+(function setupConsoleLogging() {
+  const forward = (level, original) => {
+    return function (...args) {
+      original.apply(console, args);
+      try {
+        const message = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+        if (message) {
+          invoke("log_message", { level, message }).catch(() => {});
+        }
+      } catch (_) {}
+    };
+  };
+  console.log = forward("info", console.log);
+  console.info = forward("info", console.info);
+  console.warn = forward("warn", console.warn);
+  console.error = forward("error", console.error);
+})();
+
 // Tab switching
 function initTabs() {
   const tabs = document.querySelectorAll(".tab");
