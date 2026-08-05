@@ -340,6 +340,7 @@ async function initDriveTest() {
   const content = document.getElementById("drive-info-content");
   const smartToggle = document.getElementById("smart-toggle");
   const smartContent = document.getElementById("smart-content");
+  const smartRetry = document.getElementById("smart-retry-admin");
   if (!select || !refreshBtn) return;
 
   select.addEventListener("change", onDriveSelect);
@@ -353,6 +354,9 @@ async function initDriveTest() {
   }
   if (smartToggle && smartContent) {
     smartToggle.addEventListener("click", () => onSmartToggle(smartToggle, smartContent));
+  }
+  if (smartRetry) {
+    smartRetry.addEventListener("click", () => invoke("restart_as_admin"));
   }
   await loadDrives();
 }
@@ -409,15 +413,30 @@ async function loadDrives() {
 
 let smartLoadedId = null;
 
+function isAdminPrivilegeError(err) {
+  const text = String(err).toLowerCase();
+  return (
+    text.includes("error=5") ||
+    text.includes("access is denied") ||
+    text.includes("access denied") ||
+    text.includes("administrator") ||
+    text.includes("elevation") ||
+    text.includes("permission")
+  );
+}
+
 async function onSmartToggle(toggle, content) {
   const select = document.getElementById("drive-select");
   const smartData = document.getElementById("smart-data");
   const smartStatus = document.getElementById("smart-status");
+  const smartAdmin = document.getElementById("smart-admin");
   const id = select.value;
 
   const collapsed = content.classList.toggle("collapsed");
   toggle.setAttribute("aria-expanded", String(!collapsed));
   toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
+
+  if (smartAdmin) smartAdmin.classList.add("hidden");
 
   if (!collapsed && id && smartLoadedId !== id) {
     smartData.textContent = "";
@@ -429,6 +448,9 @@ async function onSmartToggle(toggle, content) {
       smartLoadedId = id;
     } catch (err) {
       smartData.textContent = `Error: ${err}`;
+      if (smartAdmin && isAdminPrivilegeError(err)) {
+        smartAdmin.classList.remove("hidden");
+      }
     } finally {
       smartStatus.classList.add("hidden");
     }
@@ -444,10 +466,12 @@ function onDriveSelect() {
   const smartToggle = document.getElementById("smart-toggle");
   const smartContent = document.getElementById("smart-content");
   const smartData = document.getElementById("smart-data");
+  const smartAdmin = document.getElementById("smart-admin");
 
   smartLoadedId = null;
   smartData.textContent = "Select a drive and expand to load SMART data.";
   if (smartContent) smartContent.classList.add("collapsed");
+  if (smartAdmin) smartAdmin.classList.add("hidden");
   if (smartToggle) {
     smartToggle.setAttribute("aria-expanded", "false");
     smartToggle.querySelector(".toggle-icon").textContent = "+";

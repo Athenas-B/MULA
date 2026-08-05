@@ -1126,6 +1126,27 @@ fn log_message(level: String, message: String) {
     logger::log_message(&level, &message);
 }
 
+#[tauri::command]
+fn restart_as_admin() -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Could not determine application path: {e}"))?;
+    let exe_str = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let ps = format!("Start-Process -FilePath \"{}\" -Verb runAs", exe_str);
+
+    // Give the new process a moment to be requested before exiting.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        std::process::exit(0);
+    });
+
+    std::process::Command::new("powershell")
+        .args(["-ExecutionPolicy", "Bypass", "-Command", &ps])
+        .spawn()
+        .map_err(|e| format!("Failed to request elevation: {e}"))?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = logger::init();
@@ -1152,6 +1173,7 @@ pub fn run() {
             get_drive_details,
             get_drive_smart,
             log_message,
+            restart_as_admin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -428,6 +428,24 @@ body {
   margin-bottom: 6px;
 }
 
+.smart-admin {
+  margin-top: 12px;
+  padding: 12px;
+  background: #fff3cd;
+  border: 1px solid #ffeeba;
+  border-radius: 8px;
+}
+
+.smart-admin.hidden {
+  display: none;
+}
+
+.smart-admin-hint {
+  margin: 0 0 10px 0;
+  font-size: 0.85rem;
+  color: #856404;
+}
+
 .smart-pre {
   background: #1a1a1a;
   color: #d4d4d4;
@@ -537,6 +555,15 @@ body {
 
   .smart-status {
     color: #aaa;
+  }
+
+  .smart-admin {
+    background: #3a2f05;
+    border-color: #5c4b0c;
+  }
+
+  .smart-admin-hint {
+    color: #e6d9a8;
   }
 
   .drive-empty {
