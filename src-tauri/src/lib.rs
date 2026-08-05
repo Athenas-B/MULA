@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+mod elevated_helper;
 mod logger;
 
 static VSD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
@@ -1050,95 +1050,8 @@ fn normalize_serial(s: &str) -> String {
     s.to_lowercase().trim().trim_end_matches('.').replace(' ', "")
 }
 
-fn smartctl_temp_file(name: &str) -> std::path::PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("mula_smart_{pid}_{ts}_{name}"))
-}
-
 fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let out_path = smartctl_temp_file("out.txt");
-    let err_path = smartctl_temp_file("err.txt");
-    let script_path = smartctl_temp_file("script.ps1");
-
-    // Use forward slashes so we don't need to double-escape Windows paths in PowerShell.
-    let smartctl_ps = smartctl.to_string_lossy().replace("\\", "/");
-    let arg_list = args
-        .iter()
-        .map(|a| format!("'{}'", a.replace("'", "''")))
-        .collect::<Vec<_>>()
-        .join(",");
-    let out_ps = out_path.to_string_lossy().replace("\\", "/");
-    let err_ps = err_path.to_string_lossy().replace("\\", "/");
-
-    // The elevated PowerShell runs this script. It starts smartctl with stdout/stderr
-    // redirected to files, because Start-Process -Verb runAs cannot use -RedirectStandardOutput.
-    // A try/catch writes any PowerShell error to the same stderr file for diagnostics.
-    let script = format!(
-        r#"try {{
-    $p = Start-Process -FilePath '{}' -ArgumentList {} -Wait -NoNewWindow -PassThru -RedirectStandardOutput '{}' -RedirectStandardError '{}'
-    exit $p.ExitCode
-}} catch {{
-    $_.Exception.Message | Out-File -FilePath '{}' -Encoding utf8
-    exit 1
-}}"#,
-        smartctl_ps, arg_list, out_ps, err_ps, err_ps
-    );
-    std::fs::write(&script_path, &script)
-        .map_err(|e| format!("Failed to write smartctl script: {e}"))?;
-
-    let script_ps = script_path.to_string_lossy().replace("\\", "/");
-    let ps = format!(
-        r#"Start-Process -FilePath "powershell" -ArgumentList '-ExecutionPolicy','Bypass','-File','{}' -Verb runAs -Wait"#,
-        script_ps
-    );
-
-    log::info!("Elevated smartctl script: {}", script_path.display());
-    log::info!("Elevated smartctl script contents: {}", script);
-    log::info!("Elevated smartctl launch: {}", ps);
-
-    let output = Command::new("powershell")
-        .args(["-ExecutionPolicy", "Bypass", "-Command", &ps])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to start elevated smartctl: {e}"))?;
-
-    let ps_stdout = String::from_utf8_lossy(&output.stdout);
-    let ps_stderr = String::from_utf8_lossy(&output.stderr);
-    log::info!(
-        "Elevated smartctl PowerShell finished: success={}, stdout={}, stderr={}",
-        output.status.success(),
-        ps_stdout,
-        ps_stderr
-    );
-
-    let stdout_bytes = std::fs::read(&out_path)
-        .map_err(|e| format!("Failed to read smartctl stdout file '{}': {}", out_path.display(), e))?;
-    let stderr_bytes = std::fs::read(&err_path)
-        .map_err(|e| format!("Failed to read smartctl stderr file '{}': {}", err_path.display(), e))?;
-    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-    log::info!(
-        "Elevated smartctl output: stdout_len={}, stderr_len={}",
-        stdout.len(),
-        stderr.len()
-    );
-
-    let _ = std::fs::remove_file(&out_path);
-    let _ = std::fs::remove_file(&err_path);
-    let _ = std::fs::remove_file(&script_path);
-
-    if !stdout.trim().is_empty() {
-        return Ok(stdout);
-    }
-    if !stderr.trim().is_empty() {
-        return Err(format!("smartctl error: {}", stderr.trim()));
-    }
-    Err("smartctl returned no output".to_string())
+    elevated_helper::run_elevated(smartctl, args)
 }
 
 fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Result<String, String> {
@@ -1341,6 +1254,11 @@ pub fn run() {
             get_drive_test_status_elevated,
             log_message,
         ])
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                elevated_helper::stop_helper();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
