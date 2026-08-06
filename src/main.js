@@ -404,6 +404,13 @@ window.addEventListener("DOMContentLoaded", () => {
     const checkbox = document.getElementById("app-autostart");
     if (checkbox) checkbox.checked = event.payload;
   });
+
+  // Keep the Wall Changer tab in sync when the max source level is changed from the tray.
+  listen("max-level-changed", (event) => {
+    const input = document.getElementById("wc-max-level");
+    if (input) input.value = event.payload;
+    if (wcSettings) wcSettings.maximum_source_level = event.payload;
+  });
 });
 
 // ── Drive Test ──
@@ -942,9 +949,10 @@ async function initWallchanger() {
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
 
-  for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor"]) {
+  for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-bg-color", "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor"]) {
     document.getElementById(id)?.addEventListener("change", () => {
       wcUpdateModelFromUi();
+      wcUpdateBgColorVisibility();
       wcAutoSave();
     });
   }
@@ -964,15 +972,39 @@ async function wcLoadSettings() {
   }
 }
 
+function wcArgbToHex(argb) {
+  const u32 = (argb ?? 0xFF000000) >>> 0;
+  const r = (u32 >> 16) & 0xFF;
+  const g = (u32 >> 8) & 0xFF;
+  const b = u32 & 0xFF;
+  return "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function wcHexToArgb(hex) {
+  const clean = hex.replace("#", "");
+  const r = parseInt(clean.substring(0, 2), 16) || 0;
+  const g = parseInt(clean.substring(2, 4), 16) || 0;
+  const b = parseInt(clean.substring(4, 6), 16) || 0;
+  const u32 = ((0xFF << 24) | (r << 16) | (g << 8) | b) >>> 0;
+  return u32 > 0x7FFFFFFF ? u32 - 0x100000000 : u32;
+}
+
+function wcUpdateBgColorVisibility() {
+  const row = document.getElementById("wc-bg-color-row");
+  if (row) row.classList.toggle("hidden", document.getElementById("wc-scaling").value !== "FitInsideScreen");
+}
+
 function wcRenderSettings() {
   document.getElementById("wc-interval").value = wcSettings.interval_minutes;
   document.getElementById("wc-max-level").value = wcSettings.maximum_source_level;
   document.getElementById("wc-rotation").value = wcSettings.rotation_mode;
   document.getElementById("wc-scaling").value = wcSettings.scaling_mode;
+  document.getElementById("wc-bg-color").value = wcArgbToHex(wcSettings.background_color_argb);
   document.getElementById("wc-separate-queues").checked = wcSettings.use_separate_monitor_queues;
   document.getElementById("wc-unique-queues").checked = wcSettings.keep_image_in_single_monitor_queue;
   document.getElementById("wc-stop-slideshow").checked = wcSettings.disable_windows_slideshow_when_running;
   document.getElementById("wc-one-monitor").checked = wcSettings.change_one_monitor_per_interval;
+  wcUpdateBgColorVisibility();
 }
 
 function wcRenderSources() {
@@ -1041,6 +1073,7 @@ function wcUpdateModelFromUi() {
   wcSettings.maximum_source_level = Math.min(10, Math.max(1, parseInt(document.getElementById("wc-max-level").value, 10) || 10));
   wcSettings.rotation_mode = document.getElementById("wc-rotation").value;
   wcSettings.scaling_mode = document.getElementById("wc-scaling").value;
+  wcSettings.background_color_argb = wcHexToArgb(document.getElementById("wc-bg-color").value);
   wcSettings.use_separate_monitor_queues = document.getElementById("wc-separate-queues").checked;
   wcSettings.keep_image_in_single_monitor_queue = document.getElementById("wc-unique-queues").checked;
   wcSettings.disable_windows_slideshow_when_running = document.getElementById("wc-stop-slideshow").checked;

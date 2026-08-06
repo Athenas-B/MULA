@@ -1373,8 +1373,31 @@ pub fn run() {
             let change = MenuItem::with_id(app, "change", "Change wallpaper", true, None::<&str>)?;
             let start = MenuItem::with_id(app, "start", "Start", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
+
+            let current_max_level = wallchanger::settings::load()
+                .map(|s| s.maximum_source_level)
+                .unwrap_or(10);
+            let mut max_level_items = Vec::new();
+            for level in 1..=10 {
+                let item = CheckMenuItem::with_id(
+                    app,
+                    format!("max_level_{level}"),
+                    level.to_string(),
+                    true,
+                    level == current_max_level,
+                    None::<&str>,
+                )?;
+                max_level_items.push(item);
+            }
+            let max_level_submenu = SubmenuBuilder::new(app, "Max source level")
+                .items(&max_level_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<_>).collect::<Vec<_>>())
+                .build()?;
+            app.manage(wallchanger::MaxLevelMenuState(
+                (1..=10).zip(max_level_items.into_iter()).collect(),
+            ));
+
             let wallchanger_submenu = SubmenuBuilder::new(app, "Wall Changer")
-                .items(&[&change, &start, &stop])
+                .items(&[&change, &start, &stop, &max_level_submenu])
                 .build()?;
 
             let autostart_enabled = startup::is_enabled().unwrap_or(false);
@@ -1432,6 +1455,22 @@ pub fn run() {
                         } else {
                             use tauri::Emitter;
                             let _ = app.emit("autostart-changed", enabled);
+                        }
+                    }
+                    id if id.starts_with("max_level_") => {
+                        if let Ok(level) = id.trim_start_matches("max_level_").parse::<i32>() {
+                            let result = wallchanger::settings::load().and_then(|mut s| {
+                                s.maximum_source_level = level;
+                                wallchanger::settings::save(&s)
+                            });
+                            match result {
+                                Ok(()) => {
+                                    wallchanger::sync_max_level_menu(app, level);
+                                    use tauri::Emitter;
+                                    let _ = app.emit("max-level-changed", level);
+                                }
+                                Err(e) => log::error!("Failed to update max source level: {e}"),
+                            }
                         }
                     }
                     "quit" => app.exit(0),

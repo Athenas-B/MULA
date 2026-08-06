@@ -7,15 +7,35 @@ pub mod settings;
 pub use monitors::Monitor;
 pub use settings::Settings;
 
+/// Holds handles to the tray's "Max source level" check items (one per level 1-10)
+/// so they can be kept in sync with the level chosen in the Wall Changer tab.
+pub struct MaxLevelMenuState(pub Vec<(i32, tauri::menu::CheckMenuItem<tauri::Wry>)>);
+
+pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
+    use tauri::Manager;
+    if let Some(state) = app.try_state::<MaxLevelMenuState>() {
+        for (item_level, item) in &state.0 {
+            let _ = item.set_checked(*item_level == level);
+        }
+    }
+}
+
 #[tauri::command]
 pub fn wc_get_settings() -> Result<Settings, String> {
     settings::load()
 }
 
 #[tauri::command]
-pub fn wc_save_settings(mut settings: Settings) -> Result<(), String> {
+pub fn wc_save_settings(app: tauri::AppHandle, mut settings: Settings) -> Result<(), String> {
+    use tauri::Emitter;
+
     settings::normalize(&mut settings);
-    settings::save(&settings)
+    settings::save(&settings)?;
+
+    sync_max_level_menu(&app, settings.maximum_source_level);
+    let _ = app.emit("max-level-changed", settings.maximum_source_level);
+
+    Ok(())
 }
 
 #[tauri::command]

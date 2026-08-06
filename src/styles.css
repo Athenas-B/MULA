@@ -667,6 +667,14 @@ body {
   min-width: 120px;
 }
 
+.wallchanger-row input[type="color"] {
+  min-width: 48px;
+  width: 48px;
+  height: 30px;
+  padding: 2px;
+  cursor: pointer;
+}
+
 .about-autostart {
   margin-top: 16px;
   justify-content: center;
