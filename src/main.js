@@ -990,8 +990,13 @@ function wcHexToArgb(hex) {
 }
 
 function wcUpdateBgColorVisibility() {
-  const row = document.getElementById("wc-bg-color-row");
-  if (row) row.classList.toggle("hidden", document.getElementById("wc-scaling").value !== "FitInsideScreen");
+  // Background color only affects "Fit inside screen" mode, but stays visible
+  // (disabled otherwise) so it's easy to discover.
+  const input = document.getElementById("wc-bg-color");
+  const label = document.querySelector('label[for="wc-bg-color"]');
+  const isFit = document.getElementById("wc-scaling").value === "FitInsideScreen";
+  if (input) input.disabled = !isFit;
+  if (label) label.classList.toggle("wallchanger-label-disabled", !isFit);
 }
 
 function wcRenderSettings() {
