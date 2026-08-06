@@ -50,6 +50,26 @@ async function loadAppInfo() {
   }
 }
 
+async function loadAppAutostart() {
+  try {
+    const enabled = await invoke("get_autostart");
+    document.getElementById("app-autostart").checked = enabled;
+  } catch (e) {
+    console.error("Failed to load autostart setting:", e);
+  }
+}
+
+async function toggleAppAutostart() {
+  const checkbox = document.getElementById("app-autostart");
+  const enabled = checkbox.checked;
+  try {
+    await invoke("set_autostart", { enabled });
+  } catch (e) {
+    checkbox.checked = !enabled;
+    console.error("Failed to update autostart setting:", e);
+  }
+}
+
 // Open config directory in file explorer
 async function openConfigDir(e) {
   e.preventDefault();
@@ -325,10 +345,12 @@ function clearLog() {
 window.addEventListener("DOMContentLoaded", () => {
   initTabs();
   loadAppInfo();
+  loadAppAutostart();
   initVsd();
   initDriveTest();
   initWallchanger();
   document.getElementById("app-config-path").addEventListener("click", openConfigDir);
+  document.getElementById("app-autostart")?.addEventListener("change", toggleAppAutostart);
 });
 
 // ── Drive Test ──
@@ -867,8 +889,6 @@ async function initWallchanger() {
   document.getElementById("wc-remove-source")?.addEventListener("click", wcRemoveSource);
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
-
-  document.getElementById("wc-autostart")?.addEventListener("change", wcToggleAutostart);
 
   for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor"]) {
     document.getElementById(id)?.addEventListener("change", () => {

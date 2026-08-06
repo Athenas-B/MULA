@@ -667,6 +667,12 @@ body {
   min-width: 120px;
 }
 
+.about-autostart {
+  margin-top: 16px;
+  justify-content: center;
+  display: flex;
+}
+
 .wallchanger-option {
   display: inline-flex;
   align-items: center;

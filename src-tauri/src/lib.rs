@@ -1350,7 +1350,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            use tauri::menu::{Menu, MenuItem, SubmenuBuilder};
+            use tauri::menu::{CheckMenuItem, Menu, MenuItem, SubmenuBuilder};
             use tauri::tray::TrayIconBuilder;
             use tauri::Manager;
 
@@ -1363,15 +1363,27 @@ pub fn run() {
                 .items(&[&change, &start, &stop])
                 .build()?;
 
+            let autostart_enabled = startup::is_enabled().unwrap_or(false);
+            let autostart = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "Start MULA with Windows",
+                true,
+                autostart_enabled,
+                None::<&str>,
+            )?;
+
             let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&show, &wallchanger_submenu, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &wallchanger_submenu, &autostart, &quit])?;
+
+            let autostart_menu_item = autostart.clone();
 
             TrayIconBuilder::with_id("mula-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("MULA")
                 .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
+                .on_menu_event(move |app, event| match event.id().as_ref() {
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
@@ -1396,6 +1408,13 @@ pub fn run() {
                             s.change_service_running = false;
                             wallchanger::settings::save(&s)
                         });
+                    }
+                    "autostart" => {
+                        let enabled = autostart_menu_item.is_checked().unwrap_or(false);
+                        if let Err(e) = startup::set_enabled(enabled) {
+                            log::error!("Failed to update autostart setting: {e}");
+                            let _ = autostart_menu_item.set_checked(!enabled);
+                        }
                     }
                     "quit" => app.exit(0),
                     _ => {}
