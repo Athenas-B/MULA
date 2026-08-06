@@ -884,7 +884,6 @@ async function initWallchanger() {
   document.getElementById("wc-toggle")?.addEventListener("click", wcToggleService);
   document.getElementById("wc-change-now")?.addEventListener("click", wcChangeNow);
   document.getElementById("wc-apply")?.addEventListener("click", wcApply);
-  document.getElementById("wc-save")?.addEventListener("click", wcSaveSettings);
   document.getElementById("wc-add-folder")?.addEventListener("click", wcAddFolder);
   document.getElementById("wc-remove-source")?.addEventListener("click", wcRemoveSource);
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
@@ -893,32 +892,13 @@ async function initWallchanger() {
   for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor"]) {
     document.getElementById(id)?.addEventListener("change", () => {
       wcUpdateModelFromUi();
+      wcAutoSave();
     });
   }
 
   await wcLoadSettings();
   await wcLoadStatus();
   await wcLoadMonitors();
-  await wcLoadAutostart();
-}
-
-async function wcLoadAutostart() {
-  try {
-    const enabled = await invoke("get_autostart");
-    document.getElementById("wc-autostart").checked = enabled;
-  } catch (err) {
-    console.error("Failed to load autostart setting:", err);
-  }
-}
-
-async function wcToggleAutostart() {
-  const enabled = document.getElementById("wc-autostart").checked;
-  try {
-    await invoke("set_autostart", { enabled });
-  } catch (err) {
-    document.getElementById("wc-autostart").checked = !enabled;
-    wcShowMessage(`Error updating startup setting: ${err}`, "error");
-  }
 }
 
 async function wcLoadSettings() {
@@ -968,20 +948,24 @@ function wcRenderSources() {
 
     row.querySelector('input[type="checkbox"]').addEventListener("change", (e) => {
       wcSettings.source_folders[index].enabled = e.target.checked;
+      wcAutoSave();
     });
 
     row.querySelector('input[type="number"]').addEventListener("change", (e) => {
       wcSettings.source_folders[index].level = Math.min(10, Math.max(1, parseInt(e.target.value, 10) || 1));
+      wcAutoSave();
     });
 
     row.querySelector('input[type="text"]').addEventListener("change", (e) => {
       wcSettings.source_folders[index].path = e.target.value.trim();
+      wcAutoSave();
     });
 
     const subCheck = row.querySelectorAll('input[type="checkbox"]')[1];
     if (subCheck) {
       subCheck.addEventListener("change", (e) => {
         wcSettings.source_folders[index].include_subfolders = e.target.checked;
+        wcAutoSave();
       });
     }
 
@@ -1023,6 +1007,7 @@ async function wcAddFolder() {
       wallhaven_purity: "110",
     });
     wcRenderSources();
+    await wcAutoSave();
   } catch (err) {
     wcShowMessage(`Error adding folder: ${err}`, "error");
   }
@@ -1033,6 +1018,7 @@ function wcRemoveSource() {
   wcSettings.source_folders.splice(wcSelectedSourceIndex, 1);
   wcSelectedSourceIndex = Math.min(wcSelectedSourceIndex, wcSettings.source_folders.length - 1);
   wcRenderSources();
+  wcAutoSave();
 }
 
 function wcMoveSource(delta) {
@@ -1043,17 +1029,20 @@ function wcMoveSource(delta) {
   wcSettings.source_folders.splice(newIndex, 0, moved);
   wcSelectedSourceIndex = newIndex;
   wcRenderSources();
+  wcAutoSave();
 }
 
-async function wcSaveSettings() {
-  try {
-    wcUpdateModelFromUi();
-    await invoke("wc_save_settings", { settings: wcSettings });
-    wcShowMessage("Settings saved.", "success");
-    await wcLoadStatus();
-  } catch (err) {
-    wcShowMessage(`Error saving settings: ${err}`, "error");
-  }
+let wcAutoSaveTimer = null;
+
+function wcAutoSave() {
+  clearTimeout(wcAutoSaveTimer);
+  wcAutoSaveTimer = setTimeout(async () => {
+    try {
+      await invoke("wc_save_settings", { settings: wcSettings });
+    } catch (err) {
+      wcShowMessage(`Error saving settings: ${err}`, "error");
+    }
+  }, 300);
 }
 
 async function wcApply() {
