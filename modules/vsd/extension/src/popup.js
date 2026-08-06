@@ -2,6 +2,11 @@
 
 vsdInstallErrorCapture('popup');
 
+// Mark the layout as a pop-out window so the CSS can use all available space.
+if (new URLSearchParams(window.location.search).has('popout')) {
+  document.documentElement.classList.add('popout');
+}
+
 // ── DOM Elements ────────────────────────────────────────────────────────────
 
 const streamsList = document.getElementById('streams');
@@ -306,7 +311,7 @@ copyLogsBtn.onclick = async () => {
 popoutBtn.onclick = () => {
   const api = typeof browser !== 'undefined' && browser.windows ? browser : chrome;
   api.windows.create({
-    url: chrome.runtime.getURL('popup.html'),
+    url: chrome.runtime.getURL('popup.html?popout=1'),
     type: 'popup',
     width: 420, height: 600,
     left: Math.max(0, window.screen.availLeft + window.screen.availWidth - 420),

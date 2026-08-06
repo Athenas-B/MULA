@@ -12,6 +12,16 @@ body {
   padding: 12px;
 }
 
+/* Pop-out window mode: use the full available window space */
+html.popout, html.popout body {
+  height: 100%;
+}
+
+html.popout body {
+  max-height: none;
+  min-height: 100%;
+}
+
 .header {
   display: flex;
   align-items: center;
