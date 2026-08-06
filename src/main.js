@@ -952,6 +952,7 @@ async function initWallchanger() {
   for (const id of [
     "wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-bg-color",
     "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor",
+    "wc-fade-enabled", "wc-fade-duration", "wc-fade-steps",
     "wc-overlay-enabled", "wc-overlay-mode", "wc-overlay-font-size", "wc-overlay-color",
     "wc-overlay-offset-x", "wc-overlay-offset-y", "wc-overlay-backdrop",
   ]) {
@@ -1032,6 +1033,9 @@ function wcRenderSettings() {
   document.getElementById("wc-overlay-offset-x").value = wcSettings.picture_name_overlay_offset_x;
   document.getElementById("wc-overlay-offset-y").value = wcSettings.picture_name_overlay_offset_y;
   document.getElementById("wc-overlay-backdrop").checked = wcSettings.picture_name_overlay_use_backdrop;
+  document.getElementById("wc-fade-enabled").checked = wcSettings.enable_wallpaper_fade_transition;
+  document.getElementById("wc-fade-duration").value = wcSettings.wallpaper_fade_duration_ms;
+  document.getElementById("wc-fade-steps").value = wcSettings.wallpaper_fade_steps;
   wcUpdateBgColorVisibility();
   wcUpdateOverlayVisibility();
 }
@@ -1114,6 +1118,9 @@ function wcUpdateModelFromUi() {
   wcSettings.picture_name_overlay_offset_x = parseInt(document.getElementById("wc-overlay-offset-x").value, 10) || 0;
   wcSettings.picture_name_overlay_offset_y = parseInt(document.getElementById("wc-overlay-offset-y").value, 10) || 0;
   wcSettings.picture_name_overlay_use_backdrop = document.getElementById("wc-overlay-backdrop").checked;
+  wcSettings.enable_wallpaper_fade_transition = document.getElementById("wc-fade-enabled").checked;
+  wcSettings.wallpaper_fade_duration_ms = Math.max(0, parseInt(document.getElementById("wc-fade-duration").value, 10) || 0);
+  wcSettings.wallpaper_fade_steps = Math.max(1, parseInt(document.getElementById("wc-fade-steps").value, 10) || 12);
 }
 
 async function wcAddFolder() {

@@ -4,6 +4,7 @@ mod overlay;
 mod queue;
 pub mod service;
 pub mod settings;
+mod transition;
 
 pub use monitors::Monitor;
 pub use settings::Settings;

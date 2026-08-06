@@ -1,7 +1,8 @@
 use super::images::{is_eligible_source, load_images};
-use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, set_wallpaper_for_monitor, try_disable_windows_slideshow};
-use super::overlay::resolve_wallpaper_path;
+use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, try_disable_windows_slideshow};
+use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor};
+use super::transition::apply_wallpaper;
 use super::settings::{load, save, Settings};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -133,7 +134,7 @@ pub fn apply(settings: &mut Settings, change_one_monitor_only: bool) -> Result<S
         };
 
         let wallpaper_path = resolve_wallpaper_path(&selected.image.path, settings);
-        set_wallpaper_for_monitor(&monitor.id, &wallpaper_path)?;
+        apply_wallpaper(monitor, &wallpaper_path, settings)?;
 
         record_image_shown(settings, &selected.image.path);
 
@@ -141,6 +142,10 @@ pub fn apply(settings: &mut Settings, change_one_monitor_only: bool) -> Result<S
     }
 
     save(settings)?;
+
+    if let Err(e) = cleanup_rendered_cache() {
+        log::warn!("Failed to clean up rendered wallpaper cache: {e}");
+    }
 
     Ok(format!(
         "Applied {} wallpaper(s): {}",

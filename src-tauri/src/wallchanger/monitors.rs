@@ -148,6 +148,15 @@ fn get_wallpaper_for_monitor(wallpaper: &IDesktopWallpaper, monitor_id: &HSTRING
     }
 }
 
+/// Returns the wallpaper file currently set for a monitor, according to Windows itself
+/// (used as the "before" frame when building a fade transition).
+pub fn get_current_wallpaper(monitor_id: &str) -> Result<String, String> {
+    initialize_com()?;
+    let wallpaper = create_desktop_wallpaper()?;
+    let id_hstring = HSTRING::from(monitor_id);
+    get_wallpaper_for_monitor(&wallpaper, &id_hstring)
+}
+
 pub fn try_disable_windows_slideshow() -> Result<(), String> {
     initialize_com()?;
     let wallpaper = create_desktop_wallpaper()?;

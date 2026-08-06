@@ -66,11 +66,56 @@ fn argb_to_rgba(argb: i32) -> Rgba<u8> {
     Rgba([r, g, b, a])
 }
 
+/// Cap the overlay render cache at roughly 300 MB...
+const MAX_CACHE_BYTES: u64 = 300 * 1024 * 1024;
+/// ...or 500 files, whichever limit is hit first.
+const MAX_CACHE_FILES: usize = 500;
+
 fn rendered_cache_dir() -> Result<PathBuf, String> {
     let dir = super::settings::config_dir()?.join("rendered");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create rendered wallpaper cache directory: {e}"))?;
     Ok(dir)
+}
+
+/// Prunes the rendered-overlay cache directory, deleting the least-recently-modified
+/// files first, until the cache is back under the size/file-count limits. Stale entries
+/// (e.g. from images that were removed or had their overlay settings changed) naturally
+/// age out this way, since a changed cache key means a new file is written rather than
+/// the old one being reused.
+pub fn cleanup_rendered_cache() -> Result<(), String> {
+    let dir = rendered_cache_dir()?;
+    prune_directory(&dir, MAX_CACHE_BYTES, MAX_CACHE_FILES)
+}
+
+fn prune_directory(dir: &Path, max_bytes: u64, max_files: usize) -> Result<(), String> {
+    let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read rendered wallpaper cache directory: {e}"))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            let modified = meta.modified().ok()?;
+            Some((e.path(), meta.len(), modified))
+        })
+        .collect();
+
+    entries.sort_by_key(|(_, _, modified)| *modified);
+
+    let mut total_bytes: u64 = entries.iter().map(|(_, size, _)| size).sum();
+    let mut count = entries.len();
+
+    for (path, size, _) in entries {
+        if total_bytes <= max_bytes && count <= max_files {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(size);
+            count = count.saturating_sub(1);
+        }
+    }
+
+    Ok(())
 }
 
 fn cache_key(original_path: &str, settings: &Settings) -> String {
@@ -194,5 +239,26 @@ mod tests {
         let rendered = image::open(&resolved).unwrap().to_rgba8();
         let has_light_pixel = rendered.pixels().any(|p| p[0] > 200 && p[1] > 200 && p[2] > 200);
         assert!(has_light_pixel, "expected white overlay text to be drawn somewhere on the image");
+    }
+
+    #[test]
+    fn cleanup_prunes_oldest_files_over_the_limit() {
+        let dir = std::env::temp_dir().join("mula_overlay_cleanup_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let older = dir.join("older.jpg");
+        let newer = dir.join("newer.jpg");
+        std::fs::write(&older, b"old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&newer, b"new").unwrap();
+
+        // Force eviction down to a single file, regardless of byte size.
+        prune_directory(&dir, u64::MAX, 1).unwrap();
+
+        assert!(!older.exists(), "the older file should have been evicted first");
+        assert!(newer.exists(), "the newer file should have been kept");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
