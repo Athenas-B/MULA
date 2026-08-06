@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 mod elevated_helper;
 mod logger;
+mod startup;
 mod wallchanger;
 
 static VSD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
@@ -343,6 +344,16 @@ fn vsd_get_autostart() -> bool {
 #[tauri::command]
 fn vsd_set_autostart(enabled: bool) -> Result<(), String> {
     write_vsd_config_value("VSD_AUTOSTART", if enabled { "true" } else { "false" })
+}
+
+#[tauri::command]
+fn get_autostart() -> Result<bool, String> {
+    startup::is_enabled()
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    startup::set_enabled(enabled)
 }
 
 fn urllib_post(url: &str, body: &str) -> Result<(), String> {
@@ -1330,6 +1341,8 @@ pub fn run() {
             wallchanger::wc_stop_service,
             wallchanger::wc_toggle_service,
             wallchanger::wc_get_status,
+            get_autostart,
+            set_autostart,
         ])
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
@@ -1393,6 +1406,13 @@ pub fn run() {
             if let Ok(settings) = wallchanger::settings::load() {
                 if settings.change_service_running {
                     let _ = wallchanger::service::start();
+                }
+            }
+
+            // When launched from the Windows startup entry, start hidden in the tray.
+            if std::env::args().any(|arg| arg == startup::AUTOSTART_ARG) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
                 }
             }
 

@@ -868,6 +868,8 @@ async function initWallchanger() {
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
 
+  document.getElementById("wc-autostart")?.addEventListener("change", wcToggleAutostart);
+
   for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor"]) {
     document.getElementById(id)?.addEventListener("change", () => {
       wcUpdateModelFromUi();
@@ -877,6 +879,26 @@ async function initWallchanger() {
   await wcLoadSettings();
   await wcLoadStatus();
   await wcLoadMonitors();
+  await wcLoadAutostart();
+}
+
+async function wcLoadAutostart() {
+  try {
+    const enabled = await invoke("get_autostart");
+    document.getElementById("wc-autostart").checked = enabled;
+  } catch (err) {
+    console.error("Failed to load autostart setting:", err);
+  }
+}
+
+async function wcToggleAutostart() {
+  const enabled = document.getElementById("wc-autostart").checked;
+  try {
+    await invoke("set_autostart", { enabled });
+  } catch (err) {
+    document.getElementById("wc-autostart").checked = !enabled;
+    wcShowMessage(`Error updating startup setting: ${err}`, "error");
+  }
 }
 
 async function wcLoadSettings() {
