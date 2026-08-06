@@ -233,13 +233,23 @@ function load() {
 // ── Button Handlers ─────────────────────────────────────────────────────────
 
 clearBtn.onclick = () => {
-  const keepUrls = protectActive.checked
-    ? [...activeJobs.entries()].filter(([, jobId]) => isJobActive(jobId)).map(([url]) => url)
-    : [];
-  chrome.runtime.sendMessage({ type: 'clear', keepUrls }, () => {
+  const keepUrls = new Set();
+
+  for (const [url, jobId] of activeJobs.entries()) {
+    const p = jobProgress.get(jobId);
+    if (protectActive.checked && isJobActive(jobId)) keepUrls.add(url);
+    if (p?.status === 'done' || p?.status === 'error') keepUrls.add(url);
+  }
+
+  for (const s of cachedStreams) {
+    if (s.saved) keepUrls.add(s.url);
+  }
+
+  const keep = Array.from(keepUrls);
+  chrome.runtime.sendMessage({ type: 'clear', keepUrls: keep }, () => {
     if (chrome.runtime.lastError) return;
     for (const [url, jobId] of activeJobs.entries()) {
-      if (!keepUrls.includes(url)) { activeJobs.delete(url); jobProgress.delete(jobId); }
+      if (!keep.includes(url)) { activeJobs.delete(url); jobProgress.delete(jobId); }
     }
     load();
   });
