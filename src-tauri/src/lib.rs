@@ -346,14 +346,28 @@ fn vsd_set_autostart(enabled: bool) -> Result<(), String> {
     write_vsd_config_value("VSD_AUTOSTART", if enabled { "true" } else { "false" })
 }
 
+/// Holds a handle to the tray menu's "Start MULA with Windows" check item so its
+/// checked state can be kept in sync with the System tab toggle, and vice versa.
+struct AutostartMenuState(tauri::menu::CheckMenuItem<tauri::Wry>);
+
 #[tauri::command]
 fn get_autostart() -> Result<bool, String> {
     startup::is_enabled()
 }
 
 #[tauri::command]
-fn set_autostart(enabled: bool) -> Result<(), String> {
-    startup::set_enabled(enabled)
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri::{Emitter, Manager};
+
+    startup::set_enabled(enabled)?;
+
+    if let Some(state) = app.try_state::<AutostartMenuState>() {
+        let _ = state.0.set_checked(enabled);
+    }
+
+    let _ = app.emit("autostart-changed", enabled);
+
+    Ok(())
 }
 
 fn urllib_post(url: &str, body: &str) -> Result<(), String> {
@@ -1378,6 +1392,7 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show, &wallchanger_submenu, &autostart, &quit])?;
 
             let autostart_menu_item = autostart.clone();
+            app.manage(AutostartMenuState(autostart.clone()));
 
             TrayIconBuilder::with_id("mula-tray")
                 .icon(app.default_window_icon().unwrap().clone())
@@ -1414,6 +1429,9 @@ pub fn run() {
                         if let Err(e) = startup::set_enabled(enabled) {
                             log::error!("Failed to update autostart setting: {e}");
                             let _ = autostart_menu_item.set_checked(!enabled);
+                        } else {
+                            use tauri::Emitter;
+                            let _ = app.emit("autostart-changed", enabled);
                         }
                     }
                     "quit" => app.exit(0),

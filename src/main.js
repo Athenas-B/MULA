@@ -1,6 +1,7 @@
 const { invoke } = window.__TAURI__.core;
 const { revealItemInDir } = window.__TAURI__.opener;
 const { open: openDialog } = window.__TAURI__.dialog;
+const { listen } = window.__TAURI__.event;
 
 // Forward console messages to the Rust file logger
 (function setupConsoleLogging() {
@@ -397,6 +398,12 @@ window.addEventListener("DOMContentLoaded", () => {
   initWallchanger();
   document.getElementById("app-config-path").addEventListener("click", openConfigDir);
   document.getElementById("app-autostart")?.addEventListener("change", toggleAppAutostart);
+
+  // Keep the checkbox in sync when autostart is toggled from the tray menu.
+  listen("autostart-changed", (event) => {
+    const checkbox = document.getElementById("app-autostart");
+    if (checkbox) checkbox.checked = event.payload;
+  });
 });
 
 // ── Drive Test ──
