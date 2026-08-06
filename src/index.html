@@ -234,6 +234,44 @@
           </div>
 
           <div class="wallchanger-section">
+            <h3>Picture name overlay</h3>
+            <div class="wallchanger-row">
+              <label class="wallchanger-option">
+                <input type="checkbox" id="wc-overlay-enabled">
+                <span>Show picture name overlay</span>
+              </label>
+            </div>
+            <div class="wallchanger-row">
+              <label for="wc-overlay-mode">Text</label>
+              <select id="wc-overlay-mode">
+                <option value="FileNameWithoutExtension">File name (no extension)</option>
+                <option value="FileName">File name</option>
+                <option value="FolderAndFileName">Folder and file name</option>
+                <option value="FullPath">Full path</option>
+              </select>
+            </div>
+            <div class="wallchanger-row">
+              <label for="wc-overlay-font-size">Font size</label>
+              <input type="number" id="wc-overlay-font-size" min="1" max="200" value="28">
+            </div>
+            <div class="wallchanger-row">
+              <label for="wc-overlay-color">Text color</label>
+              <input type="color" id="wc-overlay-color" value="#ffffff">
+            </div>
+            <div class="wallchanger-row">
+              <label for="wc-overlay-offset-x">Offset X / Y</label>
+              <input type="number" id="wc-overlay-offset-x" value="0" style="max-width: 90px;">
+              <input type="number" id="wc-overlay-offset-y" value="0" style="max-width: 90px;">
+            </div>
+            <div class="wallchanger-row">
+              <label class="wallchanger-option">
+                <input type="checkbox" id="wc-overlay-backdrop">
+                <span>Use dark backdrop behind text</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="wallchanger-section">
             <h3>Sources</h3>
             <div class="wallchanger-sources" id="wc-sources"></div>
             <div class="wallchanger-source-toolbar">

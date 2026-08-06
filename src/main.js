@@ -949,10 +949,16 @@ async function initWallchanger() {
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
 
-  for (const id of ["wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-bg-color", "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor"]) {
+  for (const id of [
+    "wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-bg-color",
+    "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor",
+    "wc-overlay-enabled", "wc-overlay-mode", "wc-overlay-font-size", "wc-overlay-color",
+    "wc-overlay-offset-x", "wc-overlay-offset-y", "wc-overlay-backdrop",
+  ]) {
     document.getElementById(id)?.addEventListener("change", () => {
       wcUpdateModelFromUi();
       wcUpdateBgColorVisibility();
+      wcUpdateOverlayVisibility();
       wcAutoSave();
     });
   }
@@ -999,6 +1005,16 @@ function wcUpdateBgColorVisibility() {
   if (label) label.classList.toggle("wallchanger-label-disabled", !isFit);
 }
 
+function wcUpdateOverlayVisibility() {
+  const enabled = document.getElementById("wc-overlay-enabled").checked;
+  for (const id of ["wc-overlay-mode", "wc-overlay-font-size", "wc-overlay-color", "wc-overlay-offset-x", "wc-overlay-offset-y", "wc-overlay-backdrop"]) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !enabled;
+    const label = document.querySelector(`label[for="${id}"]`);
+    if (label) label.classList.toggle("wallchanger-label-disabled", !enabled);
+  }
+}
+
 function wcRenderSettings() {
   document.getElementById("wc-interval").value = wcSettings.interval_minutes;
   document.getElementById("wc-max-level").value = wcSettings.maximum_source_level;
@@ -1009,7 +1025,15 @@ function wcRenderSettings() {
   document.getElementById("wc-unique-queues").checked = wcSettings.keep_image_in_single_monitor_queue;
   document.getElementById("wc-stop-slideshow").checked = wcSettings.disable_windows_slideshow_when_running;
   document.getElementById("wc-one-monitor").checked = wcSettings.change_one_monitor_per_interval;
+  document.getElementById("wc-overlay-enabled").checked = wcSettings.show_picture_name_overlay;
+  document.getElementById("wc-overlay-mode").value = wcSettings.picture_name_overlay_text_mode;
+  document.getElementById("wc-overlay-font-size").value = wcSettings.picture_name_overlay_font_size;
+  document.getElementById("wc-overlay-color").value = wcArgbToHex(wcSettings.picture_name_overlay_text_color_argb);
+  document.getElementById("wc-overlay-offset-x").value = wcSettings.picture_name_overlay_offset_x;
+  document.getElementById("wc-overlay-offset-y").value = wcSettings.picture_name_overlay_offset_y;
+  document.getElementById("wc-overlay-backdrop").checked = wcSettings.picture_name_overlay_use_backdrop;
   wcUpdateBgColorVisibility();
+  wcUpdateOverlayVisibility();
 }
 
 function wcRenderSources() {
@@ -1083,6 +1107,13 @@ function wcUpdateModelFromUi() {
   wcSettings.keep_image_in_single_monitor_queue = document.getElementById("wc-unique-queues").checked;
   wcSettings.disable_windows_slideshow_when_running = document.getElementById("wc-stop-slideshow").checked;
   wcSettings.change_one_monitor_per_interval = document.getElementById("wc-one-monitor").checked;
+  wcSettings.show_picture_name_overlay = document.getElementById("wc-overlay-enabled").checked;
+  wcSettings.picture_name_overlay_text_mode = document.getElementById("wc-overlay-mode").value;
+  wcSettings.picture_name_overlay_font_size = Math.max(1, parseInt(document.getElementById("wc-overlay-font-size").value, 10) || 28);
+  wcSettings.picture_name_overlay_text_color_argb = wcHexToArgb(document.getElementById("wc-overlay-color").value);
+  wcSettings.picture_name_overlay_offset_x = parseInt(document.getElementById("wc-overlay-offset-x").value, 10) || 0;
+  wcSettings.picture_name_overlay_offset_y = parseInt(document.getElementById("wc-overlay-offset-y").value, 10) || 0;
+  wcSettings.picture_name_overlay_use_backdrop = document.getElementById("wc-overlay-backdrop").checked;
 }
 
 async function wcAddFolder() {

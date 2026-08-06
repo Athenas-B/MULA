@@ -1,5 +1,6 @@
 use super::images::{is_eligible_source, load_images};
 use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, set_wallpaper_for_monitor, try_disable_windows_slideshow};
+use super::overlay::resolve_wallpaper_path;
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor};
 use super::settings::{load, save, Settings};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,7 +132,8 @@ pub fn apply(settings: &mut Settings, change_one_monitor_only: bool) -> Result<S
             chosen
         };
 
-        set_wallpaper_for_monitor(&monitor.id, &selected.image.path)?;
+        let wallpaper_path = resolve_wallpaper_path(&selected.image.path, settings);
+        set_wallpaper_for_monitor(&monitor.id, &wallpaper_path)?;
 
         record_image_shown(settings, &selected.image.path);
 

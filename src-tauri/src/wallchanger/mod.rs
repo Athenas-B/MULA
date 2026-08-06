@@ -1,5 +1,6 @@
 mod images;
 mod monitors;
+mod overlay;
 mod queue;
 pub mod service;
 pub mod settings;

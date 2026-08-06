@@ -27,7 +27,7 @@ pub enum ScalingMode {
     FitInsideScreen,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum PictureNameOverlayTextMode {
     #[default]
@@ -186,12 +186,15 @@ pub fn settings_path() -> Result<PathBuf, String> {
 
 pub fn load() -> Result<Settings, String> {
     let path = settings_path()?;
-    if !path.exists() {
-        return Ok(Settings::default());
-    }
+    // Deserialize from "{}" rather than using `Settings::default()` directly, so that
+    // the per-field `#[serde(default = "...")]` values (e.g. font size, colors, interval)
+    // are applied instead of the derived `Default` impl's zeroed-out values.
+    let text = if path.exists() {
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read wallchanger settings: {e}"))?
+    } else {
+        "{}".to_string()
+    };
 
-    let text = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read wallchanger settings: {e}"))?;
     let mut settings: Settings = serde_json::from_str(&text)
         .map_err(|e| format!("Failed to parse wallchanger settings: {e}"))?;
     normalize(&mut settings);

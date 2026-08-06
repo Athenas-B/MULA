@@ -29,6 +29,8 @@ tauri-plugin-window-state = "2"
 log = { version = "0.4", features = ["std"] }
 chrono = "0.4"
 image = "0.25"
+imageproc = { version = "0.25", default-features = false }
+ab_glyph = "0.2"
 rand = "0.8"
 shellexpand = "3"
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
