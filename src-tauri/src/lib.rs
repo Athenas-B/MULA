@@ -1337,21 +1337,26 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            use tauri::menu::{Menu, MenuItem};
+            use tauri::menu::{Menu, MenuItem, SubmenuBuilder};
             use tauri::tray::TrayIconBuilder;
             use tauri::Manager;
 
             let show = MenuItem::with_id(app, "show", "Show MULA", true, None::<&str>)?;
+
             let change = MenuItem::with_id(app, "change", "Change wallpaper", true, None::<&str>)?;
             let start = MenuItem::with_id(app, "start", "Start", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
+            let wallchanger_submenu = SubmenuBuilder::new(app, "Wall Changer")
+                .items(&[&change, &start, &stop])
+                .build()?;
+
             let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&show, &change, &start, &stop, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &wallchanger_submenu, &quit])?;
 
-            TrayIconBuilder::with_id("wallchanger-tray")
+            TrayIconBuilder::with_id("mula-tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Wall Changer")
+                .tooltip("MULA")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => {
