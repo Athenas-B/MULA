@@ -81,6 +81,15 @@ function isM3u8(url) {
   return /\.m3u8?(\?|$)/i.test(url);
 }
 
+function isMasterPlaylistUrl(url) {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    return /(^|\/)master(?:_[\w-]+)?\.m3u8$/.test(path);
+  } catch (e) {
+    return false;
+  }
+}
+
 function isExtensionUrl(url) {
   return url && (url.startsWith('chrome-extension://') || url.startsWith('moz-extension://'));
 }
@@ -179,7 +188,7 @@ function removeStream(url) {
 // ── Network Interception ────────────────────────────────────────────────────
 
 function handleRequest(details) {
-  if (!detectionEnabled || !isM3u8(details.url)) return;
+  if (!detectionEnabled || !isM3u8(details.url) || isMasterPlaylistUrl(details.url)) return;
 
   const fallbackPageUrl = details.documentUrl || details.initiator || 'unknown';
   if (isExtensionUrl(fallbackPageUrl)) return;
@@ -204,6 +213,8 @@ function handleRequest(details) {
 
 chrome.webRequest.onBeforeRequest.addListener(handleRequest, { urls: ['<all_urls>'] }, []);
 
+const headerExtraInfo = typeof browser !== 'undefined' ? ['requestHeaders'] : ['requestHeaders', 'extraHeaders'];
+
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (!isM3u8(details.url)) return;
@@ -224,7 +235,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     }
   },
   { urls: ['<all_urls>'] },
-  ['requestHeaders', 'extraHeaders']
+  headerExtraInfo
 );
 
 // ── Server Communication ────────────────────────────────────────────────────
