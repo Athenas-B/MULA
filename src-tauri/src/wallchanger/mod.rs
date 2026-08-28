@@ -1,4 +1,6 @@
 mod images;
+#[cfg_attr(target_os = "windows", path = "monitors/windows.rs")]
+#[cfg_attr(not(target_os = "windows"), path = "monitors/linux.rs")]
 mod monitors;
 mod overlay;
 mod preview;

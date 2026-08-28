@@ -58,6 +58,7 @@ pub fn start() -> Result<(), String> {
             std::thread::sleep(Duration::from_secs(1));
         }
 
+        #[cfg(target_os = "windows")]
         unsafe { windows::Win32::System::Com::CoUninitialize() };
     });
 

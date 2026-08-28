@@ -73,12 +73,21 @@ fn get_vsd_server_path() -> Option<std::path::PathBuf> {
     None
 }
 
-fn get_python_command() -> String {
-    // Try python3 first, fall back to python
-    if cfg!(target_os = "windows") {
-        "python".to_string()
+fn get_python_command(venv_dir: &Path) -> std::path::PathBuf {
+    // Prefer a local virtual environment, fall back to system python
+    let venv_python = if cfg!(target_os = "windows") {
+        venv_dir.join(".venv").join("Scripts").join("python.exe")
     } else {
-        "python3".to_string()
+        venv_dir.join(".venv").join("bin").join("python")
+    };
+    if venv_python.exists() {
+        return venv_python;
+    }
+
+    if cfg!(target_os = "windows") {
+        std::path::PathBuf::from("python")
+    } else {
+        std::path::PathBuf::from("python3")
     }
 }
 
@@ -94,8 +103,8 @@ async fn vsd_start() -> Result<(), String> {
     let server_path = get_vsd_server_path()
         .ok_or("Could not find VSD server.py")?;
 
-    let python = get_python_command();
     let working_dir = server_path.parent().unwrap().to_path_buf();
+    let python = get_python_command(&working_dir);
 
     // Install dependencies if needed
     let requirements = working_dir.join("requirements.txt");
@@ -407,7 +416,7 @@ async fn vsd_install_extension(browser: String) -> Result<String, String> {
     let build_script = get_extension_build_script()
         .ok_or("Could not find extension build script")?;
 
-    let python = get_python_command();
+    let python = get_python_command(build_script.parent().unwrap());
 
     // Build the extension
     let output = Command::new(&python)
