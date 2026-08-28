@@ -964,9 +964,12 @@ async function initWallchanger() {
     });
   }
 
+  document.getElementById("wc-queue-refresh")?.addEventListener("click", wcLoadQueuePreview);
+
   await wcLoadSettings();
   await wcLoadStatus();
   await wcLoadMonitors();
+  await wcLoadQueuePreview();
 }
 
 async function wcLoadSettings() {
@@ -1181,6 +1184,7 @@ async function wcApply() {
     const result = await invoke("wc_apply");
     wcShowMessage(result, "success");
     await wcLoadSettings();
+    await wcLoadQueuePreview();
   } catch (err) {
     wcShowMessage(`Error applying wallpaper: ${err}`, "error");
   }
@@ -1193,6 +1197,7 @@ async function wcChangeNow() {
     const result = await invoke("wc_change_now");
     wcShowMessage(result, "success");
     await wcLoadSettings();
+    await wcLoadQueuePreview();
   } catch (err) {
     wcShowMessage(`Error changing wallpaper: ${err}`, "error");
   }
@@ -1243,6 +1248,53 @@ async function wcLoadMonitors() {
   } catch (err) {
     wcShowMessage(`Error loading monitors: ${err}`, "error");
   }
+}
+
+async function wcLoadQueuePreview() {
+  const container = document.getElementById("wc-queues");
+  if (!container) return;
+
+  container.innerHTML = `<div class="wallchanger-empty">Loading...</div>`;
+  try {
+    const queues = await invoke("wc_get_queue_preview");
+    if (!queues.length) {
+      container.innerHTML = `<div class="wallchanger-empty">No queues yet. Add a source folder to build a queue.</div>`;
+      return;
+    }
+
+    container.innerHTML = queues.map(wcRenderQueueCard).join("");
+  } catch (err) {
+    container.innerHTML = "";
+    wcShowMessage(`Error loading queue preview: ${err}`, "error");
+  }
+}
+
+function wcRenderQueueCard(q) {
+  const rows = q.images
+    .slice(0, 30)
+    .map((img) => {
+      const badges = [
+        img.is_next ? `<span class="wallchanger-badge next">Next</span>` : "",
+        img.is_last_shown ? `<span class="wallchanger-badge last">Last shown</span>` : "",
+        img.last_resort ? `<span class="wallchanger-badge last-resort">Last resort</span>` : "",
+      ].join("");
+      return `<li class="wallchanger-queue-item${img.is_next ? " next" : ""}${img.last_resort ? " last-resort" : ""}">
+        <span class="wallchanger-queue-filename" title="${img.path}">${img.file_name}</span>
+        ${badges}
+      </li>`;
+    })
+    .join("");
+
+  const more = q.images.length > 30 ? `<li class="wallchanger-queue-more">+${q.images.length - 30} more</li>` : "";
+  const nextHint = q.rotation_mode === "Random" ? "Next picture is chosen randomly" : "";
+
+  return `<div class="wallchanger-queue-card">
+    <div class="wallchanger-queue-title">
+      <strong>${q.label}</strong>
+      <span class="wallchanger-queue-meta">${q.image_count} image(s) &middot; ${q.rotation_mode}${nextHint ? " &middot; " + nextHint : ""}</span>
+    </div>
+    <ul class="wallchanger-queue-list">${rows}${more}</ul>
+  </div>`;
 }
 
 function wcShowMessage(text, kind) {

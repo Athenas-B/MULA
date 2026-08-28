@@ -201,6 +201,29 @@ pub fn ensure_queue_state<'a>(
     settings.queue_states.last_mut().unwrap()
 }
 
+/// Returns the image path that `choose_from_queue` would pick next for `RotationMode::Sequence`,
+/// without mutating `state`. Random rotation has no fixed "next" image, so this only applies to
+/// Sequence mode; callers should treat a `None` result for Random mode as "picked at random".
+pub fn peek_next_sequence_path(queue: &[RankedImage], state: &QueueState) -> Option<String> {
+    if queue.is_empty() || state.ordered_image_paths.is_empty() {
+        return None;
+    }
+
+    let available: std::collections::HashSet<&String> = queue.iter().map(|r| &r.image.path).collect();
+    let ordered: Vec<&String> = state
+        .ordered_image_paths
+        .iter()
+        .filter(|p| available.contains(p))
+        .collect();
+
+    if ordered.is_empty() {
+        return None;
+    }
+
+    let idx = (state.next_index as usize) % ordered.len();
+    Some(ordered[idx].clone())
+}
+
 pub fn choose_from_queue(
     queue: &[RankedImage],
     rotation_mode: RotationMode,
