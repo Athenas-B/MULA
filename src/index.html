@@ -196,6 +196,10 @@
               <input type="number" id="wc-max-level" min="1" max="10" value="10">
             </div>
             <div class="wallchanger-row">
+              <label for="wc-wallhaven-api-key">Wallhaven API key</label>
+              <input type="text" id="wc-wallhaven-api-key" placeholder="optional; required for NSFW purity">
+            </div>
+            <div class="wallchanger-row">
               <label for="wc-rotation">Rotation</label>
               <select id="wc-rotation">
                 <option value="Random">Random</option>
@@ -285,6 +289,7 @@
             <div class="wallchanger-sources" id="wc-sources"></div>
             <div class="wallchanger-source-toolbar">
               <button id="wc-add-folder" class="vsd-btn">Add folder</button>
+              <button id="wc-add-wallhaven" class="vsd-btn">Add Wallhaven URL</button>
               <button id="wc-remove-source" class="vsd-btn" disabled>Remove</button>
               <button id="wc-move-up" class="vsd-btn" disabled>Up</button>
               <button id="wc-move-down" class="vsd-btn" disabled>Down</button>
@@ -294,6 +299,14 @@
           <div class="wallchanger-section">
             <h3>Monitors</h3>
             <ul id="wc-monitors" class="wallchanger-monitors"></ul>
+          </div>
+
+          <div class="wallchanger-section">
+            <div class="wallchanger-queue-header">
+              <h3>Monitor preview</h3>
+              <button id="wc-monitor-preview-refresh" class="vsd-btn">Refresh</button>
+            </div>
+            <div id="wc-monitor-preview" class="wallchanger-monitor-preview"></div>
           </div>
 
           <div class="wallchanger-section">

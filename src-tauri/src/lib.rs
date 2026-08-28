@@ -1356,6 +1356,7 @@ pub fn run() {
             wallchanger::wc_toggle_service,
             wallchanger::wc_get_status,
             wallchanger::wc_get_queue_preview,
+            wallchanger::wc_get_monitor_preview,
             get_autostart,
             set_autostart,
         ])

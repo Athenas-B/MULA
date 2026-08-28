@@ -945,12 +945,13 @@ async function initWallchanger() {
   document.getElementById("wc-change-now")?.addEventListener("click", wcChangeNow);
   document.getElementById("wc-apply")?.addEventListener("click", wcApply);
   document.getElementById("wc-add-folder")?.addEventListener("click", wcAddFolder);
+  document.getElementById("wc-add-wallhaven")?.addEventListener("click", wcAddWallhavenUrl);
   document.getElementById("wc-remove-source")?.addEventListener("click", wcRemoveSource);
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
 
   for (const id of [
-    "wc-interval", "wc-max-level", "wc-rotation", "wc-scaling", "wc-bg-color",
+    "wc-interval", "wc-max-level", "wc-wallhaven-api-key", "wc-rotation", "wc-scaling", "wc-bg-color",
     "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor",
     "wc-fade-enabled", "wc-fade-duration", "wc-fade-steps",
     "wc-overlay-enabled", "wc-overlay-mode", "wc-overlay-font-size", "wc-overlay-color",
@@ -965,10 +966,12 @@ async function initWallchanger() {
   }
 
   document.getElementById("wc-queue-refresh")?.addEventListener("click", wcLoadQueuePreview);
+  document.getElementById("wc-monitor-preview-refresh")?.addEventListener("click", wcLoadMonitorPreview);
 
   await wcLoadSettings();
   await wcLoadStatus();
   await wcLoadMonitors();
+  await wcLoadMonitorPreview();
   await wcLoadQueuePreview();
 }
 
@@ -1022,6 +1025,7 @@ function wcUpdateOverlayVisibility() {
 function wcRenderSettings() {
   document.getElementById("wc-interval").value = wcSettings.interval_minutes;
   document.getElementById("wc-max-level").value = wcSettings.maximum_source_level;
+  document.getElementById("wc-wallhaven-api-key").value = wcSettings.wallhaven_api_key || "";
   document.getElementById("wc-rotation").value = wcSettings.rotation_mode;
   document.getElementById("wc-scaling").value = wcSettings.scaling_mode;
   document.getElementById("wc-bg-color").value = wcArgbToHex(wcSettings.background_color_argb);
@@ -1043,21 +1047,42 @@ function wcRenderSettings() {
   wcUpdateOverlayVisibility();
 }
 
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function isWallhavenUrl(path) {
+  const p = (path || "").trim().toLowerCase();
+  return (p.startsWith("http://") || p.startsWith("https://")) && p.includes("wallhaven.cc");
+}
+
 function wcRenderSources() {
   const container = document.getElementById("wc-sources");
   container.innerHTML = "";
 
   wcSettings.source_folders.forEach((source, index) => {
+    const isUrl = isWallhavenUrl(source.path);
     const row = document.createElement("div");
     row.className = `wallchanger-source${index === wcSelectedSourceIndex ? " selected" : ""}`;
+    row.style.gridTemplateColumns = isUrl ? "24px 1fr 60px 70px 80px" : "24px 1fr 60px 110px";
     row.innerHTML = `
       <input type="checkbox" ${source.enabled ? "checked" : ""} title="Enabled">
-      <input type="text" value="${source.path}" placeholder="Folder or URL" readonly>
+      <input type="text" value="${escapeHtml(source.path)}" placeholder="Folder or URL" ${isUrl ? "" : "readonly"}>
       <input type="number" min="1" max="10" value="${source.level}" title="Level">
-      <label class="wallchanger-option" title="Include subfolders">
-        <input type="checkbox" ${source.include_subfolders ? "checked" : ""}>
-        <span>Subfolders</span>
-      </label>
+      ${isUrl ? `
+        <input type="number" min="1" max="20" value="${source.wallhaven_page_limit || 1}" title="Wallhaven page limit">
+        <input type="text" value="${escapeHtml(source.wallhaven_purity || "110")}" maxlength="3" title="Wallhaven purity (100/110/111)">
+      ` : `
+        <label class="wallchanger-option" title="Include subfolders">
+          <input type="checkbox" ${source.include_subfolders ? "checked" : ""}>
+          <span>Subfolders</span>
+        </label>
+      `}
     `;
 
     row.addEventListener("click", (e) => {
@@ -1072,22 +1097,49 @@ function wcRenderSources() {
       wcAutoSave();
     });
 
-    row.querySelector('input[type="number"]').addEventListener("change", (e) => {
+    const inputs = row.querySelectorAll('input[type="text"], input[type="number"]');
+    const pathInput = inputs[0];
+    const levelInput = inputs[1];
+
+    pathInput.addEventListener("change", (e) => {
+      const previousUrl = isWallhavenUrl(wcSettings.source_folders[index].path);
+      wcSettings.source_folders[index].path = e.target.value.trim();
+      const nowUrl = isWallhavenUrl(wcSettings.source_folders[index].path);
+      if (previousUrl !== nowUrl) {
+        if (nowUrl) {
+          wcSettings.source_folders[index].include_subfolders = false;
+          wcSettings.source_folders[index].wallhaven_page_limit = wcSettings.source_folders[index].wallhaven_page_limit || 1;
+          wcSettings.source_folders[index].wallhaven_purity = wcSettings.source_folders[index].wallhaven_purity || "110";
+        }
+        wcRenderSources();
+      }
+      wcAutoSave();
+    });
+
+    levelInput.addEventListener("change", (e) => {
       wcSettings.source_folders[index].level = Math.min(10, Math.max(1, parseInt(e.target.value, 10) || 1));
       wcAutoSave();
     });
 
-    row.querySelector('input[type="text"]').addEventListener("change", (e) => {
-      wcSettings.source_folders[index].path = e.target.value.trim();
-      wcAutoSave();
-    });
-
-    const subCheck = row.querySelectorAll('input[type="checkbox"]')[1];
-    if (subCheck) {
-      subCheck.addEventListener("change", (e) => {
-        wcSettings.source_folders[index].include_subfolders = e.target.checked;
+    if (isUrl) {
+      const pageLimitInput = inputs[2];
+      const purityInput = inputs[3];
+      pageLimitInput.addEventListener("change", (e) => {
+        wcSettings.source_folders[index].wallhaven_page_limit = Math.max(1, parseInt(e.target.value, 10) || 1);
         wcAutoSave();
       });
+      purityInput.addEventListener("change", (e) => {
+        wcSettings.source_folders[index].wallhaven_purity = (e.target.value || "110").replace(/\D/g, "").slice(0, 3);
+        wcAutoSave();
+      });
+    } else {
+      const subCheck = row.querySelector('label.wallchanger-option input[type="checkbox"]');
+      if (subCheck) {
+        subCheck.addEventListener("change", (e) => {
+          wcSettings.source_folders[index].include_subfolders = e.target.checked;
+          wcAutoSave();
+        });
+      }
     }
 
     container.appendChild(row);
@@ -1107,6 +1159,8 @@ function wcUpdateModelFromUi() {
   if (!wcSettings) return;
   wcSettings.interval_minutes = Math.min(1440, Math.max(1, parseInt(document.getElementById("wc-interval").value, 10) || 30));
   wcSettings.maximum_source_level = Math.min(10, Math.max(1, parseInt(document.getElementById("wc-max-level").value, 10) || 10));
+  wcSettings.wallhaven_api_key = (document.getElementById("wc-wallhaven-api-key").value || "").trim();
+  wcSettings.use_wallhaven_api_key = wcSettings.wallhaven_api_key.length > 0;
   wcSettings.rotation_mode = document.getElementById("wc-rotation").value;
   wcSettings.scaling_mode = document.getElementById("wc-scaling").value;
   wcSettings.background_color_argb = wcHexToArgb(document.getElementById("wc-bg-color").value);
@@ -1143,6 +1197,26 @@ async function wcAddFolder() {
   } catch (err) {
     wcShowMessage(`Error adding folder: ${err}`, "error");
   }
+}
+
+async function wcAddWallhavenUrl() {
+  const url = window.prompt("Enter a Wallhaven search or /api/v1/search URL:");
+  if (!url) return;
+  const trimmed = url.trim();
+  if (!/^https?:\/\//i.test(trimmed) || !trimmed.toLowerCase().includes("wallhaven.cc")) {
+    wcShowMessage("Please enter a valid Wallhaven URL.", "error");
+    return;
+  }
+  wcSettings.source_folders.push({
+    path: trimmed,
+    enabled: true,
+    include_subfolders: false,
+    level: 5,
+    wallhaven_page_limit: 1,
+    wallhaven_purity: "110",
+  });
+  wcRenderSources();
+  await wcAutoSave();
 }
 
 function wcRemoveSource() {
@@ -1184,6 +1258,7 @@ async function wcApply() {
     const result = await invoke("wc_apply");
     wcShowMessage(result, "success");
     await wcLoadSettings();
+    await wcLoadMonitorPreview();
     await wcLoadQueuePreview();
   } catch (err) {
     wcShowMessage(`Error applying wallpaper: ${err}`, "error");
@@ -1197,6 +1272,7 @@ async function wcChangeNow() {
     const result = await invoke("wc_change_now");
     wcShowMessage(result, "success");
     await wcLoadSettings();
+    await wcLoadMonitorPreview();
     await wcLoadQueuePreview();
   } catch (err) {
     wcShowMessage(`Error changing wallpaper: ${err}`, "error");
@@ -1294,6 +1370,40 @@ function wcRenderQueueCard(q) {
       <span class="wallchanger-queue-meta">${q.image_count} image(s) &middot; ${q.rotation_mode}${nextHint ? " &middot; " + nextHint : ""}</span>
     </div>
     <ul class="wallchanger-queue-list">${rows}${more}</ul>
+  </div>`;
+}
+
+async function wcLoadMonitorPreview() {
+  const container = document.getElementById("wc-monitor-preview");
+  if (!container) return;
+  container.innerHTML = `<div class="wallchanger-empty">Loading...</div>`;
+  try {
+    const previews = await invoke("wc_get_monitor_preview");
+    if (!previews.length) {
+      container.innerHTML = `<div class="wallchanger-empty">No monitors found.</div>`;
+      return;
+    }
+    container.innerHTML = previews.map(wcRenderMonitorPreview).join("");
+  } catch (err) {
+    container.innerHTML = "";
+    wcShowMessage(`Error loading monitor preview: ${err}`, "error");
+  }
+}
+
+function wcRenderMonitorPreview(p) {
+  const imageDims = p.image_width ? `${p.image_width}×${p.image_height}` : "—";
+  return `<div class="wallchanger-monitor-preview-card">
+    <div class="wallchanger-monitor-preview-title">
+      <strong>Monitor ${p.monitor_index}</strong>
+      <span>${p.width}×${p.height}</span>
+    </div>
+    <div class="wallchanger-monitor-preview-frame">
+      <img src="${p.preview_data_url}" alt="Monitor ${p.monitor_index} preview">
+    </div>
+    <div class="wallchanger-monitor-preview-meta">
+      <span title="${p.fit}">${p.fit}</span>
+      <span title="${p.wallpaper_path}">Image: ${imageDims}</span>
+    </div>
   </div>`;
 }
 

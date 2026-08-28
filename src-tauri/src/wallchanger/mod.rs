@@ -1,10 +1,12 @@
 mod images;
 mod monitors;
 mod overlay;
+mod preview;
 mod queue;
 pub mod service;
 pub mod settings;
 mod transition;
+mod wallhaven;
 
 use serde::Serialize;
 
@@ -129,19 +131,42 @@ pub fn wc_get_queue_preview() -> Result<Vec<QueuePreview>, String> {
 
     if !settings.use_separate_monitor_queues || monitors.len() <= 1 {
         if let Some(queue) = queues.get("shared").cloned() {
-            previews.push(build_queue_preview(&mut settings, "shared".to_string(), "Shared queue".to_string(), &queue, rotation_label));
+            previews.push(build_queue_preview(
+                &mut settings,
+                "shared".to_string(),
+                "Shared queue".to_string(),
+                &queue,
+                rotation_label,
+            ));
         }
     } else {
         for (index, monitor) in monitors.iter().enumerate() {
             let key = queue::get_queue_key(&settings, monitors.len(), &monitor.id, false);
             if let Some(queue) = queues.get(&key).cloned() {
-                let label = format!("Monitor {} ({}x{})", index + 1, monitor.width, monitor.height);
-                previews.push(build_queue_preview(&mut settings, key, label, &queue, rotation_label));
+                let label = format!(
+                    "Monitor {} ({}x{})",
+                    index + 1,
+                    monitor.width,
+                    monitor.height
+                );
+                previews.push(build_queue_preview(
+                    &mut settings,
+                    key,
+                    label,
+                    &queue,
+                    rotation_label,
+                ));
             }
         }
     }
 
     Ok(previews)
+}
+
+#[tauri::command]
+pub fn wc_get_monitor_preview() -> Result<Vec<preview::MonitorPreview>, String> {
+    let settings = settings::load()?;
+    preview::build_monitor_previews(&settings)
 }
 
 fn build_queue_preview(

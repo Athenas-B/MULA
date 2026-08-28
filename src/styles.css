@@ -1056,6 +1056,76 @@ html[data-theme="dark"] .wallchanger-queue-more {
   color: #888;
 }
 
+.wallchanger-monitor-preview {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.wallchanger-monitor-preview-card {
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 10px;
+  background: #fff;
+}
+
+.wallchanger-monitor-preview-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+  font-size: 0.9rem;
+}
+
+.wallchanger-monitor-preview-title span {
+  font-size: 0.8rem;
+  color: #666;
+}
+
+.wallchanger-monitor-preview-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  background: #000;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.wallchanger-monitor-preview-frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.wallchanger-monitor-preview-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 0.78rem;
+  color: #555;
+  overflow: hidden;
+}
+
+.wallchanger-monitor-preview-meta span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+html[data-theme="dark"] .wallchanger-monitor-preview-card {
+  background: #1e1e1e;
+  border-color: #333;
+}
+
+html[data-theme="dark"] .wallchanger-monitor-preview-title span {
+  color: #999;
+}
+
+html[data-theme="dark"] .wallchanger-monitor-preview-meta {
+  color: #aaa;
+}
+
 html[data-theme="dark"] .wallchanger-empty {
   color: #aaa;
 }
