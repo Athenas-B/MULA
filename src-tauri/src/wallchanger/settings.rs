@@ -168,6 +168,17 @@ fn default_level() -> i32 { 5 }
 fn default_interval() -> i32 { 30 }
 fn default_max_level() -> i32 { 10 }
 fn default_wallhaven_page_limit() -> i32 { 1 }
+
+fn normalize_purity(purity: &str) -> String {
+    let s = purity.trim();
+    if s.len() == 3 && s.chars().all(|c| c == '0' || c == '1') {
+        if s == "000" { "100".to_string() } else { s.to_string() }
+    } else if s.is_empty() {
+        "110".to_string()
+    } else {
+        "110".to_string()
+    }
+}
 fn default_black() -> i32 { 0xFF000000u32 as i32 }
 fn default_white() -> i32 { 0xFFFFFFFFu32 as i32 }
 fn default_font_size() -> i32 { 28 }
@@ -227,7 +238,8 @@ pub fn normalize(settings: &mut Settings) {
     for source in &mut settings.source_folders {
         source.path = source.path.trim().to_string();
         source.level = source.level.clamp(1, 10);
-        source.wallhaven_page_limit = source.wallhaven_page_limit.max(1);
+        source.wallhaven_page_limit = source.wallhaven_page_limit.max(0);
+        source.wallhaven_purity = normalize_purity(&source.wallhaven_purity);
     }
 
     settings.source_folders.retain(|s| !s.path.is_empty());

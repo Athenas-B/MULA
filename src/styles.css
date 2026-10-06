@@ -722,7 +722,7 @@ body {
 
 .wallchanger-source {
   display: grid;
-  grid-template-columns: 24px 1fr 80px 100px 80px;
+  grid-template-columns: 24px 1fr 60px 80px 180px;
   gap: 8px;
   align-items: center;
   padding: 8px;
@@ -740,9 +740,23 @@ body {
 .wallchanger-source input[type="text"],
 .wallchanger-source input[type="number"] {
   width: 100%;
+  min-width: 0;
   padding: 4px 6px;
   border: 1px solid #ced4da;
   border-radius: 4px;
+}
+
+.wallchanger-purity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.wallchanger-purity .wallchanger-option {
+  margin-right: 0;
+  font-size: 0.8rem;
+  white-space: nowrap;
 }
 
 .wallchanger-source-toolbar {

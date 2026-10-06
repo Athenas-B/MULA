@@ -1061,6 +1061,21 @@ function isWallhavenUrl(path) {
   return (p.startsWith("http://") || p.startsWith("https://")) && p.includes("wallhaven.cc");
 }
 
+function wcParsePurity(purity) {
+  const s = String(purity || "110").trim();
+  let valid = "110";
+  if (/^[01]{0,3}$/.test(s)) {
+    valid = s.padEnd(3, "0").slice(0, 3);
+  }
+  if (valid === "000") valid = "100";
+  return [valid[0] === "1", valid[1] === "1", valid[2] === "1"];
+}
+
+function wcBuildPurity(bits) {
+  const s = bits.map((b) => (b ? "1" : "0")).join("");
+  return s === "000" ? "100" : s;
+}
+
 function wcRenderSources() {
   const container = document.getElementById("wc-sources");
   container.innerHTML = "";
@@ -1069,14 +1084,20 @@ function wcRenderSources() {
     const isUrl = isWallhavenUrl(source.path);
     const row = document.createElement("div");
     row.className = `wallchanger-source${index === wcSelectedSourceIndex ? " selected" : ""}`;
-    row.style.gridTemplateColumns = isUrl ? "24px 1fr 60px 70px 80px" : "24px 1fr 60px 110px";
+    row.style.gridTemplateColumns = isUrl ? "24px 1fr 60px 80px 180px" : "24px 1fr 60px 110px";
+    const pageLimit = Number.isFinite(source.wallhaven_page_limit) ? source.wallhaven_page_limit : 1;
+    const [sfw, sketchy, nsfw] = wcParsePurity(source.wallhaven_purity);
     row.innerHTML = `
       <input type="checkbox" ${source.enabled ? "checked" : ""} title="Enabled">
       <input type="text" value="${escapeHtml(source.path)}" placeholder="Folder or URL" ${isUrl ? "" : "readonly"}>
       <input type="number" min="1" max="10" value="${source.level}" title="Level">
       ${isUrl ? `
-        <input type="number" min="1" max="20" value="${source.wallhaven_page_limit || 1}" title="Wallhaven page limit">
-        <input type="text" value="${escapeHtml(source.wallhaven_purity || "110")}" maxlength="3" title="Wallhaven purity (100/110/111)">
+        <input type="number" min="0" max="20" value="${pageLimit}" title="Page limit (0 = unlimited)">
+        <div class="wallchanger-purity" title="Purity">
+          <label class="wallchanger-option" title="Safe for work"><input type="checkbox" data-purity="0" ${sfw ? "checked" : ""}><span>SFW</span></label>
+          <label class="wallchanger-option" title="Sketchy"><input type="checkbox" data-purity="1" ${sketchy ? "checked" : ""}><span>Sketchy</span></label>
+          <label class="wallchanger-option" title="Not safe for work; requires API key"><input type="checkbox" data-purity="2" ${nsfw ? "checked" : ""}><span>NSFW</span></label>
+        </div>
       ` : `
         <label class="wallchanger-option" title="Include subfolders">
           <input type="checkbox" ${source.include_subfolders ? "checked" : ""}>
@@ -1108,7 +1129,8 @@ function wcRenderSources() {
       if (previousUrl !== nowUrl) {
         if (nowUrl) {
           wcSettings.source_folders[index].include_subfolders = false;
-          wcSettings.source_folders[index].wallhaven_page_limit = wcSettings.source_folders[index].wallhaven_page_limit || 1;
+          const existingLimit = wcSettings.source_folders[index].wallhaven_page_limit;
+          wcSettings.source_folders[index].wallhaven_page_limit = Number.isFinite(existingLimit) ? existingLimit : 1;
           wcSettings.source_folders[index].wallhaven_purity = wcSettings.source_folders[index].wallhaven_purity || "110";
         }
         wcRenderSources();
@@ -1123,14 +1145,18 @@ function wcRenderSources() {
 
     if (isUrl) {
       const pageLimitInput = inputs[2];
-      const purityInput = inputs[3];
+      const purityInputs = row.querySelectorAll('.wallchanger-purity input[type="checkbox"]');
       pageLimitInput.addEventListener("change", (e) => {
-        wcSettings.source_folders[index].wallhaven_page_limit = Math.max(1, parseInt(e.target.value, 10) || 1);
+        const value = parseInt(e.target.value, 10);
+        wcSettings.source_folders[index].wallhaven_page_limit = Number.isNaN(value) ? 1 : Math.max(0, value);
         wcAutoSave();
       });
-      purityInput.addEventListener("change", (e) => {
-        wcSettings.source_folders[index].wallhaven_purity = (e.target.value || "110").replace(/\D/g, "").slice(0, 3);
-        wcAutoSave();
+      purityInputs.forEach((cb) => {
+        cb.addEventListener("change", () => {
+          const bits = Array.from(purityInputs).map((p) => p.checked);
+          wcSettings.source_folders[index].wallhaven_purity = wcBuildPurity(bits);
+          wcAutoSave();
+        });
       });
     } else {
       const subCheck = row.querySelector('label.wallchanger-option input[type="checkbox"]');
@@ -1392,12 +1418,13 @@ async function wcLoadMonitorPreview() {
 
 function wcRenderMonitorPreview(p) {
   const imageDims = p.image_width ? `${p.image_width}×${p.image_height}` : "—";
+  const aspect = p.width && p.height ? `${p.width} / ${p.height}` : "16 / 10";
   return `<div class="wallchanger-monitor-preview-card">
     <div class="wallchanger-monitor-preview-title">
       <strong>Monitor ${p.monitor_index}</strong>
       <span>${p.width}×${p.height}</span>
     </div>
-    <div class="wallchanger-monitor-preview-frame">
+    <div class="wallchanger-monitor-preview-frame" style="aspect-ratio: ${aspect}">
       <img src="${p.preview_data_url}" alt="Monitor ${p.monitor_index} preview">
     </div>
     <div class="wallchanger-monitor-preview-meta">

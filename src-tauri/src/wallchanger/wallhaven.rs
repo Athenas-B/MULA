@@ -42,7 +42,11 @@ pub fn fetch_and_cache(source: &Source, settings: &Settings) -> Result<Vec<Image
         None
     };
 
-    let page_limit = source.wallhaven_page_limit.max(1);
+    let page_limit = if source.wallhaven_page_limit == 0 {
+        u32::MAX
+    } else {
+        source.wallhaven_page_limit.max(1) as u32
+    };
     let purity = if source.wallhaven_purity.is_empty() {
         DEFAULT_WALLHAVEN_PURITY
     } else {
