@@ -169,12 +169,11 @@ fn add_image(
         .map(|e| (e.width, e.height))
         .unwrap_or_else(|| read_image_dimensions(&path_str).unwrap_or((0, 0)));
 
-    if width == 0 || height == 0 {
-        return;
-    }
-
+    // Unreadable files are cached as 0x0 too, so they aren't decoded (and logged) on every pass.
     cache.push(ImageCacheEntry { path: path_str.clone(), length, modified_secs, width, height });
-    images.push(ImageInfo { path: path_str, width, height });
+    if width > 0 && height > 0 {
+        images.push(ImageInfo { path: path_str, width, height });
+    }
 }
 
 #[cfg(test)]
@@ -243,7 +242,7 @@ mod tests {
         assert_eq!(names(&images), ["deep.png", "top.png"], "unreadable and non-image files are skipped");
         let top = images.iter().find(|i| i.path.ends_with("top.png")).unwrap();
         assert_eq!((top.width, top.height), (40, 20));
-        assert_eq!(cache.len(), 2, "dimensions are cached for readable images");
+        assert_eq!(cache.len(), 3, "dimensions are cached for every image file, readable or not");
 
         s.source_folders[0].kind = SourceKind::Folder { include_subfolders: false };
         assert_eq!(names(&load(&s, &mut cache).unwrap()), ["top.png"]);
@@ -287,6 +286,18 @@ mod tests {
         let images = load(&s, &mut cache).unwrap();
         assert_eq!((images[0].width, images[0].height), (64, 32));
         assert_eq!(cache[0].width, 64, "the cache is refreshed");
+    }
+
+    #[test]
+    fn unreadable_files_are_cached_but_not_offered() {
+        let dir = TempDir::new("images_broken");
+        std::fs::write(dir.join("broken.png"), b"not a png").unwrap();
+        let s = settings_with(vec![source(dir.path())]);
+        let mut cache = Vec::new();
+
+        assert!(load(&s, &mut cache).unwrap().is_empty());
+        assert_eq!(cache.len(), 1);
+        assert_eq!((cache[0].width, cache[0].height), (0, 0));
     }
 
     #[test]

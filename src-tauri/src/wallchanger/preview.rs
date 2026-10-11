@@ -5,14 +5,16 @@ use super::settings::{ScalingMode, Settings};
 use base64::Engine;
 use image::{imageops::FilterType, Rgba, RgbaImage};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 const PREVIEW_MAX_WIDTH: u32 = 420;
 const PREVIEW_MAX_HEIGHT: u32 = 280;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorPreview {
-    pub monitor_id: String,
     pub monitor_index: usize,
     pub width: i32,
     pub height: i32,
@@ -23,49 +25,75 @@ pub struct MonitorPreview {
     pub preview_data_url: String,
 }
 
+/// Everything a rendered preview depends on: the same key means the same thumbnail.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PreviewKey {
+    path: String,
+    file: Option<(u64, SystemTime)>,
+    width: i32,
+    height: i32,
+    fill: bool,
+    background_color_argb: i32,
+}
+
+/// The previews of the last build, so unchanged monitors aren't decoded and re-encoded again.
+static PREVIEW_CACHE: Mutex<Option<HashMap<PreviewKey, MonitorPreview>>> = Mutex::new(None);
+
 pub fn build_monitor_previews(settings: &Settings) -> Result<Vec<MonitorPreview>, String> {
     let monitors = get_monitors()?;
     if monitors.is_empty() {
         return Err("No monitors found".to_string());
     }
 
+    let mut previous = crate::util::lock(&PREVIEW_CACHE).take().unwrap_or_default();
+    let mut current = HashMap::new();
     let mut previews = Vec::new();
     for (index, monitor) in monitors.iter().enumerate() {
         let wallpaper_path = get_current_wallpaper(&monitor.id).unwrap_or_default();
-        let placeholder = |fit: &str| {
-            (0, 0, fit.to_string(), render_placeholder(monitor.width, monitor.height, settings.background_color_argb))
-        };
-        let (image_width, image_height, fit, preview) =
-            if wallpaper_path.is_empty() || !std::path::Path::new(&wallpaper_path).exists() {
-                placeholder("No wallpaper")
-            } else {
-                render_wallpaper_preview(
-                    &wallpaper_path,
-                    monitor.width,
-                    monitor.height,
-                    &settings.scaling_mode,
-                    settings.background_color_argb,
-                )
-                .unwrap_or_else(|e| {
-                    log::warn!("Failed to render monitor preview for {}: {e}", monitor.id);
-                    placeholder("Error")
-                })
-            };
-
-        previews.push(MonitorPreview {
-            monitor_id: monitor.id.clone(),
-            monitor_index: index + 1,
+        let file = std::fs::metadata(&wallpaper_path).ok().filter(|m| m.is_file()).and_then(|m| Some((m.len(), m.modified().ok()?)));
+        let key = PreviewKey {
+            path: wallpaper_path,
+            file,
             width: monitor.width,
             height: monitor.height,
-            wallpaper_path,
-            image_width,
-            image_height,
-            fit,
-            preview_data_url: png_data_url(&preview)?,
-        });
+            fill: matches!(settings.scaling_mode, ScalingMode::Fill),
+            background_color_argb: settings.background_color_argb,
+        };
+        let preview = match previous.remove(&key) {
+            Some(cached) => cached,
+            None => render_monitor_preview(&key, &monitor.id, settings)?,
+        };
+        previews.push(MonitorPreview { monitor_index: index + 1, ..preview.clone() });
+        current.insert(key, preview);
     }
 
+    *crate::util::lock(&PREVIEW_CACHE) = Some(current);
     Ok(previews)
+}
+
+fn render_monitor_preview(key: &PreviewKey, monitor_id: &str, settings: &Settings) -> Result<MonitorPreview, String> {
+    let placeholder =
+        |fit: &str| (0, 0, fit.to_string(), render_placeholder(key.width, key.height, settings.background_color_argb));
+    let (image_width, image_height, fit, preview) = if key.file.is_none() {
+        placeholder("No wallpaper")
+    } else {
+        render_wallpaper_preview(&key.path, key.width, key.height, &settings.scaling_mode, settings.background_color_argb)
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to render monitor preview for {monitor_id}: {e}");
+                placeholder("Error")
+            })
+    };
+
+    Ok(MonitorPreview {
+        monitor_index: 0,
+        width: key.width,
+        height: key.height,
+        wallpaper_path: key.path.clone(),
+        image_width,
+        image_height,
+        fit,
+        preview_data_url: png_data_url(&preview)?,
+    })
 }
 
 fn render_wallpaper_preview(

@@ -26,8 +26,8 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
 
 - **Wall Changer data model (`wallchanger/settings.rs`).** Two separate types and files:
   `Settings` (user configuration, `settings.json`) and `RuntimeState` (queues, image cache, show
-  stats, next monitor, service on/off — `state.json`, written only by `service::apply` via
-  `save_state` and by `set_service_running`). Sources are typed: `Source { path, enabled, level,
+  stats, next monitor — `state.json`, written only by `service::apply` via `save_state`). The
+  service on/off flag has its own `service.json` (`service_running` / `set_service_running`). Sources are typed: `Source { path, enabled, level,
   kind }` with `SourceKind::Folder { include_subfolders }` / `SourceKind::Wallhaven { page_limit,
   purity: Purity { sfw, sketchy, nsfw } }` (serialized with a `"kind"` tag). Unreadable files
   are moved aside to `*.bak` and defaults are used. All JSON files are written atomically.
@@ -39,17 +39,25 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   clamping itself. JSON files that can't be read (other than missing) are errors, never defaults.
 - **Threading.** Commands do blocking work through `util::blocking` / `logged_blocking` (sync
   Tauri commands run on the UI thread). `service::apply` is serialized by `APPLY_LOCK`; tray
-  actions spawn blocking tasks. The interval worker is a plain thread guarded by a generation
-  counter; every apply records `LAST_APPLY`, so a manual change restarts the interval.
-- **Events to the UI.** `wc-service-changed`, `wc-wallpaper-changed`, `wc-settings-changed`,
-  `vsd-log`, `vsd-state-changed`, `autostart-changed`. No polling for logs or state.
+  actions spawn blocking tasks. The interval worker is a plain thread that sleeps on a `Condvar`
+  (`WORKER` state: generation, active, `last_apply`); `stop`, every apply and settings changes
+  (`service::wake`) wake it, so a manual change restarts the interval. Mutexes are taken with the
+  poison-recovering `util::lock`.
+- **Events to the UI (`events.rs`).** Event names are constants there and `events::emit` sends
+  them through the `AppHandle` stored at setup: `wc-service-changed`, `wc-wallpaper-changed`,
+  `wc-settings-changed`, `vsd-log`, `vsd-state-changed`, `autostart-changed`. No polling for logs
+  or state. While the window is hidden the UI skips preview reloads and catches up on show.
+- **Logging (`logger.rs`).** `%APPDATA%\mula\logs\mula.log`, appended by a background thread in
+  batches and rotated to `mula.log.1` past 1 MB.
 - **Wallhaven.** Results are cached per source in `manifest.json` for 6 h. Stale results are
   refreshed on a background thread (`refresh_in_background`) while cached images keep being used;
   only a source with nothing cached is fetched synchronously. Images download with 4 workers
   through `.part` files. The API key is sent as an `X-API-Key` header, never in URLs.
-- **Typed command errors (`error.rs`).** Commands that the UI must react to return
-  `CommandError` (`{ kind: "smartctl_missing" | "needs_elevation" | "elevation_declined" | "other",
-  message? }`). The frontend switches on `err.kind` (`errorText`, `invokeSmart`); no text matching.
+- **Typed command errors (`error.rs`).** Every command returns `CmdResult<T>`, i.e. rejects with
+  a `CommandError` (`{ kind: "smartctl_missing" | "needs_elevation" | "elevation_declined" |
+  "other", message? }`). The frontend shows errors with `errorText(err)` and switches on
+  `err.kind` (`invokeSmart`); no text matching. External programs run through
+  `util::run_command` (stdout, or "<what> failed: <stderr>").
 - **SMART (`smart.rs`).** smartctl runs with `--json=o` (structured data plus the usual text).
   Exit-status bit 1 (device open failed) becomes `NeedsElevation` when not elevated; bits 3–7 are
   disk health, not errors. Self-test progress/log is parsed in Rust (`SelfTestStatus`, ATA and
@@ -66,7 +74,8 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   ERROR_CANCELLED) and refuses system/boot disks in Rust and in the script.
   Residual risk: a same-user process can still ask the helper for SMART reads / self-tests.
 - **VSD (`vsd.rs` + `modules/vsd/server.py`).** Config lives in `vsd.json` (`download_dir`,
-  `autostart`, `port`). MULA starts the server with `VSD_DOWNLOAD_DIR`, `VSD_PORT` and a
+  `autostart`, `port`). MULA builds the extension with `build.py --server-url` so it targets the
+  configured port, and starts the server with `VSD_DOWNLOAD_DIR`, `VSD_PORT` and a
   per-launch `VSD_ADMIN_TOKEN`; log lines carry a `seq` so the UI merges backlog and live events;
   the process lock is never held across pip; config changes on the running server are sent with the
   `X-VSD-Admin-Token` header. Autostart happens in the backend at launch. pip runs only when the
@@ -77,8 +86,9 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
 - **Browser extension (`modules/vsd/extension/src`).** Shared `config.js` (server URL helpers).
   The background owns the job lifecycle: jobs live on the stream records in storage (`stream.job`),
   one poll loop updates them and resumes when the service worker starts; every storage
-  read-modify-write goes through `updateStore`. The popup renders from `storage.onChanged`
-  (no timers). Detected playlists are verified once and cached; the content script uses a
+  read-modify-write goes through `updateStore`. webRequest listeners only see `*.m3u*` URLs. The
+  popup renders from `storage.onChanged` (no timers); its tooltip lists the same ffmpeg metadata
+  keys as `server.py`'s `METADATA_KEYS`. Detected playlists are verified once and cached; the content script uses a
   MutationObserver and sends metadata only when it changes.
 
 ## Wall Changer Port Status
@@ -92,8 +102,8 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Local image folders | Done | Add/remove/reorder, enable/disable, level 1–10, subfolders. |
 | Wallhaven URL sources | Done | Accepts `https://wallhaven.cc/search?...` or `/api/v1/search` URLs; per-source page limit (0 = unlimited) and SFW/Sketchy/NSFW purity toggles; API key support for NSFW. Cached under `%APPDATA%\mula\wallchanger\wallhaven`. |
 | Monitor detection | Done | Uses `IDesktopWallpaper`; skips monitors whose `GetMonitorRECT` fails. |
-| Monitor preview block | Done | Shows each monitor frame and how the current Windows wallpaper is fitted (Fill / FitInsideScreen). |
-| Image dimension caching | Done | Cached in `settings.json` with size + mtime. |
+| Monitor preview block | Done | Shows each monitor frame and how the current Windows wallpaper is fitted (Fill / FitInsideScreen); thumbnails are reused while file, monitor and fit settings are unchanged. |
+| Image dimension caching | Done | Cached in `state.json` with size + mtime (unreadable files as 0×0). |
 | Shared / per-monitor queues | Done | Separate queues, exclusive queue membership, fallback queues. |
 | Rotation modes | Done | Random and Sequence; Sequence index persists across restarts. |
 | Scaling modes | Done | Fill and FitInsideScreen with configurable background color. |
@@ -136,7 +146,9 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - `src-tauri/src/wallchanger/service.rs` — Background timer service.
 - `src-tauri/src/wallchanger/monitors/windows.rs` / `linux.rs` — Monitor + wallpaper COM API wrappers (selected via `#[path]`).
 - `src-tauri/src/elevated_helper.rs` — Admin-rights execution (see Architecture notes).
-- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`, `blocking`/`logged_blocking`, `read_json_or_default`/`write_json`/`write_atomic`, `safe_file_name`, `stable_hash` (FNV-1a for cache names).
+- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`/`mula_path`, `blocking`/`logged_blocking`, `lock`, `run_command`, `read_json_or_default`/`write_json`/`write_atomic`, `safe_file_name`, `stable_hash` (FNV-1a for cache names).
+- `src-tauri/src/events.rs` — Event names and `emit`.
+- `src-tauri/src/logger.rs` — Rotating app log.
 - `src-tauri/src/wallchanger/overlay.rs` — Picture-name overlay rendering.
 - `src-tauri/src/wallchanger/transition.rs` — Fade transition frame generation.
 - `src-tauri/src/wallchanger/preview.rs` — Monitor-fit preview rendering; `fit_to_canvas` is shared with the fade transition.
@@ -145,7 +157,9 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 ## Settings / Cache Paths
 
 - Settings (user configuration only): `%APPDATA%\mula\wallchanger\settings.json`
-- Runtime state (queues, image cache, stats, service on/off): `%APPDATA%\mula\wallchanger\state.json`
+- Runtime state (queues, image cache, stats): `%APPDATA%\mula\wallchanger\state.json`
+- Service on/off: `%APPDATA%\mula\wallchanger\service.json`
+- App log: `%APPDATA%\mula\logs\mula.log` (+ `mula.log.1`)
 - Rendered overlay cache: `%APPDATA%\mula\wallchanger\rendered`
 - Fade transition frames: `%APPDATA%\mula\wallchanger\rendered\transitions`
 - Wallhaven download cache: `%APPDATA%\mula\wallchanger\wallhaven\fnv<hash>\` (+ `manifest.json`)

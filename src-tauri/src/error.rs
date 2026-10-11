@@ -16,6 +16,9 @@ pub enum CommandError {
     Other { message: String },
 }
 
+/// What every Tauri command returns.
+pub type CmdResult<T> = Result<T, CommandError>;
+
 impl From<String> for CommandError {
     fn from(message: String) -> Self {
         Self::Other { message }

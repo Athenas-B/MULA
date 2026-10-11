@@ -3,7 +3,8 @@
 //! Output lines and running/stopped changes are pushed to the UI as `vsd-log` and
 //! `vsd-state-changed` events; a bounded backlog lets the UI show what happened before it opened.
 
-use crate::util;
+use crate::error::CmdResult;
+use crate::{events, util};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -12,7 +13,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
 
 /// The running server. Only held briefly: never across pip or other slow work.
 static PROCESS: Mutex<Option<Child>> = Mutex::new(None);
@@ -65,17 +65,17 @@ fn default_port() -> u16 {
     8765
 }
 
-fn config_path() -> Option<PathBuf> {
-    util::mula_config_dir().map(|dir| dir.join("vsd.json"))
+fn config_path() -> Result<PathBuf, String> {
+    util::mula_path("vsd.json")
 }
 
 fn load_config() -> Result<VsdConfig, String> {
-    util::read_json_or_default(&config_path().ok_or("Could not determine config directory")?)
+    util::read_json_or_default(&config_path()?)
 }
 
 fn update_config(f: impl FnOnce(&mut VsdConfig)) -> Result<VsdConfig, String> {
-    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let path = config_path().ok_or("Could not determine config directory")?;
+    let _guard = util::lock(&CONFIG_LOCK);
+    let path = config_path()?;
     let mut config: VsdConfig = util::read_json_or_default(&path)?;
     f(&mut config);
     util::write_json(&path, &config)?;
@@ -115,75 +115,80 @@ fn python_command(dir: &Path) -> PathBuf {
 
 // ── Output ───────────────────────────────────────────────────────────────────
 
-fn emit_line(app: &AppHandle, line: impl Into<String>) {
+fn emit_line(line: impl Into<String>) {
     let line = line.into();
     log::info!("[VSD] {line}");
     if is_import_error(&line) {
         SAW_IMPORT_ERROR.store(true, Ordering::SeqCst);
     }
     let entry = LogLine { seq: LOG_SEQ.fetch_add(1, Ordering::SeqCst) + 1, text: format!("{line}\n") };
-    if let Ok(mut backlog) = LOG_BACKLOG.lock() {
-        backlog.push_back(entry.clone());
-        while backlog.len() > LOG_BACKLOG_LINES {
-            backlog.pop_front();
-        }
+    let mut backlog = util::lock(&LOG_BACKLOG);
+    backlog.push_back(entry.clone());
+    while backlog.len() > LOG_BACKLOG_LINES {
+        backlog.pop_front();
     }
-    let _ = app.emit("vsd-log", entry);
+    drop(backlog);
+    events::emit(events::VSD_LOG, entry);
 }
 
 fn is_import_error(line: &str) -> bool {
     line.contains("ModuleNotFoundError") || line.contains("ImportError")
 }
 
-fn emit_state(app: &AppHandle, running: bool) {
-    let _ = app.emit("vsd-state-changed", running);
+fn emit_state(running: bool) {
+    events::emit(events::VSD_STATE_CHANGED, running);
 }
 
 /// Forwards one output stream of the server. The stdout reader also notices the exit.
-fn spawn_reader(app: AppHandle, stream: impl std::io::Read + Send + 'static, watch_exit: bool) {
+fn spawn_reader(stream: impl std::io::Read + Send + 'static, watch_exit: bool) {
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines() {
             let Ok(line) = line else { continue };
-            emit_line(&app, line);
+            emit_line(line);
         }
         if watch_exit {
-            wait_for_exit(&app);
+            wait_for_exit();
         }
     });
 }
 
+enum ServerStatus {
+    Absent,
+    Running,
+    Exited(Option<i32>),
+}
+
+/// The server's state; an exited server is reaped (removed from [`PROCESS`]).
+fn poll_server() -> ServerStatus {
+    let mut guard = util::lock(&PROCESS);
+    let status = match guard.as_mut().map(|child| child.try_wait()) {
+        None => return ServerStatus::Absent,
+        Some(Ok(None)) => return ServerStatus::Running,
+        Some(Ok(Some(status))) => ServerStatus::Exited(status.code()),
+        Some(Err(_)) => ServerStatus::Exited(None),
+    };
+    guard.take();
+    status
+}
+
 /// After the server closed its output: wait for the process to end, then report it. Does
-/// nothing if [`stop`] already took the process.
-fn wait_for_exit(app: &AppHandle) {
+/// nothing if [`stop_process`] already took the process.
+fn wait_for_exit() {
     loop {
-        let finished = {
-            let mut guard = PROCESS.lock().unwrap_or_else(|p| p.into_inner());
-            match guard.as_mut().map(|child| child.try_wait()) {
-                None => return,
-                Some(Ok(None)) => None,
-                Some(Ok(Some(status))) => {
-                    guard.take();
-                    Some(status.code())
-                }
-                Some(Err(_)) => {
-                    guard.take();
-                    Some(None)
-                }
-            }
-        };
-        match finished {
-            None => std::thread::sleep(Duration::from_millis(200)),
-            Some(code) => {
+        match poll_server() {
+            ServerStatus::Absent => return,
+            ServerStatus::Running => std::thread::sleep(Duration::from_millis(200)),
+            ServerStatus::Exited(code) => {
                 if code != Some(0) {
                     if SAW_IMPORT_ERROR.load(Ordering::SeqCst) {
                         // A missing module: reinstall dependencies on the next start.
                         forget_installed_requirements();
                     }
-                    emit_line(app, format!("[Server exited with code {}]", code.map_or("?".into(), |c| c.to_string())));
+                    emit_line(format!("[Server exited with code {}]", code.map_or("?".into(), |c| c.to_string())));
                 } else {
-                    emit_line(app, "[Server stopped]");
+                    emit_line("[Server stopped]");
                 }
-                emit_state(app, false);
+                emit_state(false);
                 return;
             }
         }
@@ -192,12 +197,12 @@ fn wait_for_exit(app: &AppHandle) {
 
 // ── Dependencies ─────────────────────────────────────────────────────────────
 
-fn requirements_marker() -> Option<PathBuf> {
-    util::mula_config_dir().map(|dir| dir.join("vsd-requirements.sha256"))
+fn requirements_marker() -> Result<PathBuf, String> {
+    util::mula_path("vsd-requirements.sha256")
 }
 
 fn forget_installed_requirements() {
-    if let Some(marker) = requirements_marker() {
+    if let Ok(marker) = requirements_marker() {
         let _ = std::fs::remove_file(marker);
     }
 }
@@ -213,60 +218,47 @@ fn requirements_fingerprint(python: &Path, requirements: &[u8]) -> String {
 /// Runs pip only when the interpreter or `requirements.txt` changed since the last successful
 /// install (pip takes seconds even when nothing is missing). A server that exits with an error
 /// with an import error clears the record, so a broken environment is repaired on the next start.
-fn ensure_requirements(app: &AppHandle, python: &Path, working_dir: &Path) -> Result<(), String> {
+fn ensure_requirements(python: &Path, working_dir: &Path) -> Result<(), String> {
     let requirements = working_dir.join("requirements.txt");
     let Ok(contents) = std::fs::read(&requirements) else {
         return Ok(());
     };
     let fingerprint = requirements_fingerprint(python, &contents);
-    let marker = requirements_marker();
-    if marker
-        .as_ref()
-        .and_then(|m| std::fs::read_to_string(m).ok())
-        .is_some_and(|recorded| recorded.trim() == fingerprint)
-    {
+    let marker = requirements_marker()?;
+    if std::fs::read_to_string(&marker).is_ok_and(|recorded| recorded.trim() == fingerprint) {
         return Ok(());
     }
 
-    emit_line(app, "[Installing dependencies...]");
-    let output = Command::new(python)
-        .args(["-m", "pip", "install", "--quiet", "-r"])
-        .arg(&requirements)
-        .current_dir(working_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run pip: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        emit_line(app, format!("[pip install failed: {}]", stderr.trim()));
-        return Err(format!("Failed to install dependencies: {}", stderr.trim()));
+    emit_line("[Installing dependencies...]");
+    let mut pip = Command::new(python);
+    pip.args(["-m", "pip", "install", "--quiet", "-r"]).arg(&requirements).current_dir(working_dir);
+    if let Err(e) = util::run_command(&mut pip, "pip install") {
+        emit_line(format!("[{e}]"));
+        return Err(e);
     }
-    if let Some(marker) = marker {
-        let _ = util::write_atomic(&marker, &fingerprint);
-    }
-    emit_line(app, "[Dependencies OK]");
+    let _ = util::write_atomic(&marker, &fingerprint);
+    emit_line("[Dependencies OK]");
     Ok(())
 }
 
 // ── Process lifecycle ────────────────────────────────────────────────────────
 
-fn start(app: &AppHandle) -> Result<(), String> {
+fn start() -> Result<(), String> {
     if is_running() || STARTING.swap(true, Ordering::SeqCst) {
         return Err("VSD Server is already running".to_string());
     }
-    let result = spawn_server(app);
+    let result = spawn_server();
     STARTING.store(false, Ordering::SeqCst);
     result
 }
 
 /// Installs dependencies if needed and launches the server. The process lock is only taken to
 /// store the child, so status checks never wait for pip.
-fn spawn_server(app: &AppHandle) -> Result<(), String> {
+fn spawn_server() -> Result<(), String> {
     let script = server_script().ok_or("Could not find VSD server.py")?;
     let working_dir = script.parent().ok_or("Invalid server path")?.to_path_buf();
     let python = python_command(&working_dir);
-    ensure_requirements(app, &python, &working_dir)?;
+    ensure_requirements(&python, &working_dir)?;
 
     let config = load_config()?;
     SAW_IMPORT_ERROR.store(false, Ordering::SeqCst);
@@ -284,21 +276,21 @@ fn spawn_server(app: &AppHandle) -> Result<(), String> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     // Store the child before the readers start, so a server that exits at once is noticed.
-    *PROCESS.lock().map_err(|e| e.to_string())? = Some(child);
+    *util::lock(&PROCESS) = Some(child);
     if let Some(stdout) = stdout {
-        spawn_reader(app.clone(), stdout, true);
+        spawn_reader(stdout, true);
     }
     if let Some(stderr) = stderr {
-        spawn_reader(app.clone(), stderr, false);
+        spawn_reader(stderr, false);
     }
 
-    emit_state(app, true);
+    emit_state(true);
     Ok(())
 }
 
 /// Stops the server if it runs; returns whether it did.
 pub fn stop_process() -> bool {
-    let child = PROCESS.lock().ok().and_then(|mut guard| guard.take());
+    let child = util::lock(&PROCESS).take();
     match child {
         Some(mut child) => {
             let _ = child.kill();
@@ -309,20 +301,13 @@ pub fn stop_process() -> bool {
     }
 }
 
+/// Whether the server runs. Doesn't reap an exited server, so [`wait_for_exit`] still reports it.
 fn is_running() -> bool {
-    let mut guard = PROCESS.lock().unwrap_or_else(|p| p.into_inner());
-    match guard.as_mut().map(|child| child.try_wait()) {
-        Some(Ok(None)) => true,
-        Some(_) => {
-            guard.take();
-            false
-        }
-        None => false,
-    }
+    matches!(util::lock(&PROCESS).as_mut().map(|child| child.try_wait()), Some(Ok(None)))
 }
 
 /// Starts the server at launch when the user enabled "start automatically".
-pub fn autostart(app: AppHandle) {
+pub fn autostart() {
     match load_config() {
         Ok(config) if config.autostart => {}
         Ok(_) => return,
@@ -332,10 +317,10 @@ pub fn autostart(app: AppHandle) {
         }
     }
     std::thread::spawn(move || {
-        emit_line(&app, "[Autostart: starting server...]");
-        if let Err(e) = start(&app) {
-            emit_line(&app, format!("[Error] {e}"));
-            emit_state(&app, false);
+        emit_line("[Autostart: starting server...]");
+        if let Err(e) = start() {
+            emit_line(format!("[Error] {e}"));
+            emit_state(false);
         }
     });
 }
@@ -354,41 +339,41 @@ fn notify_download_dir(port: u16, path: &str) -> Result<(), String> {
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn vsd_start(app: AppHandle) -> Result<(), String> {
-    util::blocking(move || start(&app)).await
+pub async fn vsd_start() -> CmdResult<()> {
+    Ok(util::blocking(start).await?)
 }
 
 #[tauri::command]
-pub async fn vsd_stop(app: AppHandle) -> Result<(), String> {
+pub async fn vsd_stop() -> CmdResult<()> {
     util::blocking(move || {
         if !stop_process() {
-            return Err("VSD Server is not running".to_string());
+            return Err("VSD Server is not running".into());
         }
-        emit_line(&app, "[Server stopped]");
-        emit_state(&app, false);
+        emit_line("[Server stopped]");
+        emit_state(false);
         Ok(())
     })
     .await
 }
 
 #[tauri::command]
-pub async fn vsd_is_running() -> Result<bool, String> {
+pub async fn vsd_is_running() -> CmdResult<bool> {
     util::blocking(|| Ok(is_running())).await
 }
 
 /// Recent server output (the UI receives new lines as `vsd-log` events).
 #[tauri::command]
 pub fn vsd_get_logs() -> Vec<LogLine> {
-    LOG_BACKLOG.lock().map(|backlog| backlog.iter().cloned().collect()).unwrap_or_default()
+    util::lock(&LOG_BACKLOG).iter().cloned().collect()
 }
 
 #[tauri::command]
-pub async fn vsd_get_download_dir() -> Result<String, String> {
+pub async fn vsd_get_download_dir() -> CmdResult<String> {
     util::blocking(|| Ok(load_config()?.download_dir)).await
 }
 
 #[tauri::command]
-pub async fn vsd_set_download_dir(path: String) -> Result<(), String> {
+pub async fn vsd_set_download_dir(path: String) -> CmdResult<()> {
     util::blocking(move || {
         let config = update_config(|c| c.download_dir = path.clone())?;
         if is_running() {
@@ -402,41 +387,40 @@ pub async fn vsd_set_download_dir(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn vsd_get_autostart() -> Result<bool, String> {
+pub async fn vsd_get_autostart() -> CmdResult<bool> {
     util::blocking(|| Ok(load_config()?.autostart)).await
 }
 
 #[tauri::command]
-pub async fn vsd_set_autostart(enabled: bool) -> Result<(), String> {
-    util::blocking(move || update_config(|c| c.autostart = enabled).map(|_| ())).await
+pub async fn vsd_set_autostart(enabled: bool) -> CmdResult<()> {
+    util::blocking(move || Ok(update_config(|c| c.autostart = enabled).map(|_| ())?)).await
 }
 
 /// Builds the browser extension and returns its folder (the UI reveals it).
 #[tauri::command]
-pub async fn vsd_install_extension(browser: String) -> Result<String, String> {
+pub async fn vsd_install_extension(browser: String) -> CmdResult<String> {
     util::blocking(move || {
         let vsd_dir = server_script()
             .and_then(|s| s.parent().map(Path::to_path_buf))
             .ok_or("Could not find the VSD module")?;
         let build_script = vsd_dir.join("extension").join("build.py");
         if !build_script.exists() {
-            return Err("Could not find extension build script".to_string());
+            return Err("Could not find extension build script".into());
         }
 
-        let output = Command::new(python_command(&vsd_dir.join("extension")))
-            .arg(&build_script)
-            .arg(&browser)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("Failed to run build script: {e}"))?;
-        if !output.status.success() {
-            return Err(format!("Build failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
-        }
+        // The built extension talks to the port this MULA starts the server on.
+        let server_url = format!("http://127.0.0.1:{}", load_config()?.port);
+        util::run_command(
+            Command::new(python_command(&vsd_dir.join("extension")))
+                .arg(&build_script)
+                .arg(&browser)
+                .args(["--server-url", &server_url]),
+            "the extension build",
+        )?;
 
         let ext_dir = vsd_dir.join("extension").join("dist").join(&browser);
         if !ext_dir.exists() {
-            return Err(format!("Extension not found at {}", ext_dir.display()));
+            return Err(format!("Extension not found at {}", ext_dir.display()).into());
         }
         Ok(ext_dir.to_string_lossy().to_string())
     })

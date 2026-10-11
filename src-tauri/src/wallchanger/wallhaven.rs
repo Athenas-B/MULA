@@ -43,7 +43,6 @@ struct SearchMeta {
 
 #[derive(Deserialize)]
 struct Wallpaper {
-    #[serde(rename = "id")]
     id: String,
     path: String,
 }
@@ -96,12 +95,11 @@ struct RefreshingGuard(PathBuf);
 
 impl Drop for RefreshingGuard {
     fn drop(&mut self) {
-        REFRESHING.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
+        crate::util::lock(&REFRESHING).remove(&self.0);
     }
 }
 
 /// Everything a refresh needs, owned so it can run on another thread.
-#[derive(Clone)]
 struct RefreshJob {
     url: String,
     page_limit: i32,
@@ -128,10 +126,8 @@ pub fn images_for_source(
     let cache_dir = source_cache_dir(url)?;
     let query = query_signature(url, page_limit, purity, api_key.is_some());
     let manifest = read_manifest(&cache_dir);
-    let fresh = manifest
-        .as_ref()
-        .is_some_and(|m| m.query == query && now_secs().saturating_sub(m.fetched_at) < RESULTS_TTL.as_secs());
-    let cached = cached_files(&cache_dir, manifest.as_ref());
+    let fresh = manifest.query == query && now_secs().saturating_sub(manifest.fetched_at) < RESULTS_TTL.as_secs();
+    let cached = cached_files(&cache_dir, &manifest);
 
     let job = RefreshJob {
         url: url.to_string(),
@@ -153,7 +149,7 @@ pub fn images_for_source(
 
 fn refresh_in_background(job: RefreshJob) {
     {
-        let mut running = REFRESHING.lock().unwrap_or_else(|p| p.into_inner());
+        let mut running = crate::util::lock(&REFRESHING);
         if !running.insert(job.cache_dir.clone()) {
             return;
         }
@@ -237,13 +233,13 @@ fn download_all(agent: &ureq::Agent, urls: &[String], dir: &Path) -> Vec<PathBuf
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(url) = urls.get(i) else { break };
                 match download_image(agent, url, dir) {
-                    Ok(path) => results.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(path),
+                    Ok(path) => crate::util::lock(&results)[i] = Some(path),
                     Err(e) => log::warn!("Skipping Wallhaven image {url}: {e}"),
                 }
             });
         }
     });
-    results.into_inner().unwrap_or_else(|p| p.into_inner()).into_iter().flatten().collect()
+    results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).into_iter().flatten().collect()
 }
 
 /// Stores the result of a refresh. If images were found but none could be downloaded (e.g.
@@ -273,31 +269,18 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn read_manifest(cache_dir: &Path) -> Option<Manifest> {
-    let text = fs::read_to_string(cache_dir.join(MANIFEST_FILE)).ok()?;
-    serde_json::from_str(&text).ok()
+/// The last fetch of a source; empty when there was none (or it can't be read).
+fn read_manifest(cache_dir: &Path) -> Manifest {
+    crate::util::read_json_or_default(&cache_dir.join(MANIFEST_FILE)).unwrap_or_default()
 }
 
 fn write_manifest(cache_dir: &Path, manifest: &Manifest) -> Result<(), String> {
-    let text = serde_json::to_string(manifest).map_err(|e| e.to_string())?;
-    crate::util::write_atomic(&cache_dir.join(MANIFEST_FILE), &text)
+    crate::util::write_json(&cache_dir.join(MANIFEST_FILE), manifest)
 }
 
-/// Files of the last successful fetch, or (for caches made before manifests existed) every
-/// image in the folder.
-fn cached_files(cache_dir: &Path, manifest: Option<&Manifest>) -> Vec<PathBuf> {
-    match manifest {
-        Some(m) => m.files.iter().map(|f| cache_dir.join(f)).filter(|p| p.is_file()).collect(),
-        None => fs::read_dir(cache_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.is_file() && super::images::is_image_file(p))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    }
+/// Files of the last successful fetch that are still on disk.
+fn cached_files(cache_dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
+    manifest.files.iter().map(|f| cache_dir.join(f)).filter(|p| p.is_file()).collect()
 }
 
 fn source_cache_dir(url: &str) -> Result<PathBuf, String> {
@@ -313,32 +296,24 @@ fn cache_folder_name(url: &str) -> String {
 fn build_api_url(input: &str, page: u32, purity: &str) -> Result<String, String> {
     let trimmed = input.trim();
 
-    if trimmed.contains("/api/v1/search") {
-        let mut url = trimmed.to_string();
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            url = format!("https://{url}");
+    let mut url = if trimmed.contains("/api/v1/search") {
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            trimmed.to_string()
+        } else {
+            format!("https://{trimmed}")
         }
-        set_or_append_param(&mut url, "purity", purity);
-        set_or_append_param(&mut url, "page", &page.to_string());
-        return Ok(url);
-    }
-
-    if trimmed.contains("/search?") {
-        let query = trimmed
-            .splitn(2, '?')
-            .nth(1)
-            .unwrap_or_default();
-        let mut url = if query.is_empty() {
+    } else if let Some((_, query)) = trimmed.split_once("/search?") {
+        if query.is_empty() {
             "https://wallhaven.cc/api/v1/search".to_string()
         } else {
             format!("https://wallhaven.cc/api/v1/search?{query}")
-        };
-        set_or_append_param(&mut url, "purity", purity);
-        set_or_append_param(&mut url, "page", &page.to_string());
-        return Ok(url);
-    }
-
-    Err("Unsupported Wallhaven URL. Provide a search page (https://wallhaven.cc/search?...) or an /api/v1/search URL.".into())
+        }
+    } else {
+        return Err("Unsupported Wallhaven URL. Provide a search page (https://wallhaven.cc/search?...) or an /api/v1/search URL.".into());
+    };
+    set_or_append_param(&mut url, "purity", purity);
+    set_or_append_param(&mut url, "page", &page.to_string());
+    Ok(url)
 }
 
 fn set_or_append_param(url: &mut String, key: &str, value: &str) {
@@ -464,9 +439,9 @@ mod tests {
         fs::write(dir.join("b.jpg.part"), b"x").unwrap();
 
         let manifest = Manifest { query: "q".into(), fetched_at: 0, files: vec!["a.jpg".into(), "gone.jpg".into()] };
-        assert_eq!(cached_files(&dir, Some(&manifest)), vec![dir.join("a.jpg")]);
-        // Without a manifest, partial downloads are never picked up.
-        assert_eq!(cached_files(&dir, None), vec![dir.join("a.jpg")]);
+        assert_eq!(cached_files(&dir, &manifest), vec![dir.join("a.jpg")]);
+        // Without a manifest nothing is offered, so partial downloads are never picked up.
+        assert!(cached_files(&dir, &Manifest::default()).is_empty());
     }
 }
 
@@ -496,7 +471,7 @@ mod helper_tests {
         })
         .join();
         assert!(joined.is_err());
-        assert!(!REFRESHING.lock().unwrap_or_else(|p| p.into_inner()).contains(&dir));
+        assert!(!crate::util::lock(&REFRESHING).contains(&dir));
     }
 
     #[test]
@@ -602,7 +577,7 @@ mod helper_tests {
         write_manifest(dir.path(), &old).unwrap();
 
         assert!(record_refresh(dir.path(), "q".into(), 3, Vec::new()).is_err());
-        let kept = read_manifest(dir.path()).unwrap();
+        let kept = read_manifest(dir.path());
         assert_eq!((kept.fetched_at, kept.files), (1, vec!["old.jpg".to_string()]));
     }
 
@@ -611,20 +586,20 @@ mod helper_tests {
         let dir = crate::test_support::TempDir::new("refresh_ok");
         let files = record_refresh(dir.path(), "q".into(), 2, vec![dir.join("a.jpg")]).unwrap();
         assert_eq!(files, vec![dir.join("a.jpg")]);
-        assert_eq!(read_manifest(dir.path()).unwrap().files, vec!["a.jpg".to_string()]);
+        assert_eq!(read_manifest(dir.path()).files, vec!["a.jpg".to_string()]);
 
         // A search that genuinely has no results is a valid (empty) result.
         assert!(record_refresh(dir.path(), "q2".into(), 0, Vec::new()).unwrap().is_empty());
-        assert_eq!(read_manifest(dir.path()).unwrap().query, "q2");
+        assert_eq!(read_manifest(dir.path()).query, "q2");
     }
 
     #[test]
     fn manifests_round_trip() {
         let dir = crate::test_support::TempDir::new("manifest");
-        assert!(read_manifest(dir.path()).is_none());
+        assert!(read_manifest(dir.path()).files.is_empty());
         let manifest = Manifest { query: "q".into(), fetched_at: 42, files: vec!["a.jpg".into()] };
         write_manifest(dir.path(), &manifest).unwrap();
-        let back = read_manifest(dir.path()).unwrap();
+        let back = read_manifest(dir.path());
         assert_eq!((back.query.as_str(), back.fetched_at, back.files), ("q", 42, vec!["a.jpg".to_string()]));
         assert!(!dir.join("manifest.json.tmp").exists());
     }

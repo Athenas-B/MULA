@@ -1,56 +1,82 @@
+//! The app log: `%APPDATA%\mula\logs\mula.log`, appended to and rotated to `mula.log.1` once it
+//! grows past [`MAX_LOG_BYTES`].
+
 use chrono::Local;
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use std::collections::VecDeque;
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
-use std::sync::Mutex;
 use std::thread;
 
-const MAX_LINES: usize = 1000;
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const LOG_FILE_NAME: &str = "mula.log";
 
-pub fn logs_dir() -> PathBuf {
+fn log_path() -> PathBuf {
     crate::util::mula_config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("logs")
-}
-
-pub fn log_path() -> PathBuf {
-    logs_dir().join(LOG_FILE_NAME)
-}
-
-fn write_log_lines(path: &Path, lines: &VecDeque<String>) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::File::create(path)?;
-    for line in lines {
-        writeln!(file, "{line}")?;
-    }
-    Ok(())
-}
-
-fn push_line(lines: &mut VecDeque<String>, line: String) {
-    lines.push_back(line);
-    while lines.len() > MAX_LINES {
-        lines.pop_front();
-    }
+        .join(LOG_FILE_NAME)
 }
 
 fn format_record(record: &Record) -> String {
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-    format!(
-        "[{}] [{}] {}",
-        ts,
-        record.level(),
-        record.args()
-    )
+    format!("[{}] [{}] {}", ts, record.level(), record.args())
+}
+
+/// An append-only log file that moves itself to `<name>.1` once it exceeds `max_bytes`.
+struct LogFile {
+    path: PathBuf,
+    max_bytes: u64,
+    file: Option<BufWriter<File>>,
+    size: u64,
+}
+
+impl LogFile {
+    fn new(path: PathBuf, max_bytes: u64) -> Self {
+        Self { path, max_bytes, file: None, size: 0 }
+    }
+
+    fn open(&mut self) -> std::io::Result<&mut BufWriter<File>> {
+        if self.file.is_none() {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+            self.size = file.metadata()?.len();
+            self.file = Some(BufWriter::new(file));
+        }
+        Ok(self.file.as_mut().expect("just opened"))
+    }
+
+    fn write_lines(&mut self, lines: &[String]) -> std::io::Result<()> {
+        let file = self.open()?;
+        let mut written = 0;
+        for line in lines {
+            writeln!(file, "{line}")?;
+            written += line.len() as u64 + 1;
+        }
+        file.flush()?;
+        self.size += written;
+        if self.size > self.max_bytes {
+            self.rotate()?;
+        }
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.file = None;
+        let mut rotated = self.path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = fs::remove_file(&rotated);
+        fs::rename(&self.path, rotated)?;
+        self.size = 0;
+        Ok(())
+    }
 }
 
 pub struct AppLogger {
-    sender: Mutex<Option<Sender<String>>>,
+    sender: Sender<String>,
 }
 
 impl Log for AppLogger {
@@ -59,14 +85,8 @@ impl Log for AppLogger {
     }
 
     fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-        let msg = format_record(record);
-        if let Ok(sender) = self.sender.lock() {
-            if let Some(tx) = sender.as_ref() {
-                let _ = tx.send(msg);
-            }
+        if self.enabled(record.metadata()) {
+            let _ = self.sender.send(format_record(record));
         }
     }
 
@@ -74,34 +94,19 @@ impl Log for AppLogger {
 }
 
 pub fn init() -> Result<(), log::SetLoggerError> {
-    let (tx, rx) = channel::<String>();
-    let path = log_path();
-
-    // Load any existing log file so we keep history across restarts.
-    let mut initial_lines: VecDeque<String> = VecDeque::with_capacity(MAX_LINES + 1);
-    if let Ok(content) = fs::read_to_string(&path) {
-        for line in content.lines().filter(|l| !l.trim().is_empty()) {
-            push_line(&mut initial_lines, line.to_string());
-        }
-    }
+    let (sender, receiver) = channel::<String>();
+    let mut file = LogFile::new(log_path(), MAX_LOG_BYTES);
 
     thread::spawn(move || {
-        let mut lines = initial_lines;
-        let _ = write_log_lines(&path, &lines);
-        // Write only when something was logged, batching everything already queued.
-        while let Ok(msg) = rx.recv() {
-            push_line(&mut lines, msg);
-            for msg in rx.try_iter() {
-                push_line(&mut lines, msg);
-            }
-            let _ = write_log_lines(&path, &lines);
+        // Block until something is logged, then write everything already queued in one go.
+        while let Ok(first) = receiver.recv() {
+            let mut batch = vec![first];
+            batch.extend(receiver.try_iter());
+            let _ = file.write_lines(&batch);
         }
     });
 
-    log::set_boxed_logger(Box::new(AppLogger {
-        sender: Mutex::new(Some(tx)),
-    }))
-    .map(|()| log::set_max_level(LevelFilter::Info))
+    log::set_boxed_logger(Box::new(AppLogger { sender })).map(|()| log::set_max_level(LevelFilter::Info))
 }
 
 /// Log a raw message from the frontend or other non-log-crate sources.
@@ -110,7 +115,6 @@ pub fn log_message(level: &str, message: &str) {
     let level = match level.to_lowercase().as_str() {
         "trace" => Level::Trace,
         "debug" => Level::Debug,
-        "info" => Level::Info,
         "warn" => Level::Warn,
         "error" => Level::Error,
         _ => Level::Info,
@@ -121,6 +125,8 @@ pub fn log_message(level: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
+    use std::path::Path;
 
     #[test]
     fn records_are_formatted_with_timestamp_level_and_message() {
@@ -132,32 +138,38 @@ mod tests {
     }
 
     #[test]
-    fn log_lines_are_written_one_per_line_creating_folders() {
-        let dir = crate::test_support::TempDir::new("logger");
+    fn lines_are_appended_creating_folders() {
+        let dir = TempDir::new("logger");
         let path = dir.join("logs").join("mula.log");
-        let lines: VecDeque<String> = ["first".to_string(), "second".to_string()].into();
-        write_log_lines(&path, &lines).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+        let mut log = LogFile::new(path.clone(), 1024);
+        log.write_lines(&["first".to_string(), "second".to_string()]).unwrap();
+        log.write_lines(&["third".to_string()]).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\nsecond\nthird\n");
 
-        // Rewrites replace the file instead of appending.
-        write_log_lines(&path, &VecDeque::from(["only".to_string()])).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "only\n");
+        // A later session keeps appending to the same file.
+        let mut again = LogFile::new(path.clone(), 1024);
+        again.write_lines(&["fourth".to_string()]).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\nsecond\nthird\nfourth\n");
     }
 
     #[test]
-    fn the_line_buffer_keeps_only_the_newest_lines() {
-        let mut lines = VecDeque::new();
-        for i in 0..MAX_LINES + 5 {
-            push_line(&mut lines, i.to_string());
-        }
-        assert_eq!(lines.len(), MAX_LINES);
-        assert_eq!(lines.front().map(String::as_str), Some("5"));
-        assert_eq!(lines.back().map(String::as_str), Some((MAX_LINES + 4).to_string().as_str()));
+    fn the_log_rotates_once_it_grows_past_the_limit() {
+        let dir = TempDir::new("logger_rotate");
+        let path = dir.join("mula.log");
+        let mut log = LogFile::new(path.clone(), 10);
+        log.write_lines(&["0123456789".to_string()]).unwrap(); // 11 bytes: rotated
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(dir.join("mula.log.1")).unwrap(), "0123456789\n");
+
+        log.write_lines(&["new".to_string()]).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        log.write_lines(&["more text".to_string()]).unwrap(); // rotated again, replacing .1
+        assert_eq!(fs::read_to_string(dir.join("mula.log.1")).unwrap(), "new\nmore text\n");
     }
 
     #[test]
     fn only_info_and_more_severe_records_are_enabled() {
-        let logger = AppLogger { sender: Mutex::new(None) };
+        let logger = AppLogger { sender: channel().0 };
         let meta = |level| Metadata::builder().level(level).build();
         assert!(logger.enabled(&meta(Level::Error)));
         assert!(logger.enabled(&meta(Level::Info)));
@@ -166,7 +178,6 @@ mod tests {
 
     #[test]
     fn log_file_lives_in_the_mula_logs_folder() {
-        let path = log_path();
-        assert!(path.ends_with(Path::new("mula").join("logs").join("mula.log")));
+        assert!(log_path().ends_with(Path::new("mula").join("logs").join("mula.log")));
     }
 }

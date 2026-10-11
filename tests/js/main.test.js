@@ -428,8 +428,6 @@ describe("appendLog", () => {
         '<span class="vsd-log-chunk"><span style="color:#e74c3c">X</span></span>'
     );
     assert.equal(log.scrollTop, 500);
-    m.fn.clearLog();
-    assert.equal(content.innerHTML, "");
   });
 
   it("keeps only the newest chunks so the log view stays bounded", () => {
@@ -555,6 +553,45 @@ describe("updateVsdUi / wcUpdateToggleUi / wcShowMessage", () => {
     assert.deepEqual([btn.className, label.textContent, status.textContent], ["running", "Stop", "running"]);
     m.fn.wcUpdateToggleUi(false);
     assert.deepEqual([btn.className, label.textContent, status.textContent], ["stopped", "Start", "stopped"]);
+  });
+
+  it("wcRefreshPreviews waits while the window is hidden and reloads once it is shown", async () => {
+    const m = loadMain({ invoke: () => [] });
+    m.document.add("wc-monitor-preview");
+    m.document.add("wc-queues");
+    m.document.hidden = true;
+    m.fn.wcRefreshPreviews();
+    await flush();
+    assert.equal(m.invokeCalls.length, 0);
+    assert.equal(m.run("wcPreviewsStale"), true);
+
+    m.document.hidden = false;
+    m.fn.wcRefreshPreviews();
+    await flush();
+    assert.deepEqual(m.invokeCalls.map((c) => c.cmd).sort(), ["wc_get_monitor_preview", "wc_get_queue_preview"]);
+    assert.equal(m.run("wcPreviewsStale"), false);
+  });
+
+  it("wcRenderSettings fills every form field from the settings", () => {
+    const m = loadMain();
+    const interval = m.document.add("wc-interval");
+    const color = m.document.add("wc-bg-color");
+    const separate = m.document.add("wc-separate-queues");
+    const apiKey = m.document.add("wc-wallhaven-api-key");
+    m.document.add("wc-scaling");
+    m.document.add("wc-overlay-enabled");
+    m.assign("wcSettings", {
+      interval_minutes: 15,
+      background_color_argb: 0xff102030 | 0,
+      use_separate_monitor_queues: true,
+      wallhaven_api_key: null,
+      scaling_mode: "Fill",
+    });
+    m.fn.wcRenderSettings();
+    assert.equal(interval.value, 15);
+    assert.equal(color.value, "#102030");
+    assert.equal(separate.checked, true);
+    assert.equal(apiKey.value, "");
   });
 
   it("wcShowMessage sets text and kind class", () => {
@@ -957,12 +994,10 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
 
 describe("Drive Test", () => {
   const DRIVE = {
-    id: "PD1",
-    device_id: "\\\\.\\PHYSICALDRIVE1",
+    device_id: "PD1",
     vendor: "Samsung",
     model: "SSD <980>",
     serial: "S123",
-    type: "SSD",
     bus_type: "NVMe",
     connection_speed: "PCIe 3.0 x4",
     media_type: "SSD",

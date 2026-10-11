@@ -45,7 +45,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// Finds smartctl. Never installs anything by itself; only successes are cached, so a
 /// smartctl installed or updated later is picked up without restarting MULA.
 fn ensure_smartctl() -> Result<PathBuf, CommandError> {
-    let mut guard = SMARTCTL_PATH.lock().map_err(|e| e.to_string())?;
+    let mut guard = util::lock(&SMARTCTL_PATH);
     if let Some(path) = guard.as_ref() {
         return Ok(path.clone());
     }
@@ -79,8 +79,8 @@ fn install_smartctl() -> Result<PathBuf, String> {
 
     let winget = find_on_path("winget")
         .ok_or("winget not found. Please install smartmontools manually from https://www.smartmontools.org/")?;
-    let output = Command::new(&winget)
-        .args([
+    util::run_command(
+        Command::new(&winget).args([
             "install",
             "--id",
             "smartmontools.smartmontools",
@@ -88,19 +88,9 @@ fn install_smartctl() -> Result<PathBuf, String> {
             "--accept-source-agreements",
             "--accept-package-agreements",
             "--disable-interactivity",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run winget: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "winget install failed.\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
+        ]),
+        "winget install",
+    )?;
 
     find_smartctl().ok_or_else(|| {
         "smartmontools was installed but smartctl could not be found. Restart MULA or add \
@@ -114,9 +104,7 @@ fn install_smartctl() -> Result<PathBuf, String> {
 pub async fn install_smartmontools() -> Result<String, CommandError> {
     util::logged_blocking("install_smartmontools", || {
         let path = install_smartctl()?;
-        if let Ok(mut guard) = SMARTCTL_PATH.lock() {
-            *guard = Some(path.clone());
-        }
+        *util::lock(&SMARTCTL_PATH) = Some(path.clone());
         Ok(path.to_string_lossy().to_string())
     })
     .await
@@ -129,19 +117,15 @@ pub async fn install_smartmontools() -> Result<String, CommandError> {
 static SMART_DEVICES: LazyLock<Mutex<HashMap<String, (String, String)>>> = LazyLock::new(Default::default);
 
 fn cached_device(id: &str) -> Option<(String, String)> {
-    SMART_DEVICES.lock().ok()?.get(id).cloned()
+    util::lock(&SMART_DEVICES).get(id).cloned()
 }
 
 fn remember_device(id: &str, device: &str, dtype: &str) {
-    if let Ok(mut map) = SMART_DEVICES.lock() {
-        map.insert(id.to_string(), (device.to_string(), dtype.to_string()));
-    }
+    util::lock(&SMART_DEVICES).insert(id.to_string(), (device.to_string(), dtype.to_string()));
 }
 
 fn forget_device(id: &str) {
-    if let Ok(mut map) = SMART_DEVICES.lock() {
-        map.remove(id);
-    }
+    util::lock(&SMART_DEVICES).remove(id);
 }
 
 fn extract_physical_drive_number(id: &str) -> Result<u32, String> {
@@ -589,15 +573,11 @@ pub async fn save_smart_snapshot(id: String, label: String) -> Result<String, Co
         let report = run_on_drive(&id, true, &["-a"])?;
         report.check(true, false)?;
 
-        let drive_dir = util::mula_config_dir()
-            .ok_or("Could not determine config directory")?
-            .join("snapshots")
-            .join(util::safe_file_name(&id, "-_"));
-        std::fs::create_dir_all(&drive_dir).map_err(|e| format!("Failed to create snapshot directory: {e}"))?;
-
         let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let path = drive_dir.join(format!("smart_{}_{timestamp}.txt", util::safe_file_name(&label, "-_")));
-        std::fs::write(&path, report.text()).map_err(|e| format!("Failed to write snapshot file: {e}"))?;
+        let path = util::mula_path("snapshots")?
+            .join(util::safe_file_name(&id, "-_"))
+            .join(format!("smart_{}_{timestamp}.txt", util::safe_file_name(&label, "-_")));
+        util::write_atomic(&path, &report.text())?;
         Ok(path.to_string_lossy().to_string())
     })
     .await

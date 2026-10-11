@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 mod elevated_helper;
 mod error;
+mod events;
 mod logger;
 mod smart;
 mod startup;
@@ -34,8 +35,8 @@ fn get_app_info() -> AppInfo {
 }
 
 #[tauri::command]
-fn open_config_dir() -> Result<String, String> {
-    let config_dir = util::mula_config_dir().ok_or("Could not determine config directory")?;
+fn open_config_dir() -> error::CmdResult<String> {
+    let config_dir = util::mula_path("")?;
 
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("Failed to create config directory: {e}"))?;
@@ -48,37 +49,34 @@ fn open_config_dir() -> Result<String, String> {
 struct AutostartMenuState(tauri::menu::CheckMenuItem<tauri::Wry>);
 
 #[tauri::command]
-fn get_autostart() -> Result<bool, String> {
-    startup::is_enabled()
+fn get_autostart() -> error::CmdResult<bool> {
+    Ok(startup::is_enabled()?)
 }
 
 /// Applies "Start MULA with Windows" and keeps the tray item and the System tab in sync.
 fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    use tauri::{Emitter, Manager};
+    use tauri::Manager;
 
     startup::set_enabled(enabled)?;
     if let Some(state) = app.try_state::<AutostartMenuState>() {
         let _ = state.0.set_checked(enabled);
     }
-    let _ = app.emit("autostart-changed", enabled);
+    events::emit(events::AUTOSTART_CHANGED, enabled);
     Ok(())
 }
 
 #[tauri::command]
-fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    apply_autostart(&app, enabled)
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> error::CmdResult<()> {
+    Ok(apply_autostart(&app, enabled)?)
 }
 
 // ── Drive Test commands ──
 
 #[derive(Serialize, Clone)]
 pub struct DriveInfo {
-    id: String,
     model: String,
     vendor: String,
     serial: String,
-    #[serde(rename = "type")]
-    drive_type: String,
     media_type: String,
     bus_type: String,
     interface_type: String,
@@ -214,32 +212,29 @@ fn guess_vendor_from_model(model: &str) -> Option<String> {
     Some(vendor.to_string())
 }
 
+/// Formats `value` with two decimals in the largest of `units` that keeps it at or above 1.
+fn scale_units(value: u64, step: f64, units: &[&str]) -> String {
+    let mut size = value as f64;
+    let mut unit_index = 0;
+    while size >= step && unit_index < units.len() - 1 {
+        size /= step;
+        unit_index += 1;
+    }
+    format!("{:.2} {}", size, units[unit_index])
+}
+
 fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
     if bytes == 0 {
         return "0 B".to_string();
     }
-    let mut size = bytes as f64;
-    let mut unit_index = 0;
-    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_index += 1;
-    }
-    format!("{:.2} {}", size, UNITS[unit_index])
+    scale_units(bytes, 1024.0, &["B", "KB", "MB", "GB", "TB", "PB"])
 }
 
 fn format_bitrate(bits_per_sec: u64) -> String {
     if bits_per_sec == 0 {
         return "Unknown".to_string();
     }
-    const UNITS: &[&str] = &["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
-    let mut size = bits_per_sec as f64;
-    let mut unit_index = 0;
-    while size >= 1000.0 && unit_index < UNITS.len() - 1 {
-        size /= 1000.0;
-        unit_index += 1;
-    }
-    format!("{:.2} {}", size, UNITS[unit_index])
+    scale_units(bits_per_sec, 1000.0, &["bps", "Kbps", "Mbps", "Gbps", "Tbps"])
 }
 
 fn infer_connection_speed(bus_type: &str, interface_type: &str) -> String {
@@ -292,6 +287,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         interface_type: Option<String>,
         #[serde(rename = "MediaType")]
         media_type: Option<String>,
+        #[serde(rename = "BusType")]
+        bus_type: Option<String>,
         #[serde(rename = "Size")]
         size: Option<u64>,
         #[serde(rename = "Partitions")]
@@ -302,10 +299,6 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         firmware_revision: Option<String>,
         #[serde(rename = "PNPDeviceID", alias = "PnpDeviceId")]
         pnp_device_id: Option<String>,
-        #[serde(rename = "PhysicalMediaType")]
-        physical_media_type: Option<String>,
-        #[serde(rename = "PhysicalBusType")]
-        physical_bus_type: Option<String>,
         #[serde(rename = "HealthStatus")]
         health_status: Option<String>,
         #[serde(rename = "DriveLetters")]
@@ -394,6 +387,7 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             $finalMediaType = if ($ph -and $ph.MediaType) { $ph.MediaType } else { $d.MediaType }
             $finalBusType = if ($ph -and $ph.BusType) { $ph.BusType } else { $d.InterfaceType }
             $finalHealth = if ($ph -and $ph.HealthStatus) { $ph.HealthStatus } else { $null }
+            $smartBus = @('NVMe','SATA','SAS','SCSI','IDE','ATA','PCIe') -contains $finalBusType
 
             [PSCustomObject]@{
                 DeviceID = $d.DeviceID
@@ -401,20 +395,19 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
                 SerialNumber = $finalSerial
                 Manufacturer = if ($ph -and $ph.Manufacturer) { $ph.Manufacturer } else { $d.Manufacturer }
                 InterfaceType = $d.InterfaceType
-                MediaType = $d.MediaType
+                MediaType = $finalMediaType
+                BusType = $finalBusType
                 Size = [uint64]$d.Size
                 Partitions = [uint32]$d.Partitions
                 Status = $d.Status
                 FirmwareRevision = $finalFirmware
                 PNPDeviceID = $d.PNPDeviceID
-                PhysicalMediaType = $finalMediaType
-                PhysicalBusType = $finalBusType
                 HealthStatus = $finalHealth
                 DriveLetters = if ($vol -and $vol.Letters.Count -gt 0) { @($vol.Letters) } else { $null }
                 MountPoints = if ($vol -and $vol.Mounts.Count -gt 0) { @($vol.Mounts) } else { $null }
                 ConnectionSpeed = if ($d.PNPDeviceID -and $speeds[$d.PNPDeviceID]) { $speeds[$d.PNPDeviceID] } else { $null }
-                SmartCapable = if (@('NVMe','SATA','SAS','SCSI','IDE','ATA','SATA','PCIe') -contains $finalBusType) { 'Yes' } else { 'Unknown' }
-                TrimCapable = if ($finalMediaType -eq 'SSD' -and @('NVMe','SATA','SAS','SCSI','IDE','ATA','PCIe') -contains $finalBusType) { 'Yes' } elseif ($finalMediaType -eq 'HDD') { 'No' } else { 'Unknown' }
+                SmartCapable = if ($smartBus) { 'Yes' } else { 'Unknown' }
+                TrimCapable = if ($finalMediaType -eq 'SSD' -and $smartBus) { 'Yes' } elseif ($finalMediaType -eq 'HDD') { 'No' } else { 'Unknown' }
             }
         }
 
@@ -422,22 +415,14 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         Write-Output $json
     "#;
 
-    let output = Command::new("powershell")
-        .args(["-ExecutionPolicy", "Bypass", "-Command", script])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run PowerShell drive query: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("PowerShell drive query failed: {}", stderr.trim()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = util::run_command(
+        Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]),
+        "the PowerShell drive query",
+    )?;
     let drives: Vec<PsDiskDrive> = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("Failed to parse drive data: {e}"))?;
 
+    let system_letter = system_drive_letter();
     let mut result = Vec::new();
     for d in drives {
         let pnp = d.pnp_device_id.as_deref().unwrap_or("");
@@ -465,9 +450,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             .to_string();
         let size = d.size.unwrap_or(0);
 
-        let media_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
-        let bus_type = d.physical_bus_type.as_deref().or(d.interface_type.as_deref()).unwrap_or("Unknown").trim().to_string();
-        let drive_type = media_type.clone();
+        let media_type = d.media_type.as_deref().unwrap_or("Unknown").trim().to_string();
+        let bus_type = d.bus_type.as_deref().unwrap_or("Unknown").trim().to_string();
 
         let connection_speed_text = match d.connection_speed {
             Some(bps) if bps > 0 => format_bitrate(bps),
@@ -475,15 +459,13 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         };
 
         let drive_letters = value_to_strings(d.drive_letters);
-        let is_system = holds_system_drive(&drive_letters, &system_drive_letter());
+        let is_system = holds_system_drive(&drive_letters, &system_letter);
 
         result.push(DriveInfo {
-            id: d.device_id.clone(),
             device_id: d.device_id,
             model,
             vendor,
             serial,
-            drive_type,
             media_type,
             bus_type,
             interface_type: d.interface_type.as_deref().unwrap_or("Unknown").to_string(),
@@ -512,8 +494,8 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
 }
 
 #[tauri::command]
-async fn list_physical_drives() -> Result<Vec<DriveInfo>, String> {
-    util::blocking(list_physical_drives_impl).await
+async fn list_physical_drives() -> error::CmdResult<Vec<DriveInfo>> {
+    Ok(util::blocking(list_physical_drives_impl).await?)
 }
 
 fn find_drive(id: &str) -> Result<DriveInfo, String> {
@@ -665,7 +647,7 @@ pub fn run() {
             use tauri::tray::TrayIconBuilder;
             use tauri::Manager;
 
-            wallchanger::set_app_handle(app.handle().clone());
+            events::init(app.handle().clone());
 
             let show = MenuItem::with_id(app, "show", "Show MULA", true, None::<&str>)?;
 
@@ -759,7 +741,7 @@ pub fn run() {
                 .build(app)?;
 
             // Start the VSD server if the user asked for it to start automatically.
-            vsd::autostart(app.handle().clone());
+            vsd::autostart();
 
             // Resume the wallpaper service if it was running.
             if wallchanger::settings::service_running() {

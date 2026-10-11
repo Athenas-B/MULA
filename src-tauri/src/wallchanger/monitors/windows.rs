@@ -62,15 +62,7 @@ pub fn get_monitors() -> Result<Vec<Monitor>, String> {
     let mut monitors = Vec::new();
     for id in monitor_ids(&wallpaper)? {
         match unsafe { wallpaper.GetMonitorRECT(&HSTRING::from(&id)) } {
-            Ok(rect) => monitors.push(Monitor {
-                id,
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-                width: rect.right - rect.left,
-                height: rect.bottom - rect.top,
-            }),
+            Ok(rect) => monitors.push(Monitor { id, width: rect.right - rect.left, height: rect.bottom - rect.top }),
             Err(e) => log::warn!("Skipping monitor {id}: could not get monitor rect: {e}"),
         }
     }

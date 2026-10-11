@@ -4,19 +4,27 @@ use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor, RankedImage};
 use super::transition::apply_wallpaper;
 use super::settings::{self, RuntimeState, Settings};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use crate::util::lock;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Bumped on every start/stop; a worker thread exits as soon as it no longer matches, so a quick
-/// stop + start can never leave two workers running.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-static WORKER_ACTIVE: Mutex<bool> = Mutex::new(false);
+struct Worker {
+    /// Bumped on every start/stop; a worker thread exits as soon as it no longer matches, so a
+    /// quick stop + start can never leave two workers running.
+    generation: u64,
+    active: bool,
+    /// When the last wallpaper change (from any trigger) finished, so a manual change restarts
+    /// the interval instead of being replaced moments later by the service.
+    last_apply: Option<Instant>,
+}
+
+static WORKER: Mutex<Worker> = Mutex::new(Worker { generation: 0, active: false, last_apply: None });
+/// Wakes the worker to re-plan: on stop, after a wallpaper change and when settings change.
+static WAKE: Condvar = Condvar::new();
 /// Wallpaper changes are serialized: the service, the UI and the tray can all trigger one.
 static APPLY_LOCK: Mutex<()> = Mutex::new(());
-/// When the last wallpaper change (from any trigger) finished, so a manual change restarts
-/// the interval instead of being replaced moments later by the service.
-static LAST_APPLY: Mutex<Option<Instant>> = Mutex::new(None);
+/// How long to wait before retrying when the settings can't be read.
+const SETTINGS_RETRY: Duration = Duration::from_secs(60);
 
 /// Whether the interval has elapsed since the later of the worker's start and the last change.
 fn is_change_due(worker_started: Instant, last_apply: Option<Instant>, interval: Duration, now: Instant) -> bool {
@@ -25,28 +33,35 @@ fn is_change_due(worker_started: Instant, last_apply: Option<Instant>, interval:
 }
 
 pub fn start() -> Result<(), String> {
-    let mut active = WORKER_ACTIVE.lock().map_err(|e| e.to_string())?;
-    if *active {
+    let mut worker = lock(&WORKER);
+    if worker.active {
         return Ok(());
     }
-    *active = true;
-    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    worker.active = true;
+    worker.generation += 1;
+    let generation = worker.generation;
 
     std::thread::Builder::new()
         .name("wallchanger-service".into())
         .spawn(move || run_worker(generation))
         .map_err(|e| {
-            *active = false;
+            worker.active = false;
             format!("Failed to start wallpaper service: {e}")
         })?;
     Ok(())
 }
 
 pub fn stop() -> Result<(), String> {
-    let mut active = WORKER_ACTIVE.lock().map_err(|e| e.to_string())?;
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-    *active = false;
+    let mut worker = lock(&WORKER);
+    worker.generation += 1;
+    worker.active = false;
+    WAKE.notify_all();
     Ok(())
+}
+
+/// Makes the worker re-read its settings now (e.g. the interval changed).
+pub fn wake() {
+    WAKE.notify_all();
 }
 
 /// Turns the interval service on or off and remembers the choice across restarts.
@@ -57,36 +72,48 @@ pub fn set_running(running: bool) -> Result<(), String> {
     } else {
         stop()?;
     }
-    super::emit("wc-service-changed", running);
+    crate::events::emit(crate::events::WC_SERVICE_CHANGED, running);
     Ok(())
 }
 
 fn run_worker(generation: u64) {
     if let Err(e) = super::monitors::initialize_com() {
         log::error!("Wallchanger COM init failed: {}", e);
-        if GENERATION.load(Ordering::SeqCst) == generation {
-            if let Ok(mut active) = WORKER_ACTIVE.lock() {
-                *active = false;
-            }
+        let mut worker = lock(&WORKER);
+        if worker.generation == generation {
+            worker.active = false;
         }
         return;
     }
 
     let started = Instant::now();
-    while GENERATION.load(Ordering::SeqCst) == generation {
-        match settings::load() {
+    loop {
+        let config = settings::load();
+        let worker = lock(&WORKER);
+        if worker.generation != generation {
+            break;
+        }
+        let wait = match &config {
+            Err(e) => {
+                log::error!("Wallchanger failed to load settings: {}", e);
+                SETTINGS_RETRY
+            }
             Ok(config) => {
                 let interval = Duration::from_secs(config.interval_minutes.max(1) as u64 * 60);
-                let last_apply = LAST_APPLY.lock().ok().and_then(|t| *t);
-                if is_change_due(started, last_apply, interval, Instant::now()) {
+                let now = Instant::now();
+                if is_change_due(started, worker.last_apply, interval, now) {
+                    drop(worker);
                     if let Err(e) = apply(config.change_one_monitor_per_interval) {
                         log::error!("Wallchanger apply failed: {}", e);
                     }
+                    continue;
                 }
+                let since = worker.last_apply.map_or(started, |t| t.max(started));
+                (since + interval).saturating_duration_since(now)
             }
-            Err(e) => log::error!("Wallchanger failed to load settings: {}", e),
-        }
-        std::thread::sleep(Duration::from_secs(1));
+        };
+        // Sleep until the next change is due, or until something re-plans the schedule.
+        drop(WAKE.wait_timeout(worker, wait));
     }
 
     #[cfg(target_os = "windows")]
@@ -96,12 +123,11 @@ fn run_worker(generation: u64) {
 /// Picks and sets the next wallpaper(s), then persists the resulting runtime state.
 /// Blocking (image decoding, Wallhaven downloads, fade transitions): never call it on the UI thread.
 pub fn apply(change_one_monitor_only: bool) -> Result<String, String> {
-    let _apply_guard = APPLY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _apply_guard = lock(&APPLY_LOCK);
     let result = apply_locked(change_one_monitor_only);
-    // Failed attempts count too, so a broken source isn't retried every second.
-    if let Ok(mut last) = LAST_APPLY.lock() {
-        *last = Some(Instant::now());
-    }
+    // Failed attempts count too, so a broken source isn't retried right away.
+    lock(&WORKER).last_apply = Some(Instant::now());
+    WAKE.notify_all();
     result
 }
 
@@ -111,13 +137,13 @@ fn apply_locked(change_one_monitor_only: bool) -> Result<String, String> {
     let settings = settings::load()?;
     let mut runtime = settings::load_state()?;
     let result = apply_with(&settings, &mut runtime, change_one_monitor_only)?;
-    settings::save_state(&mut runtime)?;
+    settings::save_state(&runtime)?;
 
     if let Err(e) = cleanup_rendered_cache() {
         log::warn!("Failed to clean up rendered wallpaper cache: {e}");
     }
 
-    super::emit("wc-wallpaper-changed", &result);
+    crate::events::emit(crate::events::WC_WALLPAPER_CHANGED, &result);
     Ok(result)
 }
 

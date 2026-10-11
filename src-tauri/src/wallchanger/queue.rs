@@ -248,7 +248,7 @@ mod tests {
     }
 
     fn monitor(id: &str, width: i32, height: i32) -> Monitor {
-        Monitor { id: id.into(), width, height, right: width, bottom: height, ..Default::default() }
+        Monitor { id: id.into(), width, height }
     }
 
     fn image(path: &str, width: i32, height: i32) -> ImageInfo {

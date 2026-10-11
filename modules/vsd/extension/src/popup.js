@@ -40,17 +40,20 @@ function formatProgress(p) {
   return 'Starting...';
 }
 
+/** The ffmpeg metadata the server writes for a stream (mirrors server.py's METADATA_KEYS). */
 function buildTooltip(s) {
   const meta = s.metadata || {};
-  const lines = [];
-  if (s.title || meta.title) lines.push(`title: ${s.title || meta.title}`);
-  if (meta.channel) lines.push(`artist: ${meta.channel}`);
-  if (meta.actors?.length) lines.push(`album_artist: ${meta.actors.join(', ')}`);
-  if (meta.categories?.length) lines.push(`genre: ${meta.categories.join(', ')}`);
-  if (meta.tags?.length) lines.push(`keywords: ${meta.tags.join(', ')}`);
-  if (s.pageUrl && s.pageUrl !== 'unknown') lines.push(`comment: ${s.pageUrl}`);
-  if (s.url) lines.push(`description: ${s.url}`);
-  if (meta.uploadDate) lines.push(`date: ${meta.uploadDate}`);
+  const list = (v) => (Array.isArray(v) ? v.join(', ') : v);
+  const fields = [
+    ['title', s.title || meta.title],
+    ['comment', s.pageUrl !== 'unknown' && s.pageUrl],
+    ['artist', meta.channel],
+    ['genre', list(meta.categories)],
+    ['keywords', list(meta.tags)],
+    ['album_artist', list(meta.actors)],
+    ['date', meta.uploadDate],
+  ];
+  const lines = fields.filter(([, value]) => value).map(([key, value]) => `${key}: ${value}`);
   return lines.length ? 'Metadata saved in file:\n' + lines.join('\n') : '';
 }
 

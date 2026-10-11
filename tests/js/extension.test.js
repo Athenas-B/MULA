@@ -356,9 +356,10 @@ describe("background.js helpers", () => {
   });
 
   it("registers the webRequest listeners with the expected options", () => {
-    assert.deepEqual(plain(bg.chrome.webRequest.onBeforeRequest.calls[0]), [{ urls: ["<all_urls>"] }, []]);
+    const filter = { urls: ["*://*/*.m3u*", "*://*/*.M3U*"] };
+    assert.deepEqual(plain(bg.chrome.webRequest.onBeforeRequest.calls[0]), [filter, []]);
     assert.deepEqual(plain(bg.chrome.webRequest.onBeforeSendHeaders.calls[0]), [
-      { urls: ["<all_urls>"] },
+      filter,
       ["requestHeaders", "extraHeaders"],
     ]);
   });
@@ -1334,12 +1335,11 @@ describe("popup.js helpers", () => {
       [
         "Metadata saved in file:",
         "title: Stream title",
+        "comment: https://site/v",
         "artist: Chan",
-        "album_artist: A, B",
         "genre: C1",
         "keywords: t1, t2",
-        "comment: https://site/v",
-        "description: https://cdn/x.m3u8",
+        "album_artist: A, B",
         "date: 2024-05-06",
       ].join("\n")
     );
@@ -1347,7 +1347,7 @@ describe("popup.js helpers", () => {
 
   it("buildTooltip falls back to the metadata title and skips unknown pages", () => {
     const tooltip = p.fn.buildTooltip({ url: "u", pageUrl: "unknown", title: "", metadata: { title: "Meta", tags: [] } });
-    assert.equal(tooltip, "Metadata saved in file:\ntitle: Meta\ndescription: u");
+    assert.equal(tooltip, "Metadata saved in file:\ntitle: Meta");
   });
 
   it("buildTooltip returns an empty string when there is nothing to show", () => {

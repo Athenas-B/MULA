@@ -369,8 +369,6 @@ def _fetch(
     proxy-aware connection per request). HTTP error statuses are retried on the
     same transport. A non-http(s) URL or redirect target is never retried.
     """
-    if not _is_http_url(url):
-        raise ValueError(f"Refusing to fetch non-HTTP URL: {url[:80]}")
     req_headers = {"User-Agent": _DEFAULT_UA, **_clean_headers(headers)}
     retries = max(1, retries)
 
@@ -387,12 +385,6 @@ def _fetch(
             if attempt < retries:
                 logger.warning(f"Fetch attempt {attempt}/{retries} failed for {url[:80]}: {e}")
     raise last_err
-
-
-def _resolve_url(base: str, url: str) -> str:
-    if url.startswith(("http://", "https://")):
-        return url
-    return urllib.parse.urljoin(base, url)
 
 
 def _extract_resolution(m3u8_url: str, segments: list[str]) -> str:
@@ -424,7 +416,7 @@ def _parse_m3u8(base_url: str, content: bytes) -> list[str]:
         if not line or line.startswith("#"):
             continue
         if line.endswith(".ts") or ".ts?" in line:
-            segments.append(_resolve_url(base_url, line))
+            segments.append(urllib.parse.urljoin(base_url, line))
     return segments
 
 
@@ -543,26 +535,24 @@ def _build_output_name(title: str, resolution: str, job_id: str) -> str:
     return "_".join(parts) + ".mp4"
 
 
+# Request metadata key -> ffmpeg metadata key (the extension popup shows the same fields).
+METADATA_KEYS = {
+    "pageUrl": "comment",
+    "channel": "artist",
+    "categories": "genre",
+    "tags": "keywords",
+    "actors": "album_artist",
+    "uploadDate": "date",
+}
+
+
 def _build_metadata(title: str, raw: dict) -> dict:
-    """Map request metadata to ffmpeg metadata keys."""
-    m = {}
-    if title:
-        m["title"] = title
-    if raw.get("pageUrl"):
-        m["comment"] = raw["pageUrl"]
-    if raw.get("channel"):
-        m["artist"] = raw["channel"]
-    if raw.get("categories"):
-        cats = raw["categories"]
-        m["genre"] = ", ".join(cats) if isinstance(cats, list) else str(cats)
-    if raw.get("tags"):
-        tags = raw["tags"]
-        m["keywords"] = ", ".join(tags) if isinstance(tags, list) else str(tags)
-    if raw.get("actors"):
-        actors = raw["actors"]
-        m["album_artist"] = ", ".join(actors) if isinstance(actors, list) else str(actors)
-    if raw.get("uploadDate"):
-        m["date"] = raw["uploadDate"]
+    """Map request metadata to ffmpeg metadata keys; lists are joined with commas."""
+    m = {"title": title} if title else {}
+    for key, ffmpeg_key in METADATA_KEYS.items():
+        value = raw.get(key)
+        if value:
+            m[ffmpeg_key] = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
     return m
 
 
@@ -649,13 +639,12 @@ def download():
     title = data.get("title", "")
     headers = data.get("headers")
     raw_metadata = {
-        "title": title,
         "pageUrl": data.get("pageUrl", ""),
         **(data.get("metadata") or {}),
     }
 
     job_id = uuid.uuid4().hex[:8]
-    _set_job(job_id, status="running", stage="starting")
+    _set_job(job_id)
     threading.Thread(
         target=_run_download,
         args=(job_id, url, title, headers, raw_metadata),

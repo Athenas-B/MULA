@@ -221,7 +221,7 @@ async function installExtension(browser) {
     appendLog(`Extension built successfully: ${extPath}\n\nTo install in ${name}:\n${steps.join("\n")}\n`);
   } catch (err) {
     btn.querySelector(".btn-text").textContent = "Error";
-    appendLog(`Extension build failed: ${err}\n`);
+    appendLog(`Extension build failed: ${errorText(err)}\n`);
   } finally {
     setTimeout(() => {
       btn.querySelector(".btn-text").textContent = originalText;
@@ -283,27 +283,33 @@ async function toggleVsd() {
       await invoke("vsd_start");
     }
   } catch (err) {
-    appendLog(`[Error] ${err}\n`);
+    appendLog(`[Error] ${errorText(err)}\n`);
     checkVsdStatus();
   } finally {
     toggleBtn.disabled = false;
   }
 }
 
+/** Shows a start/stop toggle button as running or stopped. */
+function setRunningUi(btn, label, running) {
+  btn.classList.toggle("running", running);
+  btn.classList.toggle("stopped", !running);
+  label.textContent = running ? "Stop" : "Start";
+}
+
+/** Collapses or expands (`collapsed` omitted: toggles) a section; returns whether it is collapsed. */
+function setCollapsed(toggle, content, collapsed) {
+  const isCollapsed = content.classList.toggle("collapsed", collapsed);
+  toggle.setAttribute("aria-expanded", String(!isCollapsed));
+  toggle.querySelector(".toggle-icon").textContent = isCollapsed ? "+" : "-";
+  return isCollapsed;
+}
+
 function updateVsdUi(running) {
   vsdRunning = running;
   const toggleBtn = document.getElementById("vsd-toggle");
-  if (running) {
-    toggleBtn.classList.remove("stopped");
-    toggleBtn.classList.add("running");
-    toggleBtn.querySelector(".toggle-label").textContent = "Stop";
-    toggleBtn.title = "Stop VSD Server";
-  } else {
-    toggleBtn.classList.remove("running");
-    toggleBtn.classList.add("stopped");
-    toggleBtn.querySelector(".toggle-label").textContent = "Start";
-    toggleBtn.title = "Start VSD Server";
-  }
+  setRunningUi(toggleBtn, toggleBtn.querySelector(".toggle-label"), running);
+  toggleBtn.title = running ? "Stop VSD Server" : "Start VSD Server";
 }
 
 // ANSI color code to CSS color mapping
@@ -342,18 +348,12 @@ function ansiToHtml(text) {
           openSpans++;
         }
       }
-    } else if (text[i] === "<") {
-      html += "&lt;";
-      i++;
-    } else if (text[i] === ">") {
-      html += "&gt;";
-      i++;
-    } else if (text[i] === "&") {
-      html += "&amp;";
-      i++;
     } else {
-      html += text[i];
-      i++;
+      // Plain text up to the next escape sequence.
+      let end = text.indexOf("\x1b[", i + 1);
+      if (end === -1) end = text.length;
+      html += escapeHtml(text.slice(i, end));
+      i = end;
     }
   }
 
@@ -375,10 +375,6 @@ function appendLog(text) {
   // Auto-scroll to bottom
   const logContainer = document.getElementById("vsd-log");
   logContainer.scrollTop = logContainer.scrollHeight;
-}
-
-function clearLog() {
-  document.getElementById("vsd-log-content").innerHTML = "";
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -407,10 +403,7 @@ window.addEventListener("DOMContentLoaded", () => {
   listen("wc-service-changed", (event) => wcUpdateToggleUi(event.payload));
 
   // Emitted after every wallpaper change, whether from this tab, the tray or the interval service.
-  listen("wc-wallpaper-changed", () => {
-    wcLoadMonitorPreview();
-    wcLoadQueuePreview();
-  });
+  listen("wc-wallpaper-changed", wcRefreshPreviews);
 });
 
 // ── Drive Test ──
@@ -432,11 +425,7 @@ async function initDriveTest() {
   select.addEventListener("change", onDriveSelect);
   refreshBtn.addEventListener("click", loadDrives);
   if (toggle && content) {
-    toggle.addEventListener("click", () => {
-      const collapsed = content.classList.toggle("collapsed");
-      toggle.setAttribute("aria-expanded", String(!collapsed));
-      toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
-    });
+    toggle.addEventListener("click", () => setCollapsed(toggle, content));
   }
   if (smartToggle && smartContent) {
     smartToggle.addEventListener("click", () => onSmartToggle(smartToggle, smartContent));
@@ -493,7 +482,7 @@ async function loadDrives() {
 
     for (const d of cachedDrives) {
       const opt = document.createElement("option");
-      opt.value = d.id;
+      opt.value = d.device_id;
       const letters = d.drive_letters?.length ? ` [${d.drive_letters.join(" ")}]` : "";
       opt.textContent = `${d.model} (${d.size_text})${letters}`;
       select.appendChild(opt);
@@ -506,7 +495,7 @@ async function loadDrives() {
   } catch (err) {
     console.error("Failed to list drives:", err);
     select.innerHTML = '<option value="">Failed to load drives</option>';
-    empty.textContent = `Error: ${err}`;
+    empty.textContent = `Error: ${errorText(err)}`;
     empty.classList.remove("hidden");
     details.classList.add("hidden");
   } finally {
@@ -611,9 +600,7 @@ async function onSmartToggle(toggle, content) {
   const id = document.getElementById("drive-select").value;
   const smartAdmin = document.getElementById("smart-admin");
 
-  const collapsed = content.classList.toggle("collapsed");
-  toggle.setAttribute("aria-expanded", String(!collapsed));
-  toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
+  const collapsed = setCollapsed(toggle, content);
   if (smartAdmin) smartAdmin.classList.add("hidden");
 
   if (!collapsed && id && smartLoadedId !== id) await loadSmartData(id, false);
@@ -806,7 +793,7 @@ async function onFormatDrive() {
 
   stopTestProgressPolling();
 
-  const drive = cachedDrives.find((d) => d.id === id);
+  const drive = cachedDrives.find((d) => d.device_id === id);
   if (drive?.is_system) return;
   const driveLabel = drive ? `${drive.vendor || ""} ${drive.model || ""} ${drive.serial || ""}`.trim() || id : id;
 
@@ -840,7 +827,7 @@ async function onFormatDrive() {
       formatStatus.className = "drive-format-status error";
     }
   } finally {
-    if (formatBtn) formatBtn.disabled = !!cachedDrives.find((d) => d.id === id)?.is_system;
+    if (formatBtn) formatBtn.disabled = !!cachedDrives.find((d) => d.device_id === id)?.is_system;
   }
 }
 
@@ -863,12 +850,8 @@ function onDriveSelect() {
 
   smartLoadedId = null;
   smartData.textContent = "Select a drive and expand to load SMART data.";
-  if (smartContent) smartContent.classList.add("collapsed");
+  if (smartToggle && smartContent) setCollapsed(smartToggle, smartContent, true);
   if (smartAdmin) smartAdmin.classList.add("hidden");
-  if (smartToggle) {
-    smartToggle.setAttribute("aria-expanded", "false");
-    smartToggle.querySelector(".toggle-icon").textContent = "+";
-  }
 
   if (!id) {
     if (smartTest) smartTest.classList.add("hidden");
@@ -882,7 +865,7 @@ function onDriveSelect() {
     return;
   }
 
-  const drive = cachedDrives.find((d) => d.id === id);
+  const drive = cachedDrives.find((d) => d.device_id === id);
   if (!drive) {
     empty.classList.remove("hidden");
     details.classList.add("hidden");
@@ -896,7 +879,6 @@ function onDriveSelect() {
     ["Vendor", drive.vendor],
     ["Model", drive.model],
     ["Serial", drive.serial || "N/A"],
-    ["Type", drive.type],
     ["Bus", drive.bus_type],
     ["Connection speed", drive.connection_speed],
     ["Media type", drive.media_type],
@@ -975,7 +957,6 @@ const WC_FORM_FIELDS = {
 async function initWallchanger() {
   document.getElementById("wc-toggle")?.addEventListener("click", wcToggleService);
   document.getElementById("wc-change-now")?.addEventListener("click", wcChangeNow);
-  document.getElementById("wc-apply")?.addEventListener("click", wcChangeNow);
   document.getElementById("wc-add-folder")?.addEventListener("click", wcAddFolder);
   document.getElementById("wc-add-wallhaven")?.addEventListener("click", wcAddWallhavenUrl);
   document.getElementById("wc-remove-source")?.addEventListener("click", wcRemoveSource);
@@ -995,14 +976,28 @@ async function initWallchanger() {
   document.getElementById("wc-queue-refresh")?.addEventListener("click", wcLoadQueuePreview);
   document.getElementById("wc-monitor-preview-refresh")?.addEventListener("click", wcLoadMonitorPreview);
 
-  await Promise.all([wcLoadSettings(), wcLoadStatus(), wcLoadMonitors(), wcLoadMonitorPreview(), wcLoadQueuePreview()]);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && wcPreviewsStale) wcRefreshPreviews();
+  });
+
+  await Promise.all([wcLoadSettings(), wcLoadStatus(), wcLoadMonitors(), wcRefreshPreviews()]);
+}
+
+// Previews are only rebuilt while the window is shown; changes while it is hidden (e.g. the
+// interval service with the app in the tray) are picked up when it is shown again.
+let wcPreviewsStale = false;
+
+function wcRefreshPreviews() {
+  wcPreviewsStale = !!document.hidden;
+  if (wcPreviewsStale) return;
+  return Promise.all([wcLoadMonitorPreview(), wcLoadQueuePreview()]);
 }
 
 async function wcLoadSettings() {
   try {
     wcApplySettings(await invoke("wc_get_settings"));
   } catch (err) {
-    wcShowMessage(`Error loading settings: ${err}`, "error");
+    wcShowMessage(`Error loading settings: ${errorText(err)}`, "error");
   }
 }
 
@@ -1038,7 +1033,7 @@ async function wcFlushPatch() {
   try {
     wcApplySettings(await invoke("wc_update_settings", { patch }));
   } catch (err) {
-    wcShowMessage(`Error saving settings: ${err}`, "error");
+    wcShowMessage(`Error saving settings: ${errorText(err)}`, "error");
     await wcLoadSettings();
   }
 }
@@ -1100,26 +1095,14 @@ function wcUpdateOverlayVisibility() {
 }
 
 function wcRenderSettings() {
-  document.getElementById("wc-interval").value = wcSettings.interval_minutes;
-  document.getElementById("wc-max-level").value = wcSettings.maximum_source_level;
-  document.getElementById("wc-wallhaven-api-key").value = wcSettings.wallhaven_api_key || "";
-  document.getElementById("wc-rotation").value = wcSettings.rotation_mode;
-  document.getElementById("wc-scaling").value = wcSettings.scaling_mode;
-  document.getElementById("wc-bg-color").value = wcArgbToHex(wcSettings.background_color_argb);
-  document.getElementById("wc-separate-queues").checked = wcSettings.use_separate_monitor_queues;
-  document.getElementById("wc-unique-queues").checked = wcSettings.keep_image_in_single_monitor_queue;
-  document.getElementById("wc-stop-slideshow").checked = wcSettings.disable_windows_slideshow_when_running;
-  document.getElementById("wc-one-monitor").checked = wcSettings.change_one_monitor_per_interval;
-  document.getElementById("wc-overlay-enabled").checked = wcSettings.show_picture_name_overlay;
-  document.getElementById("wc-overlay-mode").value = wcSettings.picture_name_overlay_text_mode;
-  document.getElementById("wc-overlay-font-size").value = wcSettings.picture_name_overlay_font_size;
-  document.getElementById("wc-overlay-color").value = wcArgbToHex(wcSettings.picture_name_overlay_text_color_argb);
-  document.getElementById("wc-overlay-offset-x").value = wcSettings.picture_name_overlay_offset_x;
-  document.getElementById("wc-overlay-offset-y").value = wcSettings.picture_name_overlay_offset_y;
-  document.getElementById("wc-overlay-backdrop").checked = wcSettings.picture_name_overlay_use_backdrop;
-  document.getElementById("wc-fade-enabled").checked = wcSettings.enable_wallpaper_fade_transition;
-  document.getElementById("wc-fade-duration").value = wcSettings.wallpaper_fade_duration_ms;
-  document.getElementById("wc-fade-steps").value = wcSettings.wallpaper_fade_steps;
+  for (const [id, [key, kind]] of Object.entries(WC_FORM_FIELDS)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    const value = wcSettings[key];
+    if (kind === "checked") el.checked = value;
+    else if (kind === "color") el.value = wcArgbToHex(value);
+    else el.value = value ?? "";
+  }
   wcUpdateBgColorVisibility();
   wcUpdateOverlayVisibility();
 }
@@ -1236,7 +1219,7 @@ async function wcAddFolder() {
       { path: folder, enabled: true, level: 5, kind: "folder", include_subfolders: true },
     ]);
   } catch (err) {
-    wcShowMessage(`Error adding folder: ${err}`, "error");
+    wcShowMessage(`Error adding folder: ${errorText(err)}`, "error");
   }
 }
 
@@ -1285,7 +1268,7 @@ async function wcChangeNow() {
     const result = await invoke("wc_change_now");
     wcShowMessage(result, "success");
   } catch (err) {
-    wcShowMessage(`Error changing wallpaper: ${err}`, "error");
+    wcShowMessage(`Error changing wallpaper: ${errorText(err)}`, "error");
   }
 }
 
@@ -1294,34 +1277,21 @@ async function wcToggleService() {
     const running = await invoke("wc_toggle_service");
     wcUpdateToggleUi(running);
   } catch (err) {
-    wcShowMessage(`Error toggling service: ${err}`, "error");
+    wcShowMessage(`Error toggling service: ${errorText(err)}`, "error");
   }
 }
 
 async function wcLoadStatus() {
   try {
-    const status = await invoke("wc_get_status");
-    wcUpdateToggleUi(status.running);
+    wcUpdateToggleUi(await invoke("wc_get_status"));
   } catch (err) {
-    wcShowMessage(`Error loading status: ${err}`, "error");
+    wcShowMessage(`Error loading status: ${errorText(err)}`, "error");
   }
 }
 
 function wcUpdateToggleUi(running) {
-  const btn = document.getElementById("wc-toggle");
-  const label = document.getElementById("wc-toggle-label");
-  const status = document.getElementById("wc-status");
-  if (running) {
-    btn.classList.add("running");
-    btn.classList.remove("stopped");
-    label.textContent = "Stop";
-    status.textContent = "running";
-  } else {
-    btn.classList.add("stopped");
-    btn.classList.remove("running");
-    label.textContent = "Start";
-    status.textContent = "stopped";
-  }
+  setRunningUi(document.getElementById("wc-toggle"), document.getElementById("wc-toggle-label"), running);
+  document.getElementById("wc-status").textContent = running ? "running" : "stopped";
 }
 
 async function wcLoadMonitors() {
@@ -1332,7 +1302,7 @@ async function wcLoadMonitors() {
       .map((m, i) => `<li>Monitor ${i + 1}: ${m.width} x ${m.height}</li>`)
       .join("");
   } catch (err) {
-    wcShowMessage(`Error loading monitors: ${err}`, "error");
+    wcShowMessage(`Error loading monitors: ${errorText(err)}`, "error");
   }
 }
 
@@ -1351,7 +1321,7 @@ async function wcLoadQueuePreview() {
     container.innerHTML = queues.map(wcRenderQueueCard).join("");
   } catch (err) {
     container.innerHTML = "";
-    wcShowMessage(`Error loading queue preview: ${err}`, "error");
+    wcShowMessage(`Error loading queue preview: ${errorText(err)}`, "error");
   }
 }
 
@@ -1396,7 +1366,7 @@ async function wcLoadMonitorPreview() {
     container.innerHTML = previews.map(wcRenderMonitorPreview).join("");
   } catch (err) {
     container.innerHTML = "";
-    wcShowMessage(`Error loading monitor preview: ${err}`, "error");
+    wcShowMessage(`Error loading monitor preview: ${errorText(err)}`, "error");
   }
 }
 

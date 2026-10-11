@@ -10,9 +10,9 @@ pub mod settings;
 mod transition;
 mod wallhaven;
 
+use crate::error::CmdResult;
 use crate::util::blocking;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 
 /// The UI lists this many images per queue; the rest is summarized by `image_count`.
 const QUEUE_PREVIEW_LIMIT: usize = 30;
@@ -30,10 +30,6 @@ pub(crate) fn aspect_ratio(width: i32, height: i32) -> f64 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Monitor {
     pub id: String,
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
     pub width: i32,
     pub height: i32,
 }
@@ -55,31 +51,15 @@ pub struct QueueImagePreview {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueuePreview {
-    pub key: String,
     pub label: String,
-    pub rotation_mode: String,
+    pub rotation_mode: settings::RotationMode,
     pub image_count: usize,
-    pub last_shown: Option<String>,
     pub images: Vec<QueueImagePreview>,
 }
 
 /// Holds handles to the tray's "Max source level" check items (one per level 1-10)
 /// so they can be kept in sync with the level chosen in the Wall Changer tab.
 pub struct MaxLevelMenuState(pub Vec<(i32, tauri::menu::CheckMenuItem<tauri::Wry>)>);
-
-static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
-
-/// Lets background code (the interval service, tray actions) notify the UI.
-pub fn set_app_handle(app: tauri::AppHandle) {
-    let _ = APP_HANDLE.set(app);
-}
-
-pub(crate) fn emit<S: Serialize + Clone>(event: &str, payload: S) {
-    use tauri::Emitter;
-    if let Some(app) = APP_HANDLE.get() {
-        let _ = app.emit(event, payload);
-    }
-}
 
 pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
     use tauri::Manager;
@@ -93,37 +73,37 @@ pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
 /// Every settings change (UI or tray) ends here: the tray's "Max source level" items are synced
 /// and the Wall Changer tab re-renders from the `wc-settings-changed` event.
 pub fn on_settings_changed(app: &tauri::AppHandle, versioned: &settings::Versioned) {
-    use tauri::Emitter;
     sync_max_level_menu(app, versioned.settings.maximum_source_level);
-    let _ = app.emit("wc-settings-changed", versioned);
+    service::wake();
+    crate::events::emit(crate::events::WC_SETTINGS_CHANGED, versioned);
 }
 
 #[tauri::command]
-pub async fn wc_get_settings() -> Result<settings::Versioned, String> {
-    blocking(settings::load_versioned).await
+pub async fn wc_get_settings() -> CmdResult<settings::Versioned> {
+    Ok(blocking(settings::load_versioned).await?)
 }
 
 /// Applies a partial update (`{ setting: value, ... }`) and returns the normalized settings
 /// with their revision.
 #[tauri::command]
-pub async fn wc_update_settings(app: tauri::AppHandle, patch: serde_json::Value) -> Result<settings::Versioned, String> {
+pub async fn wc_update_settings(app: tauri::AppHandle, patch: serde_json::Value) -> CmdResult<settings::Versioned> {
     let saved = blocking(move || settings::update_with_patch(patch)).await?;
     on_settings_changed(&app, &saved);
     Ok(saved)
 }
 
 #[tauri::command]
-pub async fn wc_get_monitors() -> Result<Vec<Monitor>, String> {
-    blocking(monitors::get_monitors).await
+pub async fn wc_get_monitors() -> CmdResult<Vec<Monitor>> {
+    Ok(blocking(monitors::get_monitors).await?)
 }
 
 #[tauri::command]
-pub async fn wc_change_now() -> Result<String, String> {
-    blocking(|| service::apply(false)).await
+pub async fn wc_change_now() -> CmdResult<String> {
+    Ok(blocking(|| service::apply(false)).await?)
 }
 
 #[tauri::command]
-pub async fn wc_toggle_service() -> Result<bool, String> {
+pub async fn wc_toggle_service() -> CmdResult<bool> {
     blocking(|| {
         let running = !settings::service_running();
         service::set_running(running)?;
@@ -132,31 +112,20 @@ pub async fn wc_toggle_service() -> Result<bool, String> {
     .await
 }
 
+/// Whether the interval service is switched on.
 #[tauri::command]
-pub async fn wc_get_status() -> Result<serde_json::Value, String> {
-    blocking(|| {
-        let config = settings::load()?;
-        Ok(serde_json::json!({
-            "running": settings::service_running(),
-            "interval_minutes": config.interval_minutes,
-            "maximum_source_level": config.maximum_source_level,
-        }))
-    })
-    .await
+pub async fn wc_get_status() -> CmdResult<bool> {
+    blocking(|| Ok(settings::service_running())).await
 }
 
 #[tauri::command]
-pub async fn wc_get_queue_preview() -> Result<Vec<QueuePreview>, String> {
-    blocking(build_queue_previews).await
+pub async fn wc_get_queue_preview() -> CmdResult<Vec<QueuePreview>> {
+    Ok(blocking(build_queue_previews).await?)
 }
 
 #[tauri::command]
-pub async fn wc_get_monitor_preview() -> Result<Vec<preview::MonitorPreview>, String> {
-    blocking(|| {
-        let settings = settings::load()?;
-        preview::build_monitor_previews(&settings)
-    })
-    .await
+pub async fn wc_get_monitor_preview() -> CmdResult<Vec<preview::MonitorPreview>> {
+    Ok(blocking(|| preview::build_monitor_previews(&settings::load()?)).await?)
 }
 
 fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
@@ -165,69 +134,43 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
     // The preview must stay cheap: only use Wallhaven images that are already downloaded.
     let images = images::load_images(&settings, &mut runtime.image_cache_entries, images::NetworkPolicy::CacheOnly)?;
     let monitors = monitors::get_monitors().unwrap_or_default();
-
     let queues = queue::build_queues(&images, &monitors, &settings);
-    let rotation_label = match settings.rotation_mode {
-        settings::RotationMode::Random => "Random",
-        settings::RotationMode::Sequence => "Sequence",
+
+    let labelled: Vec<(String, String)> = if queue::uses_shared_queue(&settings, monitors.len()) {
+        vec![("shared".to_string(), "Shared queue".to_string())]
+    } else {
+        monitors
+            .iter()
+            .enumerate()
+            .map(|(index, monitor)| {
+                let key = queue::get_queue_key(&settings, monitors.len(), &monitor.id, false);
+                (key, format!("Monitor {} ({}x{})", index + 1, monitor.width, monitor.height))
+            })
+            .collect()
     };
 
-    let mut previews = Vec::new();
-
-    if queue::uses_shared_queue(&settings, monitors.len()) {
-        if let Some(queue) = queues.get("shared").cloned() {
-            previews.push(build_queue_preview(
-                &mut runtime,
-                settings.rotation_mode,
-                "shared".to_string(),
-                "Shared queue".to_string(),
-                &queue,
-                rotation_label,
-            ));
-        }
-    } else {
-        for (index, monitor) in monitors.iter().enumerate() {
-            let key = queue::get_queue_key(&settings, monitors.len(), &monitor.id, false);
-            if let Some(queue) = queues.get(&key).cloned() {
-                let label = format!(
-                    "Monitor {} ({}x{})",
-                    index + 1,
-                    monitor.width,
-                    monitor.height
-                );
-                previews.push(build_queue_preview(
-                    &mut runtime,
-                    settings.rotation_mode,
-                    key,
-                    label,
-                    &queue,
-                    rotation_label,
-                ));
-            }
-        }
-    }
-
-    Ok(previews)
+    Ok(labelled
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let queue = queues.get(&key)?;
+            Some(build_queue_preview(&mut runtime, settings.rotation_mode, &key, label, queue))
+        })
+        .collect())
 }
 
 fn build_queue_preview(
     runtime: &mut settings::RuntimeState,
     rotation_mode: settings::RotationMode,
-    key: String,
+    key: &str,
     label: String,
     queue: &[queue::RankedImage],
-    rotation_label: &str,
 ) -> QueuePreview {
-    let state = queue::ensure_queue_state(runtime, &key, queue);
+    let state = queue::ensure_queue_state(runtime, key, queue);
     let next_path = match rotation_mode {
         settings::RotationMode::Sequence => queue::peek_next_sequence_path(queue, state),
         settings::RotationMode::Random => None,
     };
-    let last_shown = if state.last_image_path.is_empty() {
-        None
-    } else {
-        Some(state.last_image_path.clone())
-    };
+    let last_shown = Some(state.last_image_path.as_str()).filter(|p| !p.is_empty());
 
     let images = queue
         .iter()
@@ -240,16 +183,9 @@ fn build_queue_preview(
                 .unwrap_or_else(|| ranked.image.path.clone()),
             last_resort: ranked.last_resort,
             is_next: next_path.as_deref() == Some(ranked.image.path.as_str()),
-            is_last_shown: last_shown.as_deref() == Some(ranked.image.path.as_str()),
+            is_last_shown: last_shown == Some(ranked.image.path.as_str()),
         })
         .collect();
 
-    QueuePreview {
-        key,
-        label,
-        rotation_mode: rotation_label.to_string(),
-        image_count: queue.len(),
-        last_shown,
-        images,
-    }
+    QueuePreview { label, rotation_mode, image_count: queue.len(), images }
 }

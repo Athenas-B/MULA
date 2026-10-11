@@ -3,12 +3,11 @@
 //! saving settings can never roll back queue positions, statistics or the image cache.
 
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
-use crate::util::{read_json_or_default, write_json};
+use crate::util::{lock, read_json_or_default, write_json};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -233,8 +232,6 @@ pub struct ImageShowStat {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeState {
     #[serde(default)]
-    pub change_service_running: bool,
-    #[serde(default)]
     pub next_monitor_change_index: i32,
     #[serde(default)]
     pub queue_states: Vec<QueueState>,
@@ -267,17 +264,9 @@ pub struct Versioned {
     pub revision: u64,
     pub settings: Settings,
 }
-/// Serializes read-modify-write cycles on `state.json`.
-static STATE_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock(m: &'static Mutex<()>) -> MutexGuard<'static, ()> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 pub fn config_dir() -> Result<PathBuf, String> {
-    crate::util::mula_config_dir()
-        .map(|p| p.join("wallchanger"))
-        .ok_or_else(|| "Could not determine config directory".to_string())
+    crate::util::mula_path("wallchanger")
 }
 
 fn settings_path() -> Result<PathBuf, String> {
@@ -343,42 +332,31 @@ pub fn load_state() -> Result<RuntimeState, String> {
     read_json_or_default(&state_path()?)
 }
 
-/// Saves the state a wallpaper change produced. The service on/off flag belongs to
-/// [`set_service_running`], so the flag currently on disk wins over the one in `state`.
-pub fn save_state(state: &mut RuntimeState) -> Result<(), String> {
-    let _guard = lock(&STATE_LOCK);
-    state.change_service_running = read_service_flag()?;
-    write_json(&state_path()?, state)
+/// Saves the state a wallpaper change produced (compact: it can hold thousands of paths).
+pub fn save_state(state: &RuntimeState) -> Result<(), String> {
+    let text = serde_json::to_string(state).map_err(|e| format!("Failed to serialize wallchanger state: {e}"))?;
+    crate::util::write_atomic(&state_path()?, &text)
 }
 
-/// The service flag alone; deserializing into this skips building the (large) state vectors.
-#[derive(Deserialize)]
+/// Whether the interval service is switched on; stored on its own in `service.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ServiceFlag {
     #[serde(default)]
-    change_service_running: bool,
+    running: bool,
 }
 
-/// The service flag on disk; a missing file means "off", other read errors are errors.
-fn read_service_flag() -> Result<bool, String> {
-    let path = state_path()?;
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
-    };
-    Ok(serde_json::from_str::<ServiceFlag>(&text).is_ok_and(|flag| flag.change_service_running))
+fn service_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("service.json"))
 }
 
 pub fn service_running() -> bool {
-    read_service_flag().unwrap_or(false)
+    service_path()
+        .and_then(|path| read_json_or_default::<ServiceFlag>(&path))
+        .is_ok_and(|flag| flag.running)
 }
 
 pub fn set_service_running(running: bool) -> Result<(), String> {
-    let _guard = lock(&STATE_LOCK);
-    let path = state_path()?;
-    let mut state: RuntimeState = read_json_or_default(&path)?;
-    state.change_service_running = running;
-    write_json(&path, &state)
+    write_json(&service_path()?, &ServiceFlag { running })
 }
 
 pub fn normalize(settings: &mut Settings) {
@@ -519,9 +497,9 @@ mod tests {
     }
 
     #[test]
-    fn the_service_flag_is_read_without_the_rest_of_the_state() {
-        let flag: ServiceFlag =
-            serde_json::from_str(r#"{"change_service_running": true, "image_cache_entries": [{"path": "a"}]}"#).unwrap();
-        assert!(flag.change_service_running);
+    fn the_service_flag_defaults_to_off() {
+        let flag: ServiceFlag = serde_json::from_str("{}").unwrap();
+        assert!(!flag.running);
+        assert_eq!(serde_json::to_value(ServiceFlag { running: true }).unwrap(), serde_json::json!({ "running": true }));
     }
 }

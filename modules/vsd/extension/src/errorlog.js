@@ -18,24 +18,16 @@ function vsdAppendErrorLog(entry) {
 }
 
 function vsdInstallErrorCapture(context) {
-  const originalError = console.error.bind(console);
-  const originalWarn = console.warn.bind(console);
-
-  console.error = (...args) => {
-    vsdAppendErrorLog({
-      timestamp: new Date().toISOString(), context, level: 'error',
-      message: args.map(a => (a instanceof Error ? (a.stack || a.message) : String(a))).join(' ')
-    });
-    originalError(...args);
-  };
-
-  console.warn = (...args) => {
-    vsdAppendErrorLog({
-      timestamp: new Date().toISOString(), context, level: 'warn',
-      message: args.map(a => (a instanceof Error ? (a.stack || a.message) : String(a))).join(' ')
-    });
-    originalWarn(...args);
-  };
+  for (const level of ['error', 'warn']) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      vsdAppendErrorLog({
+        timestamp: new Date().toISOString(), context, level,
+        message: args.map(a => (a instanceof Error ? (a.stack || a.message) : String(a))).join(' ')
+      });
+      original(...args);
+    };
+  }
 
   const globalTarget = typeof window !== 'undefined' ? window : self;
 

@@ -2,10 +2,36 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// MULA's data directory, e.g. `%APPDATA%\mula`.
 pub fn mula_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("mula"))
+}
+
+/// A path inside MULA's data directory.
+pub fn mula_path(relative: &str) -> Result<PathBuf, String> {
+    Ok(mula_config_dir().ok_or("Could not determine config directory")?.join(relative))
+}
+
+/// Locks `m`, recovering the data if another thread panicked while holding it: MULA's locks
+/// guard plain data that stays consistent between operations.
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `command` and returns its stdout. A failure to start or a non-zero exit becomes an
+/// error naming `what`, with the command's stderr (or stdout, which some tools use for errors).
+pub fn run_command(command: &mut Command, what: &str) -> Result<String, String> {
+    let output = command.output().map_err(|e| format!("Failed to run {what}: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+        return Err(format!("{what} failed: {detail}"));
+    }
+    Ok(stdout)
 }
 
 /// Runs blocking work (processes, disk, COM, network) off the UI thread. Tauri runs
@@ -163,6 +189,29 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
         assert_eq!(sha256_hex(b"abc"), "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD");
+    }
+
+    #[test]
+    fn commands_return_stdout_or_a_named_error() {
+        let ok = run_command(Command::new("cmd").args(["/C", "echo hello"]), "echo").unwrap();
+        assert_eq!(ok.trim(), "hello");
+        let err = run_command(Command::new("cmd").args(["/C", "echo broken 1>&2 & exit 3"]), "the tool").unwrap_err();
+        assert_eq!(err, "the tool failed: broken");
+        assert!(run_command(&mut Command::new("mula-no-such-program"), "x").unwrap_err().starts_with("Failed to run x"));
+    }
+
+    #[test]
+    fn poisoned_locks_are_recovered() {
+        let m = std::sync::Arc::new(Mutex::new(1));
+        let poisoner = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        *lock(&m) += 1;
+        assert_eq!(*lock(&m), 2);
     }
 
     #[test]

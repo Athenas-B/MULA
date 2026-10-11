@@ -144,20 +144,20 @@ fn now_nanos() -> u128 {
 }
 
 /// Quotes a value as a PowerShell single-quoted string literal (never interpolated).
-pub fn ps_quote(value: &str) -> String {
+fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Builds a script from `template`, defining each `(name, value)` as a PowerShell variable
 /// ahead of it. Values are single-quoted literals, so they can never run as code.
-pub fn ps_script(template: &str, vars: &[(&str, &str)]) -> String {
+fn ps_script(template: &str, vars: &[(&str, &str)]) -> String {
     let mut script: String = vars.iter().map(|(name, value)| format!("${name} = {}\n", ps_quote(value))).collect();
     script.push_str(template);
     script
 }
 
 /// Encodes a script for `powershell -EncodedCommand` (base64 of UTF-16LE).
-pub fn encode_ps(script: &str) -> String {
+fn encode_ps(script: &str) -> String {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     base64::engine::general_purpose::STANDARD.encode(utf16)
 }
@@ -294,9 +294,8 @@ fn send_command(helper: &ElevatedHelper, args: &[&str], exit: bool, timeout: Dur
         exit,
     };
     let json = serde_json::to_string(&cmd).map_err(|e| format!("Failed to serialize helper command: {e}"))?;
-    let tmp_file = cmd_file.with_extension("tmp");
-    std::fs::write(&tmp_file, json).map_err(|e| format!("Failed to write helper command file: {e}"))?;
-    std::fs::rename(&tmp_file, &cmd_file).map_err(|e| format!("Failed to rename helper command file: {e}"))?;
+    // Written atomically: the helper must never pick up a half-written command.
+    crate::util::write_atomic(&cmd_file, &json)?;
 
     let start = Instant::now();
     while !res_file.exists() {
@@ -312,28 +311,30 @@ fn send_command(helper: &ElevatedHelper, args: &[&str], exit: bool, timeout: Dur
     serde_json::from_slice(&bytes).map_err(|e| format!("Failed to parse helper response: {e}"))
 }
 
-pub fn stop_helper() {
-    let helper = match ELEVATED_HELPER.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(_) => return,
-    };
-
+/// Forgets a helper and removes its command directory.
+fn discard(helper: Option<ElevatedHelper>) {
     if let Some(h) = helper {
-        let _ = send_command(&h, &[], true, Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&h.cmd_dir);
     }
 }
 
-fn run_smartctl_with_helper(exe: &Path, args: &[&str], elevate: bool) -> Result<String, CommandError> {
-    let mut guard = ELEVATED_HELPER.lock().map_err(|_| "Elevated helper lock poisoned")?;
+pub fn stop_helper() {
+    let helper = crate::util::lock(&ELEVATED_HELPER).take();
+    if let Some(h) = &helper {
+        let _ = send_command(h, &[], true, Duration::from_secs(5));
+    }
+    discard(helper);
+}
+
+/// Runs smartctl with administrator rights through the long-lived helper.
+pub fn run_smartctl_elevated(exe: &Path, args: &[&str]) -> Result<String, CommandError> {
+    let mut guard = crate::util::lock(&ELEVATED_HELPER);
 
     // A helper is bound to one executable; restart it if smartctl moved, or if it died.
     let reusable = guard.as_ref().is_some_and(|h| h.exe == exe && h.cmd_dir.join("ready").exists());
     if !reusable {
-        if let Some(old) = guard.take() {
-            let _ = std::fs::remove_dir_all(&old.cmd_dir);
-        }
-        *guard = Some(start_helper(exe, elevate).inspect_err(|e| log::error!("Failed to start elevated helper: {e}"))?);
+        discard(guard.take());
+        *guard = Some(start_helper(exe, true).inspect_err(|e| log::error!("Failed to start elevated helper: {e}"))?);
     }
 
     let helper = guard.as_ref().unwrap();
@@ -341,9 +342,7 @@ fn run_smartctl_with_helper(exe: &Path, args: &[&str], elevate: bool) -> Result<
         Ok(r) => r,
         Err(e) => {
             // Most likely the helper exited; drop it so the next call starts a fresh one.
-            if let Some(old) = guard.take() {
-                let _ = std::fs::remove_dir_all(&old.cmd_dir);
-            }
+            discard(guard.take());
             return Err(e.into());
         }
     };
@@ -355,11 +354,6 @@ fn run_smartctl_with_helper(exe: &Path, args: &[&str], elevate: bool) -> Result<
         return Err("command returned no output".into());
     }
     Ok(response.output)
-}
-
-/// Runs smartctl with administrator rights through the long-lived helper.
-pub fn run_smartctl_elevated(exe: &Path, args: &[&str]) -> Result<String, CommandError> {
-    run_smartctl_with_helper(exe, args, true)
 }
 
 /// Runs `template` once in its own elevated PowerShell (one UAC prompt), waiting for it to

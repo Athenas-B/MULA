@@ -8,8 +8,10 @@ Usage:
     python build.py          # Build both
     python build.py chrome   # Chrome only
     python build.py firefox  # Firefox only
+    python build.py chrome --server-url http://127.0.0.1:9000   # bake in another server URL
 """
 
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -19,7 +21,19 @@ SRC = HERE / "src"
 DIST = HERE / "dist"
 
 
-def build(browser: str):
+DEFAULT_SERVER_LINE = re.compile(r"^const VSD_DEFAULT_SERVER = '[^']*';$", re.MULTILINE)
+
+
+def set_default_server(config_js: Path, server_url: str):
+    """Point the built extension's default server at `server_url` (MULA's configured port)."""
+    text = config_js.read_text(encoding="utf-8")
+    updated, count = DEFAULT_SERVER_LINE.subn(f"const VSD_DEFAULT_SERVER = '{server_url}';", text)
+    if count != 1:
+        raise ValueError(f"VSD_DEFAULT_SERVER not found in {config_js}")
+    config_js.write_text(updated, encoding="utf-8")
+
+
+def build(browser: str, server_url: str | None = None):
     manifest_dir = HERE / browser
     if not manifest_dir.exists():
         print(f"Error: {manifest_dir} not found")
@@ -40,14 +54,26 @@ def build(browser: str):
     # Copy browser-specific manifest (overrides any in src/)
     shutil.copy2(manifest_dir / "manifest.json", out / "manifest.json")
 
+    if server_url:
+        set_default_server(out / "config.js", server_url)
+
     print(f"Built: {out}")
     return True
 
 
 def main():
-    targets = sys.argv[1:] or ["chrome", "firefox"]
+    args = sys.argv[1:]
+    server_url = None
+    if "--server-url" in args:
+        i = args.index("--server-url")
+        if i + 1 >= len(args):
+            print("Error: --server-url needs a value")
+            sys.exit(1)
+        server_url = args[i + 1]
+        del args[i:i + 2]
+    targets = args or ["chrome", "firefox"]
     for target in targets:
-        if not build(target):
+        if not build(target, server_url):
             sys.exit(1)
     print("\nDone! Load extensions from:")
     for target in targets:

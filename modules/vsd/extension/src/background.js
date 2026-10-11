@@ -312,7 +312,10 @@ function handleRequest(details) {
   }
 }
 
-chrome.webRequest.onBeforeRequest.addListener(handleRequest, { urls: ['<all_urls>'] }, []);
+// Only playlist requests wake the background; the handlers still check isM3u8() exactly.
+const PLAYLIST_FILTER = { urls: ['*://*/*.m3u*', '*://*/*.M3U*'] };
+
+chrome.webRequest.onBeforeRequest.addListener(handleRequest, PLAYLIST_FILTER, []);
 
 const headerExtraInfo = typeof browser !== 'undefined' ? ['requestHeaders'] : ['requestHeaders', 'extraHeaders'];
 
@@ -328,14 +331,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
         h[name] = value;
       }
     });
-    if (Object.keys(h).length) {
-      capturedHeaders.set(details.url, h);
-      if (capturedHeaders.size > MAX_CAPTURED_HEADERS) {
-        capturedHeaders.delete(capturedHeaders.keys().next().value);
-      }
-    }
+    if (Object.keys(h).length) setBounded(capturedHeaders, details.url, h, MAX_CAPTURED_HEADERS);
   },
-  { urls: ['<all_urls>'] },
+  PLAYLIST_FILTER,
   headerExtraInfo
 );
 

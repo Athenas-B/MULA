@@ -112,6 +112,25 @@ class BuildTests(unittest.TestCase):
         self._build("chrome")
         self.assertTrue(marker.exists())
 
+    def test_server_url_is_baked_into_config_js(self):
+        (self.src / "config.js").write_text(
+            "const VSD_DEFAULT_SERVER = 'http://127.0.0.1:8765';\nconst OTHER = 1;\n", encoding="utf-8"
+        )
+        with mock.patch("builtins.print"):
+            self.assertTrue(build.build("chrome", "http://127.0.0.1:9000"))
+        built = (self.dist / "chrome" / "config.js").read_text(encoding="utf-8")
+        self.assertIn("const VSD_DEFAULT_SERVER = 'http://127.0.0.1:9000';", built)
+        self.assertIn("const OTHER = 1;", built)
+        # The source stays untouched.
+        self.assertIn("8765", (self.src / "config.js").read_text(encoding="utf-8"))
+
+    def test_main_passes_the_server_url(self):
+        with mock.patch.object(build, "build", return_value=True) as fake, \
+                mock.patch.object(sys, "argv", ["build.py", "firefox", "--server-url", "http://x:1"]), \
+                mock.patch("builtins.print"):
+            build.main()
+        fake.assert_called_once_with("firefox", "http://x:1")
+
     def test_unknown_browser_returns_false(self):
         ok, output = self._build("safari")
         self.assertFalse(ok)

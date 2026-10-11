@@ -171,35 +171,6 @@ class IsHttpUrlTests(unittest.TestCase):
                 self.assertFalse(server._is_http_url(url))
 
 
-class ResolveUrlTests(unittest.TestCase):
-    def test_absolute_urls_untouched(self):
-        self.assertEqual(
-            server._resolve_url("https://a.com/v/index.m3u8", "https://cdn.b.com/s1.ts"),
-            "https://cdn.b.com/s1.ts",
-        )
-        self.assertEqual(
-            server._resolve_url("https://a.com/v/index.m3u8", "http://c.com/s1.ts"),
-            "http://c.com/s1.ts",
-        )
-
-    def test_relative_segment(self):
-        self.assertEqual(
-            server._resolve_url("https://a.com/v/720/index.m3u8", "seg1.ts"),
-            "https://a.com/v/720/seg1.ts",
-        )
-
-    def test_root_relative_and_parent(self):
-        base = "https://a.com/v/720/index.m3u8?token=abc"
-        self.assertEqual(server._resolve_url(base, "/s/seg1.ts"), "https://a.com/s/seg1.ts")
-        self.assertEqual(server._resolve_url(base, "../seg1.ts"), "https://a.com/v/seg1.ts")
-
-    def test_protocol_relative(self):
-        self.assertEqual(
-            server._resolve_url("https://a.com/v/index.m3u8", "//cdn.a.com/seg.ts"),
-            "https://cdn.a.com/seg.ts",
-        )
-
-
 class ExtractResolutionTests(unittest.TestCase):
     def test_from_playlist_url(self):
         self.assertEqual(server._extract_resolution("https://a.com/hls/720p/index.m3u8", []), "720P")
@@ -1434,7 +1405,7 @@ class DownloadEndpointTests(_ClientMixin, unittest.TestCase):
         self.assertEqual(
             kwargs["args"],
             (job_id, body["url"], "Hello", {"Referer": "https://a.com/"},
-             {"title": "Hello", "pageUrl": "https://a.com/watch", "channel": "Chan"}),
+             {"pageUrl": "https://a.com/watch", "channel": "Chan"}),
         )
         self.thread_cls.return_value.start.assert_called_once_with()
         self.assertEqual(server._jobs[job_id]["status"], "running")
