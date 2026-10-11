@@ -5,27 +5,37 @@
 
 use crate::util;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
+/// The running server. Only held briefly: never across pip or other slow work.
 static PROCESS: Mutex<Option<Child>> = Mutex::new(None);
-static LOG_BACKLOG: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// Set while a start is in progress (installing dependencies can take a while).
+static STARTING: AtomicBool = AtomicBool::new(false);
+/// Whether the current server run printed an import error (a broken Python environment).
+static SAW_IMPORT_ERROR: AtomicBool = AtomicBool::new(false);
+static LOG_BACKLOG: Mutex<VecDeque<LogLine>> = Mutex::new(VecDeque::new());
+static LOG_SEQ: AtomicU64 = AtomicU64::new(0);
 const LOG_BACKLOG_LINES: usize = 1000;
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Authorizes MULA's configuration changes on the running server (`X-VSD-Admin-Token`);
 /// a new secret for every launch of MULA.
-static ADMIN_TOKEN: LazyLock<String> = LazyLock::new(|| {
-    use rand::Rng;
-    let bytes: [u8; 32] = rand::thread_rng().gen();
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-});
+static ADMIN_TOKEN: LazyLock<String> = LazyLock::new(|| util::random_hex(32));
+
+/// One line of server output. `seq` increases with every line, so the UI can merge the backlog
+/// with live `vsd-log` events without showing a line twice.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogLine {
+    pub seq: u64,
+    pub text: String,
+}
 
 // ── Configuration (`vsd.json`) ──────────────────────────────────────────────
 
@@ -59,14 +69,14 @@ fn config_path() -> Option<PathBuf> {
     util::mula_config_dir().map(|dir| dir.join("vsd.json"))
 }
 
-fn load_config() -> VsdConfig {
-    config_path().map(|path| util::read_json_or_default(&path)).unwrap_or_default()
+fn load_config() -> Result<VsdConfig, String> {
+    util::read_json_or_default(&config_path().ok_or("Could not determine config directory")?)
 }
 
 fn update_config(f: impl FnOnce(&mut VsdConfig)) -> Result<VsdConfig, String> {
     let _guard = CONFIG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = config_path().ok_or("Could not determine config directory")?;
-    let mut config: VsdConfig = util::read_json_or_default(&path);
+    let mut config: VsdConfig = util::read_json_or_default(&path)?;
     f(&mut config);
     util::write_json(&path, &config)?;
     Ok(config)
@@ -108,14 +118,21 @@ fn python_command(dir: &Path) -> PathBuf {
 fn emit_line(app: &AppHandle, line: impl Into<String>) {
     let line = line.into();
     log::info!("[VSD] {line}");
-    let line = format!("{line}\n");
+    if is_import_error(&line) {
+        SAW_IMPORT_ERROR.store(true, Ordering::SeqCst);
+    }
+    let entry = LogLine { seq: LOG_SEQ.fetch_add(1, Ordering::SeqCst) + 1, text: format!("{line}\n") };
     if let Ok(mut backlog) = LOG_BACKLOG.lock() {
-        backlog.push_back(line.clone());
+        backlog.push_back(entry.clone());
         while backlog.len() > LOG_BACKLOG_LINES {
             backlog.pop_front();
         }
     }
-    let _ = app.emit("vsd-log", line);
+    let _ = app.emit("vsd-log", entry);
+}
+
+fn is_import_error(line: &str) -> bool {
+    line.contains("ModuleNotFoundError") || line.contains("ImportError")
 }
 
 fn emit_state(app: &AppHandle, running: bool) {
@@ -158,8 +175,10 @@ fn wait_for_exit(app: &AppHandle) {
             None => std::thread::sleep(Duration::from_millis(200)),
             Some(code) => {
                 if code != Some(0) {
-                    // Most likely a broken Python environment: reinstall dependencies next time.
-                    forget_installed_requirements();
+                    if SAW_IMPORT_ERROR.load(Ordering::SeqCst) {
+                        // A missing module: reinstall dependencies on the next start.
+                        forget_installed_requirements();
+                    }
                     emit_line(app, format!("[Server exited with code {}]", code.map_or("?".into(), |c| c.to_string())));
                 } else {
                     emit_line(app, "[Server stopped]");
@@ -185,16 +204,15 @@ fn forget_installed_requirements() {
 
 /// Identifies "these requirements installed into this interpreter".
 fn requirements_fingerprint(python: &Path, requirements: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(python.to_string_lossy().as_bytes());
-    hasher.update([0]);
-    hasher.update(requirements);
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    let mut identity = python.to_string_lossy().as_bytes().to_vec();
+    identity.push(0);
+    identity.extend_from_slice(requirements);
+    util::sha256_hex(&identity)
 }
 
 /// Runs pip only when the interpreter or `requirements.txt` changed since the last successful
 /// install (pip takes seconds even when nothing is missing). A server that exits with an error
-/// clears the record, so a broken environment is repaired on the next start.
+/// with an import error clears the record, so a broken environment is repaired on the next start.
 fn ensure_requirements(app: &AppHandle, python: &Path, working_dir: &Path) -> Result<(), String> {
     let requirements = working_dir.join("requirements.txt");
     let Ok(contents) = std::fs::read(&requirements) else {
@@ -234,17 +252,24 @@ fn ensure_requirements(app: &AppHandle, python: &Path, working_dir: &Path) -> Re
 // ── Process lifecycle ────────────────────────────────────────────────────────
 
 fn start(app: &AppHandle) -> Result<(), String> {
-    let mut guard = PROCESS.lock().map_err(|e| e.to_string())?;
-    if guard.is_some() {
+    if is_running() || STARTING.swap(true, Ordering::SeqCst) {
         return Err("VSD Server is already running".to_string());
     }
+    let result = spawn_server(app);
+    STARTING.store(false, Ordering::SeqCst);
+    result
+}
 
+/// Installs dependencies if needed and launches the server. The process lock is only taken to
+/// store the child, so status checks never wait for pip.
+fn spawn_server(app: &AppHandle) -> Result<(), String> {
     let script = server_script().ok_or("Could not find VSD server.py")?;
     let working_dir = script.parent().ok_or("Invalid server path")?.to_path_buf();
     let python = python_command(&working_dir);
     ensure_requirements(app, &python, &working_dir)?;
 
-    let config = load_config();
+    let config = load_config()?;
+    SAW_IMPORT_ERROR.store(false, Ordering::SeqCst);
     let mut child = Command::new(&python)
         .arg(&script)
         .current_dir(&working_dir)
@@ -256,14 +281,16 @@ fn start(app: &AppHandle) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to start VSD server: {e}"))?;
 
-    if let Some(stdout) = child.stdout.take() {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Store the child before the readers start, so a server that exits at once is noticed.
+    *PROCESS.lock().map_err(|e| e.to_string())? = Some(child);
+    if let Some(stdout) = stdout {
         spawn_reader(app.clone(), stdout, true);
     }
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = stderr {
         spawn_reader(app.clone(), stderr, false);
     }
-    *guard = Some(child);
-    drop(guard);
 
     emit_state(app, true);
     Ok(())
@@ -296,8 +323,13 @@ fn is_running() -> bool {
 
 /// Starts the server at launch when the user enabled "start automatically".
 pub fn autostart(app: AppHandle) {
-    if !load_config().autostart {
-        return;
+    match load_config() {
+        Ok(config) if config.autostart => {}
+        Ok(_) => return,
+        Err(e) => {
+            log::error!("Could not read the VSD settings: {e}");
+            return;
+        }
     }
     std::thread::spawn(move || {
         emit_line(&app, "[Autostart: starting server...]");
@@ -340,42 +372,43 @@ pub async fn vsd_stop(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn vsd_is_running() -> bool {
-    is_running()
+pub async fn vsd_is_running() -> Result<bool, String> {
+    util::blocking(|| Ok(is_running())).await
 }
 
 /// Recent server output (the UI receives new lines as `vsd-log` events).
 #[tauri::command]
-pub fn vsd_get_logs() -> Vec<String> {
+pub fn vsd_get_logs() -> Vec<LogLine> {
     LOG_BACKLOG.lock().map(|backlog| backlog.iter().cloned().collect()).unwrap_or_default()
 }
 
 #[tauri::command]
-pub fn vsd_get_download_dir() -> String {
-    load_config().download_dir
+pub async fn vsd_get_download_dir() -> Result<String, String> {
+    util::blocking(|| Ok(load_config()?.download_dir)).await
 }
 
 #[tauri::command]
-pub fn vsd_set_download_dir(path: String) -> Result<(), String> {
-    let config = update_config(|c| c.download_dir = path.clone())?;
-    if is_running() {
-        std::thread::spawn(move || {
+pub async fn vsd_set_download_dir(path: String) -> Result<(), String> {
+    util::blocking(move || {
+        let config = update_config(|c| c.download_dir = path.clone())?;
+        if is_running() {
             if let Err(e) = notify_download_dir(config.port, &path) {
                 log::error!("Failed to update the running server's download dir: {e}");
             }
-        });
-    }
-    Ok(())
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn vsd_get_autostart() -> bool {
-    load_config().autostart
+pub async fn vsd_get_autostart() -> Result<bool, String> {
+    util::blocking(|| Ok(load_config()?.autostart)).await
 }
 
 #[tauri::command]
-pub fn vsd_set_autostart(enabled: bool) -> Result<(), String> {
-    update_config(|c| c.autostart = enabled).map(|_| ())
+pub async fn vsd_set_autostart(enabled: bool) -> Result<(), String> {
+    util::blocking(move || update_config(|c| c.autostart = enabled).map(|_| ())).await
 }
 
 /// Builds the browser extension and returns its folder (the UI reveals it).
@@ -429,10 +462,10 @@ mod tests {
         let path = dir.join("vsd.json");
         let config = VsdConfig { download_dir: r"D:\Videos".into(), autostart: true, port: 9000 };
         util::write_json(&path, &config).unwrap();
-        assert_eq!(util::read_json_or_default::<VsdConfig>(&path), config);
+        assert_eq!(util::read_json_or_default::<VsdConfig>(&path).unwrap(), config);
         // A partial file keeps the defaults for what's missing.
         std::fs::write(&path, r#"{"autostart": true}"#).unwrap();
-        let partial: VsdConfig = util::read_json_or_default(&path);
+        let partial: VsdConfig = util::read_json_or_default(&path).unwrap();
         assert!(partial.autostart);
         assert_eq!(partial.port, 8765);
     }
@@ -460,6 +493,13 @@ mod tests {
         assert_ne!(a, requirements_fingerprint(Path::new("C:/venv/python.exe"), b"flask>=3\n"));
         assert_ne!(a, requirements_fingerprint(Path::new("python"), b"flask>=3\nrequests\n"));
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn only_import_errors_mark_the_environment_as_broken() {
+        assert!(is_import_error("ModuleNotFoundError: No module named 'flask'"));
+        assert!(is_import_error("ImportError: cannot import name 'CORS'"));
+        assert!(!is_import_error("OSError: [WinError 10048] Only one usage of each socket address"));
     }
 
     #[test]

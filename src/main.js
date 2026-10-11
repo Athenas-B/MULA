@@ -129,6 +129,9 @@ async function openConfigDir(e) {
 
 // ── VSD Server ──
 let vsdRunning = false;
+// Highest server log line shown, and live lines that arrive before the backlog is loaded.
+let vsdLogSeq = 0;
+let vsdLogPending = [];
 
 async function initVsd() {
   const toggleBtn = document.getElementById("vsd-toggle");
@@ -139,7 +142,7 @@ async function initVsd() {
   document.getElementById("vsd-autostart").addEventListener("change", toggleAutostart);
 
   // The backend pushes server output and running/stopped changes (it also handles autostart).
-  listen("vsd-log", (event) => appendLog(event.payload));
+  listen("vsd-log", (event) => onVsdLogLine(event.payload));
   listen("vsd-state-changed", (event) => updateVsdUi(event.payload));
 
   checkVsdStatus();
@@ -156,13 +159,29 @@ async function loadAutostart() {
   }
 }
 
-/** Shows output the server produced before this window loaded. */
+function onVsdLogLine(line) {
+  if (vsdLogPending) vsdLogPending.push(line);
+  else showVsdLogLines([line]);
+}
+
+/** Appends lines not shown yet (each line has an increasing `seq`). */
+function showVsdLogLines(lines) {
+  const fresh = lines.filter((line) => line.seq > vsdLogSeq);
+  if (fresh.length === 0) return;
+  vsdLogSeq = fresh[fresh.length - 1].seq;
+  appendLog(fresh.map((line) => line.text).join(""));
+}
+
+/** Shows output the server produced before this window loaded, then the live lines. */
 async function loadVsdLogBacklog() {
   try {
-    const lines = await invoke("vsd_get_logs");
-    if (lines?.length) appendLog(lines.join(""));
+    showVsdLogLines((await invoke("vsd_get_logs")) || []);
   } catch (e) {
     console.error("Failed to load VSD log:", e);
+  } finally {
+    const pending = vsdLogPending || [];
+    vsdLogPending = null;
+    showVsdLogLines(pending);
   }
 }
 
@@ -926,14 +945,32 @@ let wcSettings = null;
 let wcSelectedSourceIndex = -1;
 let wcPendingPatch = {};
 let wcPatchTimer = null;
+// Revision of the settings shown; older responses and events are ignored.
+let wcRevision = -1;
 
-const WC_FORM_FIELDS = [
-  "wc-interval", "wc-max-level", "wc-wallhaven-api-key", "wc-rotation", "wc-scaling", "wc-bg-color",
-  "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor",
-  "wc-fade-enabled", "wc-fade-duration", "wc-fade-steps",
-  "wc-overlay-enabled", "wc-overlay-mode", "wc-overlay-font-size", "wc-overlay-color",
-  "wc-overlay-offset-x", "wc-overlay-offset-y", "wc-overlay-backdrop",
-];
+// Form field id → [setting, how to read it]. A change sends only that field's setting.
+const WC_FORM_FIELDS = {
+  "wc-interval": ["interval_minutes", "int"],
+  "wc-max-level": ["maximum_source_level", "int"],
+  "wc-wallhaven-api-key": ["wallhaven_api_key", "text"],
+  "wc-rotation": ["rotation_mode", "text"],
+  "wc-scaling": ["scaling_mode", "text"],
+  "wc-bg-color": ["background_color_argb", "color"],
+  "wc-separate-queues": ["use_separate_monitor_queues", "checked"],
+  "wc-unique-queues": ["keep_image_in_single_monitor_queue", "checked"],
+  "wc-stop-slideshow": ["disable_windows_slideshow_when_running", "checked"],
+  "wc-one-monitor": ["change_one_monitor_per_interval", "checked"],
+  "wc-fade-enabled": ["enable_wallpaper_fade_transition", "checked"],
+  "wc-fade-duration": ["wallpaper_fade_duration_ms", "int"],
+  "wc-fade-steps": ["wallpaper_fade_steps", "int"],
+  "wc-overlay-enabled": ["show_picture_name_overlay", "checked"],
+  "wc-overlay-mode": ["picture_name_overlay_text_mode", "text"],
+  "wc-overlay-font-size": ["picture_name_overlay_font_size", "int"],
+  "wc-overlay-color": ["picture_name_overlay_text_color_argb", "color"],
+  "wc-overlay-offset-x": ["picture_name_overlay_offset_x", "int"],
+  "wc-overlay-offset-y": ["picture_name_overlay_offset_y", "int"],
+  "wc-overlay-backdrop": ["picture_name_overlay_use_backdrop", "checked"],
+};
 
 async function initWallchanger() {
   document.getElementById("wc-toggle")?.addEventListener("click", wcToggleService);
@@ -945,9 +982,11 @@ async function initWallchanger() {
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
 
-  for (const id of WC_FORM_FIELDS) {
+  for (const id of Object.keys(WC_FORM_FIELDS)) {
     document.getElementById(id)?.addEventListener("change", () => {
-      wcQueuePatch(wcReadForm());
+      const patch = wcFieldPatch(id);
+      if (patch) wcQueuePatch(patch);
+      else wcRenderSettings(); // e.g. an emptied number field: show the current value again
       wcUpdateBgColorVisibility();
       wcUpdateOverlayVisibility();
     });
@@ -967,8 +1006,11 @@ async function wcLoadSettings() {
   }
 }
 
-/** Adopts settings from the backend, keeping local edits that haven't been sent yet. */
-function wcApplySettings(settings) {
+/** Adopts `{ revision, settings }` from the backend unless it is older than what is shown,
+ *  keeping local edits that haven't been sent yet. */
+function wcApplySettings({ revision, settings }) {
+  if (revision < wcRevision) return;
+  wcRevision = revision;
   const next = { ...settings, ...wcPendingPatch };
   const changed = JSON.stringify(next) !== JSON.stringify(wcSettings);
   wcSettings = next;
@@ -1001,38 +1043,23 @@ async function wcFlushPatch() {
   }
 }
 
-/** The form's values as a settings patch (the backend clamps and validates them). */
-function wcReadForm() {
-  const el = (id) => document.getElementById(id);
-  const patch = {
-    wallhaven_api_key: el("wc-wallhaven-api-key").value || "",
-    rotation_mode: el("wc-rotation").value,
-    scaling_mode: el("wc-scaling").value,
-    background_color_argb: wcHexToArgb(el("wc-bg-color").value),
-    use_separate_monitor_queues: el("wc-separate-queues").checked,
-    keep_image_in_single_monitor_queue: el("wc-unique-queues").checked,
-    disable_windows_slideshow_when_running: el("wc-stop-slideshow").checked,
-    change_one_monitor_per_interval: el("wc-one-monitor").checked,
-    show_picture_name_overlay: el("wc-overlay-enabled").checked,
-    picture_name_overlay_text_mode: el("wc-overlay-mode").value,
-    picture_name_overlay_text_color_argb: wcHexToArgb(el("wc-overlay-color").value),
-    picture_name_overlay_use_backdrop: el("wc-overlay-backdrop").checked,
-    enable_wallpaper_fade_transition: el("wc-fade-enabled").checked,
-  };
-  const numbers = {
-    interval_minutes: "wc-interval",
-    maximum_source_level: "wc-max-level",
-    picture_name_overlay_font_size: "wc-overlay-font-size",
-    picture_name_overlay_offset_x: "wc-overlay-offset-x",
-    picture_name_overlay_offset_y: "wc-overlay-offset-y",
-    wallpaper_fade_duration_ms: "wc-fade-duration",
-    wallpaper_fade_steps: "wc-fade-steps",
-  };
-  for (const [key, id] of Object.entries(numbers)) {
-    const n = parseInt(el(id).value, 10);
-    if (Number.isFinite(n)) patch[key] = n;
+/** The patch for one changed form field (the backend clamps and validates it), or null when the
+ *  value isn't usable, e.g. an empty number field. */
+function wcFieldPatch(id) {
+  const [key, kind] = WC_FORM_FIELDS[id];
+  const el = document.getElementById(id);
+  switch (kind) {
+    case "checked":
+      return { [key]: el.checked };
+    case "color":
+      return { [key]: wcHexToArgb(el.value) };
+    case "int": {
+      const n = parseInt(el.value, 10);
+      return Number.isFinite(n) ? { [key]: n } : null;
+    }
+    default:
+      return { [key]: el.value || "" };
   }
-  return patch;
 }
 
 function wcArgbToHex(argb) {

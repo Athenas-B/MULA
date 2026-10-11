@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::util::{read_json_or_default, write_json};
@@ -256,6 +257,16 @@ fn default_fade_steps() -> i32 { 12 }
 
 /// Serializes read-modify-write cycles on `settings.json`.
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+/// Bumped on every settings write, so the UI can ignore responses and events that are older
+/// than what it already shows.
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Settings together with the revision they belong to.
+#[derive(Debug, Clone, Serialize)]
+pub struct Versioned {
+    pub revision: u64,
+    pub settings: Settings,
+}
 /// Serializes read-modify-write cycles on `state.json`.
 static STATE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -278,27 +289,37 @@ fn state_path() -> Result<PathBuf, String> {
 }
 
 pub fn load() -> Result<Settings, String> {
-    let mut settings: Settings = read_json_or_default(&settings_path()?);
+    let mut settings: Settings = read_json_or_default(&settings_path()?)?;
     normalize(&mut settings);
     Ok(settings)
 }
 
+/// The current settings and their revision.
+pub fn load_versioned() -> Result<Versioned, String> {
+    let _guard = lock(&CONFIG_LOCK);
+    Ok(Versioned { revision: REVISION.load(Ordering::SeqCst), settings: load()? })
+}
+
+/// Saves `settings` (with the config lock held) and returns them with a new revision.
+fn save_versioned(settings: Settings) -> Result<Versioned, String> {
+    write_json(&settings_path()?, &settings)?;
+    Ok(Versioned { revision: REVISION.fetch_add(1, Ordering::SeqCst) + 1, settings })
+}
+
 /// Loads the settings, lets `f` change them, normalizes and saves, without racing other writers.
-pub fn update(f: impl FnOnce(&mut Settings)) -> Result<Settings, String> {
+pub fn update(f: impl FnOnce(&mut Settings)) -> Result<Versioned, String> {
     let _guard = lock(&CONFIG_LOCK);
     let mut settings = load()?;
     f(&mut settings);
     normalize(&mut settings);
-    write_json(&settings_path()?, &settings)?;
-    Ok(settings)
+    save_versioned(settings)
 }
 
 /// Applies a partial update: each top-level key of `patch` replaces that setting.
-pub fn update_with_patch(patch: serde_json::Value) -> Result<Settings, String> {
+pub fn update_with_patch(patch: serde_json::Value) -> Result<Versioned, String> {
     let _guard = lock(&CONFIG_LOCK);
     let next = apply_patch(&load()?, patch)?;
-    write_json(&settings_path()?, &next)?;
-    Ok(next)
+    save_versioned(next)
 }
 
 fn apply_patch(settings: &Settings, patch: serde_json::Value) -> Result<Settings, String> {
@@ -319,14 +340,14 @@ fn apply_patch(settings: &Settings, patch: serde_json::Value) -> Result<Settings
 }
 
 pub fn load_state() -> Result<RuntimeState, String> {
-    Ok(read_json_or_default(&state_path()?))
+    read_json_or_default(&state_path()?)
 }
 
 /// Saves the state a wallpaper change produced. The service on/off flag belongs to
 /// [`set_service_running`], so the flag currently on disk wins over the one in `state`.
 pub fn save_state(state: &mut RuntimeState) -> Result<(), String> {
     let _guard = lock(&STATE_LOCK);
-    state.change_service_running = service_running();
+    state.change_service_running = read_service_flag()?;
     write_json(&state_path()?, state)
 }
 
@@ -337,18 +358,25 @@ struct ServiceFlag {
     change_service_running: bool,
 }
 
+/// The service flag on disk; a missing file means "off", other read errors are errors.
+fn read_service_flag() -> Result<bool, String> {
+    let path = state_path()?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+    };
+    Ok(serde_json::from_str::<ServiceFlag>(&text).is_ok_and(|flag| flag.change_service_running))
+}
+
 pub fn service_running() -> bool {
-    state_path()
-        .ok()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<ServiceFlag>(&text).ok())
-        .is_some_and(|flag| flag.change_service_running)
+    read_service_flag().unwrap_or(false)
 }
 
 pub fn set_service_running(running: bool) -> Result<(), String> {
     let _guard = lock(&STATE_LOCK);
     let path = state_path()?;
-    let mut state: RuntimeState = read_json_or_default(&path);
+    let mut state: RuntimeState = read_json_or_default(&path)?;
     state.change_service_running = running;
     write_json(&path, &state)
 }

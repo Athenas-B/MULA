@@ -492,12 +492,25 @@ describe("VSD server panel", () => {
     assert.equal(m.calls("vsd_start").length, 0);
   });
 
-  it("shows output the server produced before the window loaded", async () => {
-    const m = loadMain({ invoke: (cmd) => (cmd === "vsd_get_logs" ? ["[Dependencies OK]\n", "Serving on 8765\n"] : undefined) });
+  it("shows the backlog, then live lines, without duplicates or gaps", async () => {
+    let resolveBacklog;
+    const m = loadMain({
+      invoke: (cmd) => (cmd === "vsd_get_logs" ? new Promise((r) => (resolveBacklog = r)) : undefined),
+    });
     const content = m.document.add("vsd-log-content");
     m.document.add("vsd-log");
-    await m.fn.loadVsdLogBacklog();
-    assert.match(content.innerHTML, /\[Dependencies OK\]\nServing on 8765\n/);
+
+    const loading = m.fn.loadVsdLogBacklog();
+    // Live lines arrive while the backlog request is still pending; line 2 is also in the backlog.
+    m.fn.onVsdLogLine({ seq: 2, text: "Serving on 8765\n" });
+    m.fn.onVsdLogLine({ seq: 3, text: "GET /health\n" });
+    resolveBacklog([{ seq: 1, text: "[Dependencies OK]\n" }, { seq: 2, text: "Serving on 8765\n" }]);
+    await loading;
+    m.fn.onVsdLogLine({ seq: 3, text: "GET /health\n" }); // a repeat is ignored
+    m.fn.onVsdLogLine({ seq: 4, text: "POST /download\n" });
+
+    const text = content.innerHTML.replace(/<[^>]+>/g, "");
+    assert.equal(text, "[Dependencies OK]\nServing on 8765\nGET /health\nPOST /download\n");
   });
 
   it("re-checks the real state when starting fails", async () => {
@@ -588,29 +601,16 @@ describe("settings patches", () => {
     for (const id of ["wc-sources", "wc-remove-source", "wc-move-up", "wc-move-down", "wc-message"]) m.document.add(id);
   }
 
-  it("reads the form into a patch without clamping (the backend validates)", () => {
+  const versioned = (revision, settings) => ({ revision, settings });
+
+  it("turns one changed form field into a patch with only that setting", () => {
     const m = loadMain();
-    setupInputs(m, { "wc-interval": "99999", "wc-overlay-offset-x": "abc", "wc-fade-steps": "" });
-    assert.deepEqual(plain(m.fn.wcReadForm()), {
-      wallhaven_api_key: "secret-key",
-      rotation_mode: "Random",
-      scaling_mode: "FitInsideScreen",
-      background_color_argb: -15654349,
-      use_separate_monitor_queues: false,
-      keep_image_in_single_monitor_queue: false,
-      disable_windows_slideshow_when_running: false,
-      change_one_monitor_per_interval: false,
-      show_picture_name_overlay: true,
-      picture_name_overlay_text_mode: "FileName",
-      picture_name_overlay_text_color_argb: -1,
-      picture_name_overlay_use_backdrop: false,
-      enable_wallpaper_fade_transition: true,
-      interval_minutes: 99999,
-      maximum_source_level: 7,
-      picture_name_overlay_font_size: 30,
-      picture_name_overlay_offset_y: -20,
-      wallpaper_fade_duration_ms: 500,
-    });
+    setupInputs(m, { "wc-interval": "99999", "wc-overlay-offset-x": "abc" });
+    assert.deepEqual(plain(m.fn.wcFieldPatch("wc-interval")), { interval_minutes: 99999 }, "no clamping in the UI");
+    assert.deepEqual(plain(m.fn.wcFieldPatch("wc-bg-color")), { background_color_argb: -15654349 });
+    assert.deepEqual(plain(m.fn.wcFieldPatch("wc-overlay-enabled")), { show_picture_name_overlay: true });
+    assert.deepEqual(plain(m.fn.wcFieldPatch("wc-wallhaven-api-key")), { wallhaven_api_key: "secret-key" });
+    assert.equal(m.fn.wcFieldPatch("wc-overlay-offset-x"), null, "an unusable number sends nothing");
   });
 
   it("does nothing while settings are not loaded", () => {
@@ -621,9 +621,12 @@ describe("settings patches", () => {
   });
 
   it("batches edits into one debounced wc_update_settings call and adopts the normalized result", async () => {
-    const m = loadMain({ invoke: (cmd, args) => (cmd === "wc_update_settings" ? { source_folders: [], ...args.patch, interval_minutes: 1440 } : undefined) });
+    const m = loadMain({
+      invoke: (cmd, args) =>
+        cmd === "wc_update_settings" ? versioned(1, { source_folders: [], ...args.patch, interval_minutes: 1440 }) : undefined,
+    });
     setupInputs(m);
-    m.assign("wcSettings", { source_folders: [], interval_minutes: 30, maximum_source_level: 10 });
+    m.fn.wcApplySettings(versioned(0, { source_folders: [], interval_minutes: 30, maximum_source_level: 10 }));
     m.fn.wcQueuePatch({ interval_minutes: 99999 });
     m.fn.wcQueuePatch({ maximum_source_level: 3 });
     assert.deepEqual(m.timers.pending().map((t) => t.ms), [300]);
@@ -641,19 +644,45 @@ describe("settings patches", () => {
   it("keeps unsent edits when settings arrive from the backend", () => {
     const m = loadMain();
     setupInputs(m);
-    m.assign("wcSettings", { source_folders: [], interval_minutes: 30, maximum_source_level: 10 });
+    m.fn.wcApplySettings(versioned(0, { source_folders: [], interval_minutes: 30, maximum_source_level: 10 }));
     m.fn.wcQueuePatch({ interval_minutes: 45 });
     // e.g. the tray changed the max level while the interval edit is still pending
-    m.fn.wcApplySettings({ source_folders: [], interval_minutes: 30, maximum_source_level: 2 });
+    m.fn.wcApplySettings(versioned(1, { source_folders: [], interval_minutes: 30, maximum_source_level: 2 }));
     const s = plain(m.run("wcSettings"));
     assert.equal(s.interval_minutes, 45);
     assert.equal(s.maximum_source_level, 2);
   });
 
-  it("flushes pending edits before changing the wallpaper", async () => {
-    const m = loadMain({ invoke: (cmd, args) => (cmd === "wc_update_settings" ? { source_folders: [], ...args.patch } : "Applied 1 wallpaper(s): a.jpg") });
+  it("a pending edit of one field never sends back other fields (no reverting tray changes)", async () => {
+    const m = loadMain({ invoke: (cmd, args) => (cmd === "wc_update_settings" ? versioned(2, { source_folders: [], ...args.patch }) : undefined) });
     setupInputs(m);
-    m.assign("wcSettings", { source_folders: [], interval_minutes: 30 });
+    m.fn.wcApplySettings(versioned(0, { source_folders: [], interval_minutes: 30, maximum_source_level: 10 }));
+    // The user edits the interval; the change handler queues that field's patch.
+    m.document.getElementById("wc-interval").value = "45";
+    m.fn.wcQueuePatch(m.fn.wcFieldPatch("wc-interval"));
+    m.fn.wcApplySettings(versioned(1, { source_folders: [], interval_minutes: 30, maximum_source_level: 3 }));
+    m.timers.runAll();
+    await flush();
+    const [update] = m.calls("wc_update_settings");
+    assert.deepEqual(plain(update.args.patch), { interval_minutes: 45 });
+  });
+
+  it("ignores responses and events older than the settings shown", () => {
+    const m = loadMain();
+    setupInputs(m);
+    m.fn.wcApplySettings(versioned(5, { source_folders: [], interval_minutes: 30, maximum_source_level: 3 }));
+    m.fn.wcApplySettings(versioned(4, { source_folders: [], interval_minutes: 30, maximum_source_level: 10 }));
+    assert.equal(m.run("wcSettings").maximum_source_level, 3);
+    assert.equal(m.run("wcRevision"), 5);
+  });
+
+  it("flushes pending edits before changing the wallpaper", async () => {
+    const m = loadMain({
+      invoke: (cmd, args) =>
+        cmd === "wc_update_settings" ? versioned(1, { source_folders: [], ...args.patch }) : "Applied 1 wallpaper(s): a.jpg",
+    });
+    setupInputs(m);
+    m.fn.wcApplySettings(versioned(0, { source_folders: [], interval_minutes: 30 }));
     m.fn.wcQueuePatch({ interval_minutes: 5 });
     await m.fn.wcChangeNow();
     assert.deepEqual(m.invokeCalls.map((c) => c.cmd), ["wc_update_settings", "wc_change_now"]);
@@ -664,11 +693,11 @@ describe("settings patches", () => {
     const m = loadMain({
       invoke: (cmd) => {
         if (cmd === "wc_update_settings") throw "Unknown setting: x";
-        if (cmd === "wc_get_settings") return { source_folders: [], interval_minutes: 30 };
+        if (cmd === "wc_get_settings") return versioned(0, { source_folders: [], interval_minutes: 30 });
       },
     });
     setupInputs(m);
-    m.assign("wcSettings", { source_folders: [], interval_minutes: 30 });
+    m.fn.wcApplySettings(versioned(0, { source_folders: [], interval_minutes: 30 }));
     m.fn.wcQueuePatch({ x: 1 });
     await m.fn.wcFlushPatch();
     assert.match(m.document.getElementById("wc-message").textContent, /Unknown setting: x/);

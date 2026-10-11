@@ -92,6 +92,14 @@ fn plan(fresh: bool, network: NetworkPolicy, has_cached_files: bool) -> Plan {
 /// Cache folders with a background refresh in flight.
 static REFRESHING: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
+struct RefreshingGuard(PathBuf);
+
+impl Drop for RefreshingGuard {
+    fn drop(&mut self) {
+        REFRESHING.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
+    }
+}
+
 /// Everything a refresh needs, owned so it can run on another thread.
 #[derive(Clone)]
 struct RefreshJob {
@@ -151,11 +159,12 @@ fn refresh_in_background(job: RefreshJob) {
         }
     }
     std::thread::spawn(move || {
+        // Removes the in-flight mark however the refresh ends, including a panic.
+        let _done = RefreshingGuard(job.cache_dir.clone());
         match refresh(&job) {
             Ok(files) => log::info!("Refreshed Wallhaven source ({} image(s))", files.len()),
             Err(e) => log::warn!("Wallhaven refresh failed; keeping cached images: {}", redact(&e)),
         }
-        REFRESHING.lock().unwrap_or_else(|p| p.into_inner()).remove(&job.cache_dir);
     });
 }
 
@@ -472,6 +481,22 @@ mod helper_tests {
         assert_eq!(plan(false, CacheOnly, false), Plan::UseCache);
         assert_eq!(plan(false, RefreshWhenStale, true), Plan::UseCacheAndRefreshInBackground);
         assert_eq!(plan(false, RefreshWhenStale, false), Plan::RefreshNow);
+    }
+
+    #[test]
+    fn the_refresh_mark_is_cleared_even_when_a_refresh_panics() {
+        let dir = PathBuf::from("mula-test-refresh-guard");
+        REFRESHING.lock().unwrap().insert(dir.clone());
+        let joined = std::thread::spawn({
+            let dir = dir.clone();
+            move || {
+                let _done = RefreshingGuard(dir);
+                panic!("simulated refresh failure");
+            }
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(!REFRESHING.lock().unwrap_or_else(|p| p.into_inner()).contains(&dir));
     }
 
     #[test]

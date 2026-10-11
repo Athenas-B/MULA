@@ -24,7 +24,6 @@
 use crate::error::CommandError;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -144,12 +143,6 @@ fn now_nanos() -> u128 {
         .as_nanos()
 }
 
-fn random_token() -> String {
-    use rand::Rng;
-    let bytes: [u8; 24] = rand::thread_rng().gen();
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Quotes a value as a PowerShell single-quoted string literal (never interpolated).
 pub fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -167,10 +160,6 @@ pub fn ps_script(template: &str, vars: &[(&str, &str)]) -> String {
 pub fn encode_ps(script: &str) -> String {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     base64::engine::general_purpose::STANDARD.encode(utf16)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02X}")).collect()
 }
 
 fn new_private_dir(prefix: &str) -> Result<PathBuf, String> {
@@ -191,7 +180,7 @@ fn write_script_with_stub(dir: &Path, script: &str) -> Result<String, String> {
          if ($h -ne '{hash}') {{ exit 87 }}; \
          & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($b)))",
         path = ps_quote(&script_path.to_string_lossy()),
-        hash = sha256_hex(bytes),
+        hash = crate::util::sha256_hex(bytes),
     ))
 }
 
@@ -265,7 +254,7 @@ fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, CommandErro
     check_exe_is_protected(exe)?;
 
     let cmd_dir = new_private_dir("mula_smartd")?;
-    let token = random_token();
+    let token = crate::util::random_hex(24);
     let script = ps_script(
         HELPER_SCRIPT,
         &[
@@ -517,19 +506,6 @@ mod encoding_tests {
         assert_eq!(encode_ps("ab"), "YQBiAA==");
         let decoded = base64::engine::general_purpose::STANDARD.decode(encode_ps("Ž1")).unwrap();
         assert_eq!(decoded, [0x7D, 0x01, 0x31, 0x00]);
-    }
-
-    #[test]
-    fn hashes_are_uppercase_hex_sha256() {
-        assert_eq!(sha256_hex(b"abc"), "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD");
-    }
-
-    #[test]
-    fn tokens_are_random_hex() {
-        let (a, b) = (random_token(), random_token());
-        assert_eq!(a.len(), 48);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b);
     }
 
     #[test]

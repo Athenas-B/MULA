@@ -33,8 +33,10 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   are moved aside to `*.bak` and defaults are used. All JSON files are written atomically.
 - **Backend-owned settings.** The UI sends partial updates (`wc_update_settings(patch)` → normalized
   `Settings`) and renders from the result or the `wc-settings-changed` event, which every change
-  (UI or tray) emits via `wallchanger::on_settings_changed`. Unknown keys are rejected. The UI
-  keeps not-yet-sent edits when settings arrive (`wcApplySettings`) and does no clamping itself.
+  (UI or tray) emits via `wallchanger::on_settings_changed`. Unknown keys are rejected. Each form
+  change sends only its own setting; responses and events carry a `revision` and older ones are
+  ignored. The UI keeps not-yet-sent edits when settings arrive (`wcApplySettings`) and does no
+  clamping itself. JSON files that can't be read (other than missing) are errors, never defaults.
 - **Threading.** Commands do blocking work through `util::blocking` / `logged_blocking` (sync
   Tauri commands run on the UI thread). `service::apply` is serialized by `APPLY_LOCK`; tray
   actions spawn blocking tasks. The interval worker is a plain thread guarded by a generation
@@ -65,7 +67,8 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   Residual risk: a same-user process can still ask the helper for SMART reads / self-tests.
 - **VSD (`vsd.rs` + `modules/vsd/server.py`).** Config lives in `vsd.json` (`download_dir`,
   `autostart`, `port`). MULA starts the server with `VSD_DOWNLOAD_DIR`, `VSD_PORT` and a
-  per-launch `VSD_ADMIN_TOKEN`; config changes on the running server are sent with the
+  per-launch `VSD_ADMIN_TOKEN`; log lines carry a `seq` so the UI merges backlog and live events;
+  the process lock is never held across pip; config changes on the running server are sent with the
   `X-VSD-Admin-Token` header. Autostart happens in the backend at launch. pip runs only when the
   interpreter or `requirements.txt` changed (fingerprint in `vsd-requirements.sha256`; a server
   that exits with an error clears it). The server rejects non-extension `Origin`s and

@@ -745,7 +745,7 @@ pub fn run() {
                         if let Ok(level) = id.trim_start_matches("max_level_").parse::<i32>() {
                             let result = wallchanger::settings::update(|s| s.maximum_source_level = level);
                             match result {
-                                Ok(settings) => wallchanger::on_settings_changed(app, &settings),
+                                Ok(versioned) => wallchanger::on_settings_changed(app, &versioned),
                                 Err(e) => log::error!("Failed to update max source level: {e}"),
                             }
                         }

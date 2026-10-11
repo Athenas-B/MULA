@@ -30,6 +30,20 @@ pub async fn logged_blocking<T: Send + 'static, E: From<String> + std::fmt::Disp
     result
 }
 
+/// `bytes` random bytes as lowercase hex (for per-session secrets).
+pub fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut buffer = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut buffer);
+    buffer.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SHA-256 of `bytes` as uppercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02X}")).collect()
+}
+
 /// Makes `value` safe as a file-name component: ASCII letters and digits, plus any character
 /// in `keep`, are kept; everything else becomes `_`.
 pub fn safe_file_name(value: &str, keep: &str) -> String {
@@ -48,19 +62,23 @@ pub fn stable_hash(bytes: &[u8]) -> u64 {
 }
 
 /// Reads a JSON file; a missing file yields `T::default()`. A file that can't be parsed (e.g.
-/// from an older format) is moved aside to `<name>.bak` so the app keeps working.
-pub fn read_json_or_default<T: Default + serde::de::DeserializeOwned>(path: &Path) -> T {
-    let Ok(text) = fs::read_to_string(path) else {
-        return T::default();
+/// from an older format) is moved aside to `<name>.bak` so the app keeps working. Any other
+/// read error (e.g. the file is briefly locked by a virus scanner) is returned, so callers that
+/// read-modify-write never save defaults over real data.
+pub fn read_json_or_default<T: Default + serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
     };
     match serde_json::from_str(&text) {
-        Ok(value) => value,
+        Ok(value) => Ok(value),
         Err(e) => {
             let mut backup = path.as_os_str().to_owned();
             backup.push(".bak");
             log::warn!("Unreadable {} ({e}); keeping it as {:?} and starting fresh", path.display(), backup);
             let _ = fs::rename(path, &backup);
-            T::default()
+            Ok(T::default())
         }
     }
 }
@@ -118,14 +136,33 @@ mod tests {
         let dir = TempDir::new("util_json");
         let path = dir.join("settings.json");
         fs::write(&path, "{ not json").unwrap();
-        let value: std::collections::HashMap<String, i32> = read_json_or_default(&path);
+        let value: std::collections::HashMap<String, i32> = read_json_or_default(&path).unwrap();
         assert!(value.is_empty());
         assert!(!path.exists());
         assert_eq!(fs::read_to_string(dir.join("settings.json.bak")).unwrap(), "{ not json");
 
         write_json(&path, &std::collections::HashMap::from([("a", 1)])).unwrap();
-        let back: std::collections::HashMap<String, i32> = read_json_or_default(&path);
+        let back: std::collections::HashMap<String, i32> = read_json_or_default(&path).unwrap();
         assert_eq!(back.get("a"), Some(&1));
+    }
+
+    #[test]
+    fn missing_files_give_defaults_but_other_read_errors_are_errors() {
+        let dir = TempDir::new("util_json_errors");
+        let missing: std::collections::HashMap<String, i32> = read_json_or_default(&dir.join("nope.json")).unwrap();
+        assert!(missing.is_empty());
+        // A directory can't be read as a file: that must not silently become "defaults".
+        assert!(read_json_or_default::<std::collections::HashMap<String, i32>>(dir.path()).is_err());
+        assert!(dir.path().exists(), "nothing is moved aside on read errors");
+    }
+
+    #[test]
+    fn random_hex_and_sha256_hex() {
+        let (a, b) = (random_hex(24), random_hex(24));
+        assert_eq!(a.len(), 48);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert_eq!(sha256_hex(b"abc"), "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD");
     }
 
     #[test]

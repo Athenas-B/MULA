@@ -17,7 +17,6 @@ use std::sync::OnceLock;
 /// The UI lists this many images per queue; the rest is summarized by `image_count`.
 const QUEUE_PREVIEW_LIMIT: usize = 30;
 
-pub use settings::Settings;
 
 /// Width / height, treating a zero height as square.
 pub(crate) fn aspect_ratio(width: i32, height: i32) -> f64 {
@@ -93,20 +92,21 @@ pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
 
 /// Every settings change (UI or tray) ends here: the tray's "Max source level" items are synced
 /// and the Wall Changer tab re-renders from the `wc-settings-changed` event.
-pub fn on_settings_changed(app: &tauri::AppHandle, settings: &Settings) {
+pub fn on_settings_changed(app: &tauri::AppHandle, versioned: &settings::Versioned) {
     use tauri::Emitter;
-    sync_max_level_menu(app, settings.maximum_source_level);
-    let _ = app.emit("wc-settings-changed", settings);
+    sync_max_level_menu(app, versioned.settings.maximum_source_level);
+    let _ = app.emit("wc-settings-changed", versioned);
 }
 
 #[tauri::command]
-pub async fn wc_get_settings() -> Result<Settings, String> {
-    blocking(settings::load).await
+pub async fn wc_get_settings() -> Result<settings::Versioned, String> {
+    blocking(settings::load_versioned).await
 }
 
-/// Applies a partial update (`{ setting: value, ... }`) and returns the normalized settings.
+/// Applies a partial update (`{ setting: value, ... }`) and returns the normalized settings
+/// with their revision.
 #[tauri::command]
-pub async fn wc_update_settings(app: tauri::AppHandle, patch: serde_json::Value) -> Result<Settings, String> {
+pub async fn wc_update_settings(app: tauri::AppHandle, patch: serde_json::Value) -> Result<settings::Versioned, String> {
     let saved = blocking(move || settings::update_with_patch(patch)).await?;
     on_settings_changed(&app, &saved);
     Ok(saved)

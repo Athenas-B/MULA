@@ -43,15 +43,33 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Finds smartctl. Never installs anything by itself; only successes are cached, so a
-/// smartctl installed later is picked up without restarting MULA.
+/// smartctl installed or updated later is picked up without restarting MULA.
 fn ensure_smartctl() -> Result<PathBuf, CommandError> {
     let mut guard = SMARTCTL_PATH.lock().map_err(|e| e.to_string())?;
     if let Some(path) = guard.as_ref() {
         return Ok(path.clone());
     }
     let path = find_smartctl().ok_or(CommandError::SmartctlMissing)?;
+    let version = run_smartctl(&path, &["--version"]).ok().and_then(|text| parse_smartctl_version(&text));
+    if let Some((major, minor)) = version.filter(|(major, _)| *major < MIN_SMARTCTL_MAJOR) {
+        return Err(format!(
+            "smartmontools {major}.{minor} is too old: MULA needs {MIN_SMARTCTL_MAJOR}.0 or newer (for JSON output). Please update smartmontools."
+        )
+        .into());
+    }
     *guard = Some(path.clone());
     Ok(path)
+}
+
+/// JSON output (`--json`), which MULA relies on, arrived in smartmontools 7.0.
+const MIN_SMARTCTL_MAJOR: u32 = 7;
+
+/// Reads the version from `smartctl --version` ("smartctl 7.4 2023-08-01 r5530 [...]").
+fn parse_smartctl_version(text: &str) -> Option<(u32, u32)> {
+    let version = text.lines().find(|l| l.starts_with("smartctl "))?.split_whitespace().nth(1)?;
+    let (major, minor) = version.split_once('.')?;
+    let minor: String = minor.chars().take_while(char::is_ascii_digit).collect();
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn install_smartctl() -> Result<PathBuf, String> {
@@ -591,6 +609,14 @@ mod tests {
 
     fn report(json: serde_json::Value) -> SmartJson {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn smartctl_versions_are_parsed() {
+        assert_eq!(parse_smartctl_version("smartctl 7.4 2023-08-01 r5530 [x86_64-w64-mingw32-w10-b19045] (sf-7.4-1)\nCopyright"), Some((7, 4)));
+        assert_eq!(parse_smartctl_version("smartctl 6.6 2017-11-05 r4594 [x86_64-linux]"), Some((6, 6)));
+        assert_eq!(parse_smartctl_version("smartctl 7.5-rc1 2025"), Some((7, 5)));
+        assert_eq!(parse_smartctl_version("something else"), None);
     }
 
     #[test]
