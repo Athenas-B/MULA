@@ -1,6 +1,6 @@
 use super::images::ImageInfo;
 use super::monitors::Monitor;
-use super::settings::{PictureSizeHandling, QueueState, RotationMode, Settings};
+use super::settings::{PictureSizeHandling, QueueState, RotationMode, RuntimeState, Settings};
 use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -166,12 +166,12 @@ fn rank_sort(a: &RankedImage, b: &RankedImage) -> std::cmp::Ordering {
 }
 
 pub fn ensure_queue_state<'a>(
-    settings: &'a mut Settings,
+    runtime: &'a mut RuntimeState,
     queue_key: &str,
     queue: &[RankedImage],
 ) -> &'a mut QueueState {
-    if let Some(pos) = settings.queue_states.iter().position(|s| s.queue_key == queue_key) {
-        return &mut settings.queue_states[pos];
+    if let Some(pos) = runtime.queue_states.iter().position(|s| s.queue_key == queue_key) {
+        return &mut runtime.queue_states[pos];
     }
 
     let paths: Vec<String> = queue.iter().map(|r| r.image.path.clone()).collect();
@@ -180,8 +180,8 @@ pub fn ensure_queue_state<'a>(
         ordered_image_paths: paths,
         ..Default::default()
     };
-    settings.queue_states.push(state);
-    settings.queue_states.last_mut().unwrap()
+    runtime.queue_states.push(state);
+    runtime.queue_states.last_mut().unwrap()
 }
 
 /// Returns the image path that `choose_from_queue` would pick next for `RotationMode::Sequence`,
@@ -370,16 +370,16 @@ mod tests {
 
     #[test]
     fn queue_state_is_created_once_and_then_reused() {
-        let mut s = settings();
-        let queue = rank_images_for_monitor(&[image("a.jpg", 1, 1), image("b.jpg", 1, 1)], &monitor("M", 1, 1), &s);
+        let mut runtime = RuntimeState::default();
+        let queue = rank_images_for_monitor(&[image("a.jpg", 1, 1), image("b.jpg", 1, 1)], &monitor("M", 1, 1), &settings());
 
-        let state = ensure_queue_state(&mut s, "shared", &queue);
+        let state = ensure_queue_state(&mut runtime, "shared", &queue);
         assert_eq!(state.ordered_image_paths, ["a.jpg", "b.jpg"]);
         state.next_index = 1;
 
-        let again = ensure_queue_state(&mut s, "shared", &[]);
+        let again = ensure_queue_state(&mut runtime, "shared", &[]);
         assert_eq!(again.next_index, 1, "existing state must not be reset");
-        assert_eq!(s.queue_states.len(), 1);
+        assert_eq!(runtime.queue_states.len(), 1);
     }
 
     #[test]

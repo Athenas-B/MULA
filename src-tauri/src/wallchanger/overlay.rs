@@ -8,8 +8,6 @@ use ab_glyph::{FontRef, PxScale};
 use image::{Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut, text_size};
 use imageproc::rect::Rect;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Common Windows font files, tried in order, since MULA currently only runs on Windows.
@@ -115,16 +113,17 @@ fn cache_key(original_path: &str, settings: &Settings) -> String {
         .and_then(|m| m.modified())
         .ok();
 
-    let mut hasher = DefaultHasher::new();
-    original_path.hash(&mut hasher);
-    format!("{mtime:?}").hash(&mut hasher);
-    (settings.picture_name_overlay_text_mode as u8).hash(&mut hasher);
-    settings.picture_name_overlay_font_size.hash(&mut hasher);
-    settings.picture_name_overlay_text_color_argb.hash(&mut hasher);
-    settings.picture_name_overlay_offset_x.hash(&mut hasher);
-    settings.picture_name_overlay_offset_y.hash(&mut hasher);
-    settings.picture_name_overlay_use_backdrop.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // Everything that changes the rendered image; the stable hash names the cached file.
+    let identity = format!(
+        "{original_path}|{mtime:?}|{:?}|{}|{}|{}|{}|{}",
+        settings.picture_name_overlay_text_mode,
+        settings.picture_name_overlay_font_size,
+        settings.picture_name_overlay_text_color_argb,
+        settings.picture_name_overlay_offset_x,
+        settings.picture_name_overlay_offset_y,
+        settings.picture_name_overlay_use_backdrop,
+    );
+    format!("{:016x}", crate::util::stable_hash(identity.as_bytes()))
 }
 
 /// Returns the path that should be handed to Windows for this wallpaper: either the

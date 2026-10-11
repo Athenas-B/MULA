@@ -1,4 +1,4 @@
-use super::settings::{ImageCacheEntry, Settings, Source};
+use super::settings::{ImageCacheEntry, Settings, Source, SourceKind};
 use super::wallhaven;
 use std::collections::HashMap;
 use std::fs;
@@ -36,12 +36,7 @@ pub enum NetworkPolicy {
 pub fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|ext| {
-            SUPPORTED_EXTENSIONS
-                .iter()
-                .any(|&s| s.eq_ignore_ascii_case(ext))
-        })
-        .unwrap_or(false)
+        .is_some_and(|ext| SUPPORTED_EXTENSIONS.iter().any(|s| s.eq_ignore_ascii_case(ext)))
 }
 
 pub fn is_eligible_source(source: &Source, settings: &Settings) -> bool {
@@ -88,70 +83,64 @@ fn read_image_dimensions(path: &str) -> Option<(i32, i32)> {
     }
 }
 
-/// Collects every image of the eligible sources. A source that fails (missing folder, Wallhaven
-/// unreachable, ...) is skipped with a warning instead of failing the whole collection.
-pub fn load_images(settings: &mut Settings, network: NetworkPolicy) -> Result<Vec<ImageInfo>, String> {
-    let cache: HashMap<String, ImageCacheEntry> = std::mem::take(&mut settings.image_cache_entries)
-        .into_iter()
-        .map(|e| (e.path.clone(), e))
-        .collect();
+/// The image files of one source with their metadata.
+fn source_files(source: &Source, settings: &Settings, network: NetworkPolicy) -> Result<Vec<(PathBuf, fs::Metadata)>, String> {
+    match &source.kind {
+        SourceKind::Wallhaven { page_limit, purity } => {
+            let api_key = Some(settings.wallhaven_api_key.as_str()).filter(|k| !k.is_empty());
+            let paths = wallhaven::images_for_source(&source.path, *page_limit, *purity, api_key, network)?;
+            Ok(paths
+                .into_iter()
+                .filter_map(|path| fs::metadata(&path).ok().map(|meta| (path, meta)))
+                .collect())
+        }
+        SourceKind::Folder { include_subfolders } => {
+            let expanded = shellexpand::full(&source.path)
+                .map_err(|e| format!("Failed to expand source path {}: {e}", source.path))?;
+            let root = PathBuf::from(expanded.as_ref());
+            if !root.is_dir() {
+                log::warn!("Skipping source {}: folder not found", source.path);
+                return Ok(Vec::new());
+            }
+            Ok(if *include_subfolders {
+                walkdir(&root)
+            } else {
+                list_dir(&root)
+                    .into_iter()
+                    .filter(|(path, meta)| meta.is_file() && is_image_file(path))
+                    .collect()
+            })
+        }
+    }
+}
+
+/// Collects every image of the eligible sources, using and refreshing the dimension `cache`.
+/// A source that fails (folder can't be expanded, Wallhaven unreachable, ...) is skipped with a
+/// warning; only when no source produced any image is the error returned.
+pub fn load_images(
+    settings: &Settings,
+    cache: &mut Vec<ImageCacheEntry>,
+    network: NetworkPolicy,
+) -> Result<Vec<ImageInfo>, String> {
+    let known: HashMap<String, ImageCacheEntry> = std::mem::take(cache).into_iter().map(|e| (e.path.clone(), e)).collect();
 
     let mut images = Vec::new();
-    let mut new_cache = Vec::new();
     let mut errors = Vec::new();
 
-    for source in &settings.source_folders {
-        if !is_eligible_source(source, settings) {
-            continue;
-        }
-
-        if wallhaven::is_wallhaven_url(&source.path) {
-            match wallhaven::images_for_source(source, settings, network) {
-                Ok(paths) => {
-                    for path in paths {
-                        if let Ok(meta) = fs::metadata(&path) {
-                            add_image(path, &meta, &cache, &mut new_cache, &mut images);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Skipping Wallhaven source {}: {e}", wallhaven::redact(&source.path));
-                    errors.push(e);
+    for source in settings.source_folders.iter().filter(|s| is_eligible_source(s, settings)) {
+        match source_files(source, settings, network) {
+            Ok(files) => {
+                for (path, meta) in files {
+                    add_image(path, &meta, &known, cache, &mut images);
                 }
             }
-            continue;
-        }
-
-        let expanded = match shellexpand::full(&source.path) {
-            Ok(expanded) => expanded,
             Err(e) => {
-                log::warn!("Skipping source {}: failed to expand path: {e}", source.path);
-                errors.push(format!("Failed to expand source path {}: {e}", source.path));
-                continue;
+                log::warn!("Skipping source {}: {e}", wallhaven::redact(&source.path));
+                errors.push(e);
             }
-        };
-        let root = PathBuf::from(expanded.as_ref());
-
-        if !root.is_dir() {
-            log::warn!("Skipping source {}: folder not found", source.path);
-            continue;
-        }
-
-        let files = if source.include_subfolders {
-            walkdir(&root)
-        } else {
-            list_dir(&root)
-                .into_iter()
-                .filter(|(path, meta)| meta.is_file() && is_image_file(path))
-                .collect()
-        };
-
-        for (path, meta) in files {
-            add_image(path, &meta, &cache, &mut new_cache, &mut images);
         }
     }
 
-    settings.image_cache_entries = new_cache;
     if images.is_empty() && !errors.is_empty() {
         return Err(errors.join("; "));
     }
@@ -161,29 +150,22 @@ pub fn load_images(settings: &mut Settings, network: NetworkPolicy) -> Result<Ve
 fn add_image(
     path: PathBuf,
     meta: &fs::Metadata,
-    cache: &HashMap<String, ImageCacheEntry>,
-    new_cache: &mut Vec<ImageCacheEntry>,
+    known: &HashMap<String, ImageCacheEntry>,
+    cache: &mut Vec<ImageCacheEntry>,
     images: &mut Vec<ImageInfo>,
 ) {
     let path_str = path.to_string_lossy().to_string();
     let length = meta.len() as i64;
-    let last_write = meta
+    let modified_secs = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let (width, height) = cache
+    let (width, height) = known
         .get(&path_str)
-        .filter(|e| {
-            e.length == length && {
-                let e_last = chrono::DateTime::parse_from_rfc3339(&e.last_write_utc)
-                    .map(|d| d.timestamp())
-                    .unwrap_or(0);
-                e_last == last_write
-            }
-        })
+        .filter(|e| e.length == length && e.modified_secs == modified_secs)
         .map(|e| (e.width, e.height))
         .unwrap_or_else(|| read_image_dimensions(&path_str).unwrap_or((0, 0)));
 
@@ -191,25 +173,8 @@ fn add_image(
         return;
     }
 
-    new_cache.push(ImageCacheEntry {
-        path: path_str.clone(),
-        length,
-        last_write_utc: format_utc(last_write),
-        width,
-        height,
-    });
-
-    images.push(ImageInfo {
-        path: path_str,
-        width,
-        height,
-    });
-}
-
-fn format_utc(epoch: i64) -> String {
-    let dt =
-        chrono::DateTime::from_timestamp(epoch, 0).unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
-    dt.to_rfc3339()
+    cache.push(ImageCacheEntry { path: path_str.clone(), length, modified_secs, width, height });
+    images.push(ImageInfo { path: path_str, width, height });
 }
 
 #[cfg(test)]
@@ -218,13 +183,11 @@ mod tests {
     use crate::test_support::{write_png, TempDir};
 
     fn settings_with(sources: Vec<Source>) -> Settings {
-        let mut s: Settings = serde_json::from_str("{}").unwrap();
-        s.source_folders = sources;
-        s
+        Settings { source_folders: sources, ..Settings::default() }
     }
 
     fn source(path: &Path) -> Source {
-        serde_json::from_value(serde_json::json!({ "path": path.to_string_lossy() })).unwrap()
+        Source::folder(path.to_string_lossy())
     }
 
     fn names(images: &[ImageInfo]) -> Vec<String> {
@@ -234,6 +197,10 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    fn load(settings: &Settings, cache: &mut Vec<ImageCacheEntry>) -> Result<Vec<ImageInfo>, String> {
+        load_images(settings, cache, NetworkPolicy::CacheOnly)
     }
 
     #[test]
@@ -248,8 +215,7 @@ mod tests {
 
     #[test]
     fn sources_must_be_enabled_non_empty_and_within_the_level_limit() {
-        let mut s = settings_with(vec![]);
-        s.maximum_source_level = 5;
+        let s = Settings { maximum_source_level: 5, ..Settings::default() };
         let mut src = source(Path::new("C:/Pics"));
         assert!(is_eligible_source(&src, &s));
 
@@ -272,15 +238,15 @@ mod tests {
         std::fs::write(dir.join("broken.jpg"), b"not really a jpeg").unwrap();
 
         let mut s = settings_with(vec![source(dir.path())]);
-        let images = load_images(&mut s, NetworkPolicy::CacheOnly).unwrap();
+        let mut cache = Vec::new();
+        let images = load(&s, &mut cache).unwrap();
         assert_eq!(names(&images), ["deep.png", "top.png"], "unreadable and non-image files are skipped");
         let top = images.iter().find(|i| i.path.ends_with("top.png")).unwrap();
         assert_eq!((top.width, top.height), (40, 20));
-        assert_eq!(s.image_cache_entries.len(), 2, "dimensions are cached for readable images");
+        assert_eq!(cache.len(), 2, "dimensions are cached for readable images");
 
-        s.source_folders[0].include_subfolders = false;
-        let images = load_images(&mut s, NetworkPolicy::CacheOnly).unwrap();
-        assert_eq!(names(&images), ["top.png"]);
+        s.source_folders[0].kind = SourceKind::Folder { include_subfolders: false };
+        assert_eq!(names(&load(&s, &mut cache).unwrap()), ["top.png"]);
     }
 
     #[test]
@@ -294,9 +260,8 @@ mod tests {
         too_high.level = 9;
         let missing = source(&dir.join("does-not-exist"));
 
-        let mut s = settings_with(vec![disabled, too_high, missing]);
-        s.maximum_source_level = 5;
-        assert!(load_images(&mut s, NetworkPolicy::CacheOnly).unwrap().is_empty());
+        let s = Settings { maximum_source_level: 5, ..settings_with(vec![disabled, too_high, missing]) };
+        assert!(load(&s, &mut Vec::new()).unwrap().is_empty());
     }
 
     #[test]
@@ -304,37 +269,36 @@ mod tests {
         let dir = TempDir::new("images_cache");
         let file = write_png(&dir.join("a.png"), 64, 32);
         let meta = std::fs::metadata(&file).unwrap();
-        let mtime = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let path_str = file.to_string_lossy().to_string();
+        let modified_secs = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
-        let mut s = settings_with(vec![source(dir.path())]);
-        s.image_cache_entries = vec![ImageCacheEntry {
-            path: path_str.clone(),
+        let s = settings_with(vec![source(dir.path())]);
+        let mut cache = vec![ImageCacheEntry {
+            path: file.to_string_lossy().to_string(),
             length: meta.len() as i64,
-            last_write_utc: format_utc(mtime),
+            modified_secs,
             width: 999,
             height: 555,
         }];
-        let images = load_images(&mut s, NetworkPolicy::CacheOnly).unwrap();
+        let images = load(&s, &mut cache).unwrap();
         assert_eq!((images[0].width, images[0].height), (999, 555), "cache hit must skip decoding");
 
         // A size mismatch means the file changed: the real dimensions are read again.
-        s.image_cache_entries[0].length += 1;
-        let images = load_images(&mut s, NetworkPolicy::CacheOnly).unwrap();
+        cache[0].length += 1;
+        let images = load(&s, &mut cache).unwrap();
         assert_eq!((images[0].width, images[0].height), (64, 32));
-        assert_eq!(s.image_cache_entries[0].width, 64, "the cache is refreshed");
+        assert_eq!(cache[0].width, 64, "the cache is refreshed");
     }
 
     #[test]
     fn cache_entries_for_deleted_files_are_dropped() {
         let dir = TempDir::new("images_prune");
         write_png(&dir.join("a.png"), 8, 8);
-        let mut s = settings_with(vec![source(dir.path())]);
-        s.image_cache_entries = vec![ImageCacheEntry { path: dir.join("gone.png").to_string_lossy().to_string(), ..Default::default() }];
+        let s = settings_with(vec![source(dir.path())]);
+        let mut cache = vec![ImageCacheEntry { path: dir.join("gone.png").to_string_lossy().to_string(), ..Default::default() }];
 
-        load_images(&mut s, NetworkPolicy::CacheOnly).unwrap();
-        assert_eq!(s.image_cache_entries.len(), 1);
-        assert!(s.image_cache_entries[0].path.ends_with("a.png"));
+        load(&s, &mut cache).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(cache[0].path.ends_with("a.png"));
     }
 
     #[test]
@@ -343,18 +307,11 @@ mod tests {
         write_png(&dir.join("a.png"), 8, 8);
         let unexpandable = source(Path::new("$MULA_SURELY_UNDEFINED_VAR/pics"));
 
-        let mut only_bad = settings_with(vec![unexpandable.clone()]);
-        let err = load_images(&mut only_bad, NetworkPolicy::CacheOnly).unwrap_err();
+        let err = load(&settings_with(vec![unexpandable.clone()]), &mut Vec::new()).unwrap_err();
         assert!(err.contains("Failed to expand"), "{err}");
 
-        let mut mixed = settings_with(vec![unexpandable, source(dir.path())]);
-        assert_eq!(load_images(&mut mixed, NetworkPolicy::CacheOnly).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn utc_timestamps_round_trip() {
-        let formatted = format_utc(1_700_000_000);
-        assert_eq!(chrono::DateTime::parse_from_rfc3339(&formatted).unwrap().timestamp(), 1_700_000_000);
+        let mixed = settings_with(vec![unexpandable, source(dir.path())]);
+        assert_eq!(load(&mixed, &mut Vec::new()).unwrap().len(), 1);
     }
 
     #[test]

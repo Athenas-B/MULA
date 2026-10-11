@@ -177,6 +177,9 @@ export class FakeElement {
   append(...children) {
     this.children.push(...children);
   }
+  replaceChildren(...children) {
+    this.children = [...children];
+  }
   removeChild(child) {
     this.children = this.children.filter((c) => c !== child);
     return child;
@@ -260,6 +263,37 @@ export function createFakeDocument() {
   return doc;
 }
 
+/**
+ * Fake MutationObserver class plus the list of created instances. Callbacks only run
+ * when the test calls trigger() (on one instance, or on all via the returned helper).
+ */
+export function createFakeMutationObserver() {
+  const instances = [];
+  class FakeMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.targets = [];
+      this.disconnected = false;
+      instances.push(this);
+    }
+    observe(target, options) {
+      this.targets.push({ target, options });
+    }
+    disconnect() {
+      this.disconnected = true;
+      this.targets = [];
+    }
+    trigger(records = []) {
+      if (!this.disconnected) this.callback(records, this);
+    }
+  }
+  return {
+    MutationObserver: FakeMutationObserver,
+    instances,
+    trigger: (records) => instances.forEach((o) => o.trigger(records)),
+  };
+}
+
 export function createFakeLocalStorage(initial = {}, { throwOnAccess = false } = {}) {
   const map = new Map(Object.entries(initial));
   const guard = () => {
@@ -309,9 +343,14 @@ const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)
 /**
  * Fake `chrome` API with an in-memory, synchronous storage.local, recorded
  * sendMessage calls (answered by `onSend`), tabs and webRequest events.
+ * With `asyncStorage: true`, storage.local callbacks run on a later macrotask (reads
+ * still snapshot at call time), which exposes lost-update races. Every set() call is
+ * recorded in `writes`.
  */
-export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undefined } = {}) {
+export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undefined, asyncStorage = false } = {}) {
   const store = clone(storage);
+  const writes = [];
+  const later = (fn) => (asyncStorage ? setImmediate(fn) : fn());
   const sent = [];
   const icons = [];
   const created = [];
@@ -319,6 +358,7 @@ export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undef
 
   const chrome = {
     store,
+    writes,
     sent,
     icons,
     created,
@@ -350,16 +390,17 @@ export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undef
           else if (typeof keys === "string") result = keys in store ? { [keys]: clone(store[keys]) } : {};
           else if (Array.isArray(keys)) result = Object.fromEntries(keys.filter((k) => k in store).map((k) => [k, clone(store[k])]));
           else result = Object.fromEntries(Object.entries(keys).map(([k, d]) => [k, k in store ? clone(store[k]) : clone(d)]));
-          cb(result);
+          later(() => cb(result));
         },
         set(obj, cb) {
+          writes.push(clone(obj));
           const changes = {};
           for (const [k, v] of Object.entries(obj)) {
             changes[k] = { oldValue: clone(store[k]), newValue: clone(v) };
             store[k] = clone(v);
           }
           chrome.storage.onChanged.fire(changes, "local");
-          cb?.();
+          later(() => cb?.());
         },
       },
     },

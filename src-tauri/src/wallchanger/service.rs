@@ -3,7 +3,7 @@ use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow
 use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor, RankedImage};
 use super::transition::apply_wallpaper;
-use super::settings::{self, Settings};
+use super::settings::{self, RuntimeState, Settings};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -74,7 +74,7 @@ fn run_worker(generation: u64) {
 
     let started = Instant::now();
     while GENERATION.load(Ordering::SeqCst) == generation {
-        match settings::load_config() {
+        match settings::load() {
             Ok(config) => {
                 let interval = Duration::from_secs(config.interval_minutes.max(1) as u64 * 60);
                 let last_apply = LAST_APPLY.lock().ok().and_then(|t| *t);
@@ -108,9 +108,10 @@ pub fn apply(change_one_monitor_only: bool) -> Result<String, String> {
 fn apply_locked(change_one_monitor_only: bool) -> Result<String, String> {
     super::monitors::initialize_com()?;
 
-    let mut settings = settings::load()?;
-    let result = apply_with(&mut settings, change_one_monitor_only)?;
-    settings::save_apply_state(&settings)?;
+    let settings = settings::load()?;
+    let mut runtime = settings::load_state()?;
+    let result = apply_with(&settings, &mut runtime, change_one_monitor_only)?;
+    settings::save_state(&mut runtime)?;
 
     if let Err(e) = cleanup_rendered_cache() {
         log::warn!("Failed to clean up rendered wallpaper cache: {e}");
@@ -120,12 +121,12 @@ fn apply_locked(change_one_monitor_only: bool) -> Result<String, String> {
     Ok(result)
 }
 
-fn apply_with(settings: &mut Settings, change_one_monitor_only: bool) -> Result<String, String> {
+fn apply_with(settings: &Settings, runtime: &mut RuntimeState, change_one_monitor_only: bool) -> Result<String, String> {
     if !settings.source_folders.iter().any(|s| is_eligible_source(s, settings)) {
         return Err("No eligible wallpaper sources found".to_string());
     }
 
-    let images = load_images(settings, NetworkPolicy::RefreshWhenStale)?;
+    let images = load_images(settings, &mut runtime.image_cache_entries, NetworkPolicy::RefreshWhenStale)?;
     if images.is_empty() {
         return Err("No wallpaper images found in enabled sources".to_string());
     }
@@ -140,9 +141,9 @@ fn apply_with(settings: &mut Settings, change_one_monitor_only: bool) -> Result<
 
     let queues = build_queues(&images, &monitors, settings);
 
-    let (targets, next_index) = select_target_monitors(&monitors, settings, change_one_monitor_only);
+    let (targets, next_index) = select_target_monitors(&monitors, runtime.next_monitor_change_index, change_one_monitor_only);
     if let Some(idx) = next_index {
-        settings.next_monitor_change_index = idx;
+        runtime.next_monitor_change_index = idx;
     }
 
     let rotation_mode = settings.rotation_mode;
@@ -161,7 +162,7 @@ fn apply_with(settings: &mut Settings, change_one_monitor_only: bool) -> Result<
 
         let fallback_key = get_queue_key(settings, monitors.len(), &monitor.id, fallback);
         let selected = {
-            let state = ensure_queue_state(settings, &fallback_key, queue);
+            let state = ensure_queue_state(runtime, &fallback_key, queue);
             let chosen = choose_from_queue(queue, rotation_mode, state)
                 .ok_or_else(|| "No suitable wallpaper found".to_string())?;
             state.last_image_path = chosen.image.path.clone();
@@ -171,7 +172,7 @@ fn apply_with(settings: &mut Settings, change_one_monitor_only: bool) -> Result<
         let wallpaper_path = resolve_wallpaper_path(&selected.image.path, settings);
         apply_wallpaper(monitor, &wallpaper_path, settings)?;
 
-        record_image_shown(settings, &selected.image.path);
+        record_image_shown(runtime, &selected.image.path);
 
         applied.push(selected.image.path.clone());
     }
@@ -189,11 +190,11 @@ fn apply_with(settings: &mut Settings, change_one_monitor_only: bool) -> Result<
 
 fn select_target_monitors<'a>(
     monitors: &'a [super::monitors::Monitor],
-    settings: &Settings,
+    next_monitor_index: i32,
     change_one_monitor_only: bool,
 ) -> (Vec<&'a super::monitors::Monitor>, Option<i32>) {
     if change_one_monitor_only && monitors.len() > 1 {
-        let index = (settings.next_monitor_change_index as usize) % monitors.len();
+        let index = (next_monitor_index.max(0) as usize) % monitors.len();
         let next = ((index + 1) % monitors.len()) as i32;
         (vec![&monitors[index]], Some(next))
     } else {
@@ -219,11 +220,11 @@ fn handle_windows_slideshow_conflict(settings: &Settings) {
     }
 }
 
-fn record_image_shown(settings: &mut Settings, path: &str) {
-    if let Some(stat) = settings.image_show_stats.iter_mut().find(|s| s.path == path) {
+fn record_image_shown(runtime: &mut RuntimeState, path: &str) {
+    if let Some(stat) = runtime.image_show_stats.iter_mut().find(|s| s.path == path) {
         stat.shown_count += 1;
     } else {
-        settings.image_show_stats.push(super::settings::ImageShowStat {
+        runtime.image_show_stats.push(super::settings::ImageShowStat {
             path: path.to_string(),
             shown_count: 1,
         });
@@ -246,8 +247,7 @@ mod tests {
     #[test]
     fn all_monitors_change_unless_one_per_interval_is_requested() {
         let ms = monitors(3);
-        let s: Settings = serde_json::from_str("{}").unwrap();
-        let (targets, next) = select_target_monitors(&ms, &s, false);
+        let (targets, next) = select_target_monitors(&ms, 0, false);
         assert_eq!(ids(&targets), ["M0", "M1", "M2"]);
         assert_eq!(next, None);
     }
@@ -255,12 +255,12 @@ mod tests {
     #[test]
     fn one_monitor_per_interval_rotates_through_the_monitors() {
         let ms = monitors(3);
-        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        let mut index = 0;
         let mut seen = Vec::new();
         for _ in 0..4 {
-            let (targets, next) = select_target_monitors(&ms, &s, true);
+            let (targets, next) = select_target_monitors(&ms, index, true);
             seen.extend(ids(&targets));
-            s.next_monitor_change_index = next.unwrap();
+            index = next.unwrap();
         }
         assert_eq!(seen, ["M0", "M1", "M2", "M0"]);
     }
@@ -268,9 +268,8 @@ mod tests {
     #[test]
     fn a_stale_monitor_index_wraps_around() {
         let ms = monitors(2);
-        let mut s: Settings = serde_json::from_str("{}").unwrap();
-        s.next_monitor_change_index = 7; // e.g. a monitor was unplugged
-        let (targets, next) = select_target_monitors(&ms, &s, true);
+        // e.g. a monitor was unplugged
+        let (targets, next) = select_target_monitors(&ms, 7, true);
         assert_eq!(ids(&targets), ["M1"]);
         assert_eq!(next, Some(0));
     }
@@ -278,8 +277,7 @@ mod tests {
     #[test]
     fn a_single_monitor_ignores_one_per_interval() {
         let ms = monitors(1);
-        let s: Settings = serde_json::from_str("{}").unwrap();
-        let (targets, next) = select_target_monitors(&ms, &s, true);
+        let (targets, next) = select_target_monitors(&ms, 0, true);
         assert_eq!(ids(&targets), ["M0"]);
         assert_eq!(next, None);
     }
@@ -304,7 +302,7 @@ mod tests {
 
     #[test]
     fn show_counts_are_recorded_per_image() {
-        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        let mut s = RuntimeState::default();
         record_image_shown(&mut s, "a.jpg");
         record_image_shown(&mut s, "b.jpg");
         record_image_shown(&mut s, "a.jpg");

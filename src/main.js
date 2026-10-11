@@ -129,7 +129,6 @@ async function openConfigDir(e) {
 
 // ── VSD Server ──
 let vsdRunning = false;
-let vsdLogInterval = null;
 
 async function initVsd() {
   const toggleBtn = document.getElementById("vsd-toggle");
@@ -138,25 +137,32 @@ async function initVsd() {
   document.getElementById("vsd-install-chrome").addEventListener("click", () => installExtension("chrome"));
   document.getElementById("vsd-install-firefox").addEventListener("click", () => installExtension("firefox"));
   document.getElementById("vsd-autostart").addEventListener("change", toggleAutostart);
-  // Check initial state
+
+  // The backend pushes server output and running/stopped changes (it also handles autostart).
+  listen("vsd-log", (event) => appendLog(event.payload));
+  listen("vsd-state-changed", (event) => updateVsdUi(event.payload));
+
   checkVsdStatus();
+  loadVsdLogBacklog();
   loadDownloadDir();
   loadAutostart();
 }
 
 async function loadAutostart() {
   try {
-    const enabled = await invoke("vsd_get_autostart");
-    document.getElementById("vsd-autostart").checked = enabled;
-    if (enabled && !vsdRunning) {
-      // Auto-start the server
-      updateVsdUi(true);
-      appendLog("[Autostart: starting server...]\n");
-      startLogPolling();
-      await invoke("vsd_start");
-    }
+    document.getElementById("vsd-autostart").checked = await invoke("vsd_get_autostart");
   } catch (e) {
     console.error("Failed to load autostart setting:", e);
+  }
+}
+
+/** Shows output the server produced before this window loaded. */
+async function loadVsdLogBacklog() {
+  try {
+    const lines = await invoke("vsd_get_logs");
+    if (lines?.length) appendLog(lines.join(""));
+  } catch (e) {
+    console.error("Failed to load VSD log:", e);
   }
 }
 
@@ -238,11 +244,7 @@ async function changeDownloadDir() {
 
 async function checkVsdStatus() {
   try {
-    const running = await invoke("vsd_is_running");
-    updateVsdUi(running);
-    if (running && !vsdLogInterval) {
-      startLogPolling();
-    }
+    updateVsdUi(await invoke("vsd_is_running"));
   } catch (e) {
     console.error("Failed to check VSD status:", e);
   }
@@ -255,24 +257,15 @@ async function toggleVsd() {
   try {
     if (vsdRunning) {
       await invoke("vsd_stop");
-      updateVsdUi(false);
-      stopLogPolling();
-      appendLog("\n[Server stopped]");
     } else {
-      // Update UI immediately before the async start
+      // Show the new state right away; the backend confirms it with `vsd-state-changed`.
       updateVsdUi(true);
       appendLog("[Starting server...]\n");
-      startLogPolling();
-
       await invoke("vsd_start");
     }
   } catch (err) {
     appendLog(`[Error] ${err}\n`);
-    // Revert UI if start failed
-    if (!vsdRunning) {
-      updateVsdUi(false);
-      stopLogPolling();
-    }
+    checkVsdStatus();
   } finally {
     toggleBtn.disabled = false;
   }
@@ -291,29 +284,6 @@ function updateVsdUi(running) {
     toggleBtn.classList.add("stopped");
     toggleBtn.querySelector(".toggle-label").textContent = "Start";
     toggleBtn.title = "Start VSD Server";
-  }
-}
-
-function startLogPolling() {
-  if (vsdLogInterval) return;
-  vsdLogInterval = setInterval(pollLogs, 1000);
-}
-
-function stopLogPolling() {
-  if (vsdLogInterval) {
-    clearInterval(vsdLogInterval);
-    vsdLogInterval = null;
-  }
-}
-
-async function pollLogs() {
-  try {
-    const lines = await invoke("vsd_get_logs");
-    if (lines && lines.length > 0) {
-      appendLog(lines.join(""));
-    }
-  } catch (e) {
-    // Server may have stopped
   }
 }
 
@@ -409,11 +379,9 @@ window.addEventListener("DOMContentLoaded", () => {
     if (checkbox) checkbox.checked = event.payload;
   });
 
-  // Keep the Wall Changer tab in sync when the max source level is changed from the tray.
-  listen("max-level-changed", (event) => {
-    const input = document.getElementById("wc-max-level");
-    if (input) input.value = event.payload;
-    if (wcSettings) wcSettings.maximum_source_level = event.payload;
+  // Settings changed elsewhere (e.g. the tray's max source level) or normalized by the backend.
+  listen("wc-settings-changed", (event) => {
+    if (wcSettings) wcApplySettings(event.payload);
   });
 
   // The service can be started/stopped from the tray, too.
@@ -561,12 +529,27 @@ function stopTestProgressPolling() {
   testPollNoProgressCount = 0;
 }
 
+/** Readable text for a command error: typed `{ kind, message }` objects or plain strings. */
+function errorText(err) {
+  if (err && typeof err === "object" && "kind" in err) {
+    switch (err.kind) {
+      case "smartctl_missing":
+        return "smartmontools (smartctl) is not installed.";
+      case "elevation_declined":
+        return "Administrator rights were declined.";
+      default:
+        return err.message || err.kind;
+    }
+  }
+  return String(err?.message ?? err);
+}
+
 // smartmontools is never installed silently: if smartctl is missing, ask the user first.
 async function invokeSmart(command, args) {
   try {
     return await invoke(command, args);
   } catch (err) {
-    if (!String(err).includes("SMARTCTL_MISSING")) throw err;
+    if (err?.kind !== "smartctl_missing") throw err;
     const install = window.confirm(
       "SMART features need smartmontools (smartctl), which is not installed.\n\n" +
         "Install it now with winget? This accepts the smartmontools package license."
@@ -579,42 +562,42 @@ async function invokeSmart(command, args) {
   }
 }
 
-function needsAdminRights(text) {
-  const t = String(text).toLowerCase();
-  return (
-    t.includes("error=5") ||
-    t.includes("access is denied") ||
-    t.includes("access denied") ||
-    t.includes("admin rights") ||
-    t.includes("requires admin") ||
-    t.includes("administrator") ||
-    t.includes("elevation") ||
-    t.includes("permission")
-  );
-}
-
-async function onSmartRetryAdmin() {
-  const select = document.getElementById("drive-select");
+async function loadSmartData(id, elevated) {
   const smartData = document.getElementById("smart-data");
   const smartStatus = document.getElementById("smart-status");
   const smartAdmin = document.getElementById("smart-admin");
-  const id = select.value;
-  if (!id) return;
 
   if (smartAdmin) smartAdmin.classList.add("hidden");
   smartData.textContent = "";
-  smartStatus.textContent = "Loading SMART data with administrator privileges...";
+  smartStatus.textContent = elevated ? "Loading SMART data with administrator privileges..." : "Loading SMART data...";
   smartStatus.classList.remove("hidden");
   try {
-    const data = await invokeSmart("get_drive_smart_elevated", { id });
-    smartData.textContent = data;
+    smartData.textContent = await invokeSmart("get_drive_smart", { id, elevated });
     smartLoadedId = id;
   } catch (err) {
     console.error(err);
-    smartData.textContent = `Error: ${err}`;
+    smartData.textContent = `Error: ${errorText(err)}`;
+    if (smartAdmin && err?.kind === "needs_elevation") smartAdmin.classList.remove("hidden");
   } finally {
     smartStatus.classList.add("hidden");
   }
+}
+
+async function onSmartRetryAdmin() {
+  const id = document.getElementById("drive-select").value;
+  if (id) await loadSmartData(id, true);
+}
+
+async function onSmartToggle(toggle, content) {
+  const id = document.getElementById("drive-select").value;
+  const smartAdmin = document.getElementById("smart-admin");
+
+  const collapsed = content.classList.toggle("collapsed");
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
+  if (smartAdmin) smartAdmin.classList.add("hidden");
+
+  if (!collapsed && id && smartLoadedId !== id) await loadSmartData(id, false);
 }
 
 async function onRunDriveTest() {
@@ -645,7 +628,6 @@ async function onRunDriveTest() {
 
   const lines = [];
   let hasError = false;
-
   const appendLine = (line, isError) => {
     lines.push(line);
     if (isError) hasError = true;
@@ -660,14 +642,10 @@ async function onRunDriveTest() {
 
     for (const type of types) {
       try {
-        const data = await invokeSmart("run_drive_test_elevated", { id, testType: type });
-        if (String(data).toLowerCase().includes("failed")) {
-          appendLine(`${type}: failed\n  ${data}`, true);
-        } else {
-          appendLine(`${type}: started\n  ${data}`);
-        }
+        const output = await invokeSmart("run_drive_test", { id, testType: type });
+        appendLine(`${type}: started\n  ${output}`);
       } catch (err) {
-        appendLine(`${type}: error - ${err}`, true);
+        appendLine(`${type}: error - ${errorText(err)}`, true);
       }
     }
 
@@ -679,14 +657,13 @@ async function onRunDriveTest() {
     if (testStatus) {
       testStatus.className = hasError ? "smart-test-status error" : "smart-test-status success";
     }
-
     if (!hasError) {
       setTimeout(() => startTestProgressPolling(id), 2000);
     }
   } catch (err) {
     console.error(err);
     if (testStatus) {
-      testStatus.textContent = `Error: ${err}`;
+      testStatus.textContent = `Error: ${errorText(err)}`;
       testStatus.className = "smart-test-status error";
     }
   } finally {
@@ -694,22 +671,14 @@ async function onRunDriveTest() {
   }
 }
 
-function extractSelfTestProgress(full) {
-  const statusRegex = /(?:Self-test execution status|Self-test status):[\s\S]*?(?=\n[A-Z]|$)/i;
-  const logRegex = /(?:SMART (?:Extended )?Self-test log|Self-test Log|No Self-tests Logged)[\s\S]*?(?=\n(?:SMART|={3,})|$)/i;
-  const statusMatch = full.match(statusRegex);
-  const logMatch = full.match(logRegex);
-  const status = statusMatch ? statusMatch[0].trim() : "Self-test status not available";
-  const log = logMatch ? logMatch[0].trim() : "No self-test log available";
-  const lowerStatus = status.toLowerCase();
-  const inProgress =
-    lowerStatus.includes("in progress") &&
-    !lowerStatus.includes("no self-test in progress") &&
-    !lowerStatus.includes("no selftest in progress");
-  const hasFailed = lowerStatus.includes("failed");
-  const progressMatch = status.match(/(\d+)%\s*(?:of\s+test\s+)?(?:remaining|left)/i);
-  const progress = progressMatch ? `${progressMatch[1]}% remaining` : null;
-  return { status, log, text: `${status}\n\n${log}`, inProgress, hasFailed, progress };
+/** Text for a self-test status from `get_drive_self_test_status`. */
+function formatSelfTestStatus(status) {
+  const log = status.log.length
+    ? status.log
+        .map((e) => `  ${e.test}: ${e.result}${e.hours != null ? ` (at ${e.hours} h)` : ""}`)
+        .join("\n")
+    : "  No self-tests logged";
+  return `Self-test status: ${status.status}\n\nSelf-test log (most recent first):\n${log}`;
 }
 
 function startTestProgressPolling(id) {
@@ -732,31 +701,31 @@ async function pollTestStatus(id) {
   }
 
   try {
-    const full = await invokeSmart("get_drive_smart_elevated", { id });
-    const { status, log, inProgress, hasFailed, progress } = extractSelfTestProgress(full);
+    const status = await invokeSmart("get_drive_self_test_status", { id });
 
     let header;
-    if (inProgress) {
-      header = progress
-        ? `Monitoring self-test progress... (${progress}, updates every 10s)`
-        : "Monitoring self-test progress... (updates every 10s)";
-    } else if (hasFailed) {
+    if (status.in_progress) {
+      header =
+        status.percent_remaining != null
+          ? `Monitoring self-test progress... (${status.percent_remaining}% remaining, updates every 10s)`
+          : "Monitoring self-test progress... (updates every 10s)";
+    } else if (status.failed) {
       header = "Self-test failed";
     } else {
       header = "Self-test finished";
     }
 
     if (testStatus) {
-      testStatus.textContent = `${header}\n\n${status}\n\n${log}`;
-      testStatus.className = hasFailed ? "smart-test-status error" : "smart-test-status";
+      testStatus.textContent = `${header}\n\n${formatSelfTestStatus(status)}`;
+      testStatus.className = status.failed ? "smart-test-status error" : "smart-test-status";
     }
 
-    if (hasFailed) {
+    if (status.failed) {
       stopTestProgressPolling();
       return;
     }
 
-    if (inProgress) {
+    if (status.in_progress) {
       testPollNoProgressCount = 0;
     } else {
       testPollNoProgressCount += 1;
@@ -768,7 +737,7 @@ async function pollTestStatus(id) {
   } catch (err) {
     console.error(err);
     if (testStatus) {
-      testStatus.textContent = `Error checking status: ${err}`;
+      testStatus.textContent = `Error checking status: ${errorText(err)}`;
       testStatus.className = "smart-test-status error";
     }
     stopTestProgressPolling();
@@ -789,16 +758,19 @@ async function onCheckDriveTestStatus() {
   if (checkBtn) checkBtn.disabled = true;
 
   try {
-    const full = await invokeSmart("get_drive_smart_elevated", { id });
-    const { text, inProgress, hasFailed } = extractSelfTestProgress(full);
+    const status = await invokeSmart("get_drive_self_test_status", { id });
     if (testStatus) {
-      testStatus.textContent = text;
-      testStatus.className = hasFailed ? "smart-test-status error" : inProgress ? "smart-test-status" : "smart-test-status success";
+      testStatus.textContent = formatSelfTestStatus(status);
+      testStatus.className = status.failed
+        ? "smart-test-status error"
+        : status.in_progress
+          ? "smart-test-status"
+          : "smart-test-status success";
     }
   } catch (err) {
     console.error(err);
     if (testStatus) {
-      testStatus.textContent = `Error: ${err}`;
+      testStatus.textContent = `Error: ${errorText(err)}`;
       testStatus.className = "smart-test-status error";
     }
   } finally {
@@ -845,47 +817,11 @@ async function onFormatDrive() {
     stopFormatTimer();
     console.error(err);
     if (formatStatus) {
-      formatStatus.textContent = `Error: ${err}`;
+      formatStatus.textContent = `Error: ${errorText(err)}`;
       formatStatus.className = "drive-format-status error";
     }
   } finally {
     if (formatBtn) formatBtn.disabled = !!cachedDrives.find((d) => d.id === id)?.is_system;
-  }
-}
-
-async function onSmartToggle(toggle, content) {
-  const select = document.getElementById("drive-select");
-  const smartData = document.getElementById("smart-data");
-  const smartStatus = document.getElementById("smart-status");
-  const smartAdmin = document.getElementById("smart-admin");
-  const id = select.value;
-
-  const collapsed = content.classList.toggle("collapsed");
-  toggle.setAttribute("aria-expanded", String(!collapsed));
-  toggle.querySelector(".toggle-icon").textContent = collapsed ? "+" : "-";
-
-  if (smartAdmin) smartAdmin.classList.add("hidden");
-
-  if (!collapsed && id && smartLoadedId !== id) {
-    smartData.textContent = "";
-    smartStatus.textContent = "Loading SMART data...";
-    smartStatus.classList.remove("hidden");
-    try {
-      const data = await invokeSmart("get_drive_smart", { id });
-      smartData.textContent = data;
-      smartLoadedId = id;
-      if (smartAdmin && needsAdminRights(data)) {
-        smartAdmin.classList.remove("hidden");
-      }
-    } catch (err) {
-      console.error(err);
-      smartData.textContent = `Error: ${err}`;
-      if (smartAdmin && needsAdminRights(err)) {
-        smartAdmin.classList.remove("hidden");
-      }
-    } finally {
-      smartStatus.classList.add("hidden");
-    }
   }
 }
 
@@ -984,8 +920,20 @@ function onDriveSelect() {
 }
 
 // ── Wall Changer ──
+// The backend owns the settings: the UI sends partial updates (`wc_update_settings`) and renders
+// whatever comes back, or arrives with the `wc-settings-changed` event (e.g. from the tray).
 let wcSettings = null;
 let wcSelectedSourceIndex = -1;
+let wcPendingPatch = {};
+let wcPatchTimer = null;
+
+const WC_FORM_FIELDS = [
+  "wc-interval", "wc-max-level", "wc-wallhaven-api-key", "wc-rotation", "wc-scaling", "wc-bg-color",
+  "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor",
+  "wc-fade-enabled", "wc-fade-duration", "wc-fade-steps",
+  "wc-overlay-enabled", "wc-overlay-mode", "wc-overlay-font-size", "wc-overlay-color",
+  "wc-overlay-offset-x", "wc-overlay-offset-y", "wc-overlay-backdrop",
+];
 
 async function initWallchanger() {
   document.getElementById("wc-toggle")?.addEventListener("click", wcToggleService);
@@ -997,18 +945,11 @@ async function initWallchanger() {
   document.getElementById("wc-move-up")?.addEventListener("click", () => wcMoveSource(-1));
   document.getElementById("wc-move-down")?.addEventListener("click", () => wcMoveSource(1));
 
-  for (const id of [
-    "wc-interval", "wc-max-level", "wc-wallhaven-api-key", "wc-rotation", "wc-scaling", "wc-bg-color",
-    "wc-separate-queues", "wc-unique-queues", "wc-stop-slideshow", "wc-one-monitor",
-    "wc-fade-enabled", "wc-fade-duration", "wc-fade-steps",
-    "wc-overlay-enabled", "wc-overlay-mode", "wc-overlay-font-size", "wc-overlay-color",
-    "wc-overlay-offset-x", "wc-overlay-offset-y", "wc-overlay-backdrop",
-  ]) {
+  for (const id of WC_FORM_FIELDS) {
     document.getElementById(id)?.addEventListener("change", () => {
-      wcUpdateModelFromUi();
+      wcQueuePatch(wcReadForm());
       wcUpdateBgColorVisibility();
       wcUpdateOverlayVisibility();
-      wcAutoSave();
     });
   }
 
@@ -1020,12 +961,78 @@ async function initWallchanger() {
 
 async function wcLoadSettings() {
   try {
-    wcSettings = await invoke("wc_get_settings");
-    wcRenderSettings();
-    wcRenderSources();
+    wcApplySettings(await invoke("wc_get_settings"));
   } catch (err) {
     wcShowMessage(`Error loading settings: ${err}`, "error");
   }
+}
+
+/** Adopts settings from the backend, keeping local edits that haven't been sent yet. */
+function wcApplySettings(settings) {
+  const next = { ...settings, ...wcPendingPatch };
+  const changed = JSON.stringify(next) !== JSON.stringify(wcSettings);
+  wcSettings = next;
+  if (changed) {
+    wcRenderSettings();
+    wcRenderSources();
+  }
+}
+
+/** Records a partial settings update; it is sent after a short pause in editing. */
+function wcQueuePatch(patch) {
+  if (!wcSettings) return;
+  Object.assign(wcPendingPatch, patch);
+  Object.assign(wcSettings, patch);
+  clearTimeout(wcPatchTimer);
+  wcPatchTimer = setTimeout(wcFlushPatch, 300);
+}
+
+/** Sends pending edits now; the backend answers with the normalized settings. */
+async function wcFlushPatch() {
+  clearTimeout(wcPatchTimer);
+  if (Object.keys(wcPendingPatch).length === 0) return;
+  const patch = wcPendingPatch;
+  wcPendingPatch = {};
+  try {
+    wcApplySettings(await invoke("wc_update_settings", { patch }));
+  } catch (err) {
+    wcShowMessage(`Error saving settings: ${err}`, "error");
+    await wcLoadSettings();
+  }
+}
+
+/** The form's values as a settings patch (the backend clamps and validates them). */
+function wcReadForm() {
+  const el = (id) => document.getElementById(id);
+  const patch = {
+    wallhaven_api_key: el("wc-wallhaven-api-key").value || "",
+    rotation_mode: el("wc-rotation").value,
+    scaling_mode: el("wc-scaling").value,
+    background_color_argb: wcHexToArgb(el("wc-bg-color").value),
+    use_separate_monitor_queues: el("wc-separate-queues").checked,
+    keep_image_in_single_monitor_queue: el("wc-unique-queues").checked,
+    disable_windows_slideshow_when_running: el("wc-stop-slideshow").checked,
+    change_one_monitor_per_interval: el("wc-one-monitor").checked,
+    show_picture_name_overlay: el("wc-overlay-enabled").checked,
+    picture_name_overlay_text_mode: el("wc-overlay-mode").value,
+    picture_name_overlay_text_color_argb: wcHexToArgb(el("wc-overlay-color").value),
+    picture_name_overlay_use_backdrop: el("wc-overlay-backdrop").checked,
+    enable_wallpaper_fade_transition: el("wc-fade-enabled").checked,
+  };
+  const numbers = {
+    interval_minutes: "wc-interval",
+    maximum_source_level: "wc-max-level",
+    picture_name_overlay_font_size: "wc-overlay-font-size",
+    picture_name_overlay_offset_x: "wc-overlay-offset-x",
+    picture_name_overlay_offset_y: "wc-overlay-offset-y",
+    wallpaper_fade_duration_ms: "wc-fade-duration",
+    wallpaper_fade_steps: "wc-fade-steps",
+  };
+  for (const [key, id] of Object.entries(numbers)) {
+    const n = parseInt(el(id).value, 10);
+    if (Number.isFinite(n)) patch[key] = n;
+  }
+  return patch;
 }
 
 function wcArgbToHex(argb) {
@@ -1099,24 +1106,18 @@ function escapeHtml(text) {
     .replace(/'/g, "&#039;");
 }
 
-function isWallhavenUrl(path) {
-  const p = (path || "").trim().toLowerCase();
-  return (p.startsWith("http://") || p.startsWith("https://")) && p.includes("wallhaven.cc");
+/** Replaces the source list (structural changes re-render it). */
+function wcSetSources(sources, { render = true } = {}) {
+  wcQueuePatch({ source_folders: sources });
+  if (render) wcRenderSources();
 }
 
-function wcParsePurity(purity) {
-  const s = String(purity || "110").trim();
-  let valid = "110";
-  if (/^[01]{0,3}$/.test(s)) {
-    valid = s.padEnd(3, "0").slice(0, 3);
-  }
-  if (valid === "000") valid = "100";
-  return [valid[0] === "1", valid[1] === "1", valid[2] === "1"];
-}
-
-function wcBuildPurity(bits) {
-  const s = bits.map((b) => (b ? "1" : "0")).join("");
-  return s === "000" ? "100" : s;
+/** Changes fields of one source without re-rendering the list. */
+function wcEditSource(index, changes) {
+  wcSetSources(
+    wcSettings.source_folders.map((source, i) => (i === index ? { ...source, ...changes } : source)),
+    { render: false }
+  );
 }
 
 function wcRenderSources() {
@@ -1124,22 +1125,21 @@ function wcRenderSources() {
   container.innerHTML = "";
 
   wcSettings.source_folders.forEach((source, index) => {
-    const isUrl = isWallhavenUrl(source.path);
+    const isWallhaven = source.kind === "wallhaven";
     const row = document.createElement("div");
     row.className = `wallchanger-source${index === wcSelectedSourceIndex ? " selected" : ""}`;
-    row.style.gridTemplateColumns = isUrl ? "24px 1fr 60px 80px 180px" : "24px 1fr 60px 110px";
-    const pageLimit = Number.isFinite(source.wallhaven_page_limit) ? source.wallhaven_page_limit : 1;
-    const [sfw, sketchy, nsfw] = wcParsePurity(source.wallhaven_purity);
+    row.style.gridTemplateColumns = isWallhaven ? "24px 1fr 60px 80px 180px" : "24px 1fr 60px 110px";
+    const purity = source.purity || {};
     row.innerHTML = `
       <input type="checkbox" ${source.enabled ? "checked" : ""} title="Enabled">
-      <input type="text" value="${escapeHtml(source.path)}" placeholder="Folder or URL" ${isUrl ? "" : "readonly"}>
+      <input type="text" value="${escapeHtml(source.path)}" placeholder="Folder or URL" ${isWallhaven ? "" : "readonly"}>
       <input type="number" min="1" max="10" value="${source.level}" title="Level">
-      ${isUrl ? `
-        <input type="number" min="0" max="20" value="${pageLimit}" title="Page limit (0 = unlimited)">
+      ${isWallhaven ? `
+        <input type="number" min="0" max="20" value="${source.page_limit}" title="Page limit (0 = unlimited)">
         <div class="wallchanger-purity" title="Purity">
-          <label class="wallchanger-option" title="Safe for work"><input type="checkbox" data-purity="0" ${sfw ? "checked" : ""}><span>SFW</span></label>
-          <label class="wallchanger-option" title="Sketchy"><input type="checkbox" data-purity="1" ${sketchy ? "checked" : ""}><span>Sketchy</span></label>
-          <label class="wallchanger-option" title="Not safe for work; requires API key"><input type="checkbox" data-purity="2" ${nsfw ? "checked" : ""}><span>NSFW</span></label>
+          <label class="wallchanger-option" title="Safe for work"><input type="checkbox" data-purity="sfw" ${purity.sfw ? "checked" : ""}><span>SFW</span></label>
+          <label class="wallchanger-option" title="Sketchy"><input type="checkbox" data-purity="sketchy" ${purity.sketchy ? "checked" : ""}><span>Sketchy</span></label>
+          <label class="wallchanger-option" title="Not safe for work; requires API key"><input type="checkbox" data-purity="nsfw" ${purity.nsfw ? "checked" : ""}><span>NSFW</span></label>
         </div>
       ` : `
         <label class="wallchanger-option" title="Include subfolders">
@@ -1157,58 +1157,34 @@ function wcRenderSources() {
     });
 
     row.querySelector('input[type="checkbox"]').addEventListener("change", (e) => {
-      wcSettings.source_folders[index].enabled = e.target.checked;
-      wcAutoSave();
+      wcEditSource(index, { enabled: e.target.checked });
     });
 
     const inputs = row.querySelectorAll('input[type="text"], input[type="number"]');
-    const pathInput = inputs[0];
-    const levelInput = inputs[1];
+    const [pathInput, levelInput, pageLimitInput] = inputs;
 
-    pathInput.addEventListener("change", (e) => {
-      const previousUrl = isWallhavenUrl(wcSettings.source_folders[index].path);
-      wcSettings.source_folders[index].path = e.target.value.trim();
-      const nowUrl = isWallhavenUrl(wcSettings.source_folders[index].path);
-      if (previousUrl !== nowUrl) {
-        if (nowUrl) {
-          wcSettings.source_folders[index].include_subfolders = false;
-          const existingLimit = wcSettings.source_folders[index].wallhaven_page_limit;
-          wcSettings.source_folders[index].wallhaven_page_limit = Number.isFinite(existingLimit) ? existingLimit : 1;
-          wcSettings.source_folders[index].wallhaven_purity = wcSettings.source_folders[index].wallhaven_purity || "110";
-        }
-        wcRenderSources();
-      }
-      wcAutoSave();
-    });
-
+    pathInput.addEventListener("change", (e) => wcEditSource(index, { path: e.target.value.trim() }));
     levelInput.addEventListener("change", (e) => {
-      wcSettings.source_folders[index].level = Math.min(10, Math.max(1, parseInt(e.target.value, 10) || 1));
-      wcAutoSave();
+      const level = parseInt(e.target.value, 10);
+      if (Number.isFinite(level)) wcEditSource(index, { level });
     });
 
-    if (isUrl) {
-      const pageLimitInput = inputs[2];
-      const purityInputs = row.querySelectorAll('.wallchanger-purity input[type="checkbox"]');
+    if (isWallhaven) {
       pageLimitInput.addEventListener("change", (e) => {
-        const value = parseInt(e.target.value, 10);
-        wcSettings.source_folders[index].wallhaven_page_limit = Number.isNaN(value) ? 1 : Math.max(0, value);
-        wcAutoSave();
+        const pageLimit = parseInt(e.target.value, 10);
+        if (Number.isFinite(pageLimit)) wcEditSource(index, { page_limit: pageLimit });
       });
+      const purityInputs = row.querySelectorAll(".wallchanger-purity input[type=\"checkbox\"]");
       purityInputs.forEach((cb) => {
         cb.addEventListener("change", () => {
-          const bits = Array.from(purityInputs).map((p) => p.checked);
-          wcSettings.source_folders[index].wallhaven_purity = wcBuildPurity(bits);
-          wcAutoSave();
+          const next = {};
+          purityInputs.forEach((p) => (next[p.dataset.purity] = p.checked));
+          wcEditSource(index, { purity: next });
         });
       });
     } else {
       const subCheck = row.querySelector('label.wallchanger-option input[type="checkbox"]');
-      if (subCheck) {
-        subCheck.addEventListener("change", (e) => {
-          wcSettings.source_folders[index].include_subfolders = e.target.checked;
-          wcAutoSave();
-        });
-      }
+      subCheck?.addEventListener("change", (e) => wcEditSource(index, { include_subfolders: e.target.checked }));
     }
 
     container.appendChild(row);
@@ -1224,45 +1200,14 @@ function wcUpdateToolbar() {
   document.getElementById("wc-move-down").disabled = !hasSelection || wcSelectedSourceIndex === wcSettings.source_folders.length - 1;
 }
 
-function wcUpdateModelFromUi() {
-  if (!wcSettings) return;
-  wcSettings.interval_minutes = Math.min(1440, Math.max(1, parseInt(document.getElementById("wc-interval").value, 10) || 30));
-  wcSettings.maximum_source_level = Math.min(10, Math.max(1, parseInt(document.getElementById("wc-max-level").value, 10) || 10));
-  wcSettings.wallhaven_api_key = (document.getElementById("wc-wallhaven-api-key").value || "").trim();
-  wcSettings.use_wallhaven_api_key = wcSettings.wallhaven_api_key.length > 0;
-  wcSettings.rotation_mode = document.getElementById("wc-rotation").value;
-  wcSettings.scaling_mode = document.getElementById("wc-scaling").value;
-  wcSettings.background_color_argb = wcHexToArgb(document.getElementById("wc-bg-color").value);
-  wcSettings.use_separate_monitor_queues = document.getElementById("wc-separate-queues").checked;
-  wcSettings.keep_image_in_single_monitor_queue = document.getElementById("wc-unique-queues").checked;
-  wcSettings.disable_windows_slideshow_when_running = document.getElementById("wc-stop-slideshow").checked;
-  wcSettings.change_one_monitor_per_interval = document.getElementById("wc-one-monitor").checked;
-  wcSettings.show_picture_name_overlay = document.getElementById("wc-overlay-enabled").checked;
-  wcSettings.picture_name_overlay_text_mode = document.getElementById("wc-overlay-mode").value;
-  wcSettings.picture_name_overlay_font_size = Math.max(1, parseInt(document.getElementById("wc-overlay-font-size").value, 10) || 28);
-  wcSettings.picture_name_overlay_text_color_argb = wcHexToArgb(document.getElementById("wc-overlay-color").value);
-  wcSettings.picture_name_overlay_offset_x = parseInt(document.getElementById("wc-overlay-offset-x").value, 10) || 0;
-  wcSettings.picture_name_overlay_offset_y = parseInt(document.getElementById("wc-overlay-offset-y").value, 10) || 0;
-  wcSettings.picture_name_overlay_use_backdrop = document.getElementById("wc-overlay-backdrop").checked;
-  wcSettings.enable_wallpaper_fade_transition = document.getElementById("wc-fade-enabled").checked;
-  wcSettings.wallpaper_fade_duration_ms = Math.max(0, parseInt(document.getElementById("wc-fade-duration").value, 10) || 0);
-  wcSettings.wallpaper_fade_steps = Math.max(1, parseInt(document.getElementById("wc-fade-steps").value, 10) || 12);
-}
-
 async function wcAddFolder() {
   try {
     const folder = await openDialog({ directory: true });
     if (!folder) return;
-    wcSettings.source_folders.push({
-      path: folder,
-      enabled: true,
-      include_subfolders: true,
-      level: 5,
-      wallhaven_page_limit: 1,
-      wallhaven_purity: "110",
-    });
-    wcRenderSources();
-    await wcAutoSave();
+    wcSetSources([
+      ...wcSettings.source_folders,
+      { path: folder, enabled: true, level: 5, kind: "folder", include_subfolders: true },
+    ]);
   } catch (err) {
     wcShowMessage(`Error adding folder: ${err}`, "error");
   }
@@ -1276,54 +1221,40 @@ async function wcAddWallhavenUrl() {
     wcShowMessage("Please enter a valid Wallhaven URL.", "error");
     return;
   }
-  wcSettings.source_folders.push({
-    path: trimmed,
-    enabled: true,
-    include_subfolders: false,
-    level: 5,
-    wallhaven_page_limit: 1,
-    wallhaven_purity: "110",
-  });
-  wcRenderSources();
-  await wcAutoSave();
+  wcSetSources([
+    ...wcSettings.source_folders,
+    {
+      path: trimmed,
+      enabled: true,
+      level: 5,
+      kind: "wallhaven",
+      page_limit: 1,
+      purity: { sfw: true, sketchy: true, nsfw: false },
+    },
+  ]);
 }
 
 function wcRemoveSource() {
   if (wcSelectedSourceIndex < 0) return;
-  wcSettings.source_folders.splice(wcSelectedSourceIndex, 1);
-  wcSelectedSourceIndex = Math.min(wcSelectedSourceIndex, wcSettings.source_folders.length - 1);
-  wcRenderSources();
-  wcAutoSave();
+  const sources = wcSettings.source_folders.filter((_, i) => i !== wcSelectedSourceIndex);
+  wcSelectedSourceIndex = Math.min(wcSelectedSourceIndex, sources.length - 1);
+  wcSetSources(sources);
 }
 
 function wcMoveSource(delta) {
   if (wcSelectedSourceIndex < 0) return;
   const newIndex = wcSelectedSourceIndex + delta;
   if (newIndex < 0 || newIndex >= wcSettings.source_folders.length) return;
-  const [moved] = wcSettings.source_folders.splice(wcSelectedSourceIndex, 1);
-  wcSettings.source_folders.splice(newIndex, 0, moved);
+  const sources = [...wcSettings.source_folders];
+  const [moved] = sources.splice(wcSelectedSourceIndex, 1);
+  sources.splice(newIndex, 0, moved);
   wcSelectedSourceIndex = newIndex;
-  wcRenderSources();
-  wcAutoSave();
-}
-
-let wcAutoSaveTimer = null;
-
-function wcAutoSave() {
-  clearTimeout(wcAutoSaveTimer);
-  wcAutoSaveTimer = setTimeout(async () => {
-    try {
-      await invoke("wc_save_settings", { settings: wcSettings });
-    } catch (err) {
-      wcShowMessage(`Error saving settings: ${err}`, "error");
-    }
-  }, 300);
+  wcSetSources(sources);
 }
 
 async function wcChangeNow() {
   try {
-    wcUpdateModelFromUi();
-    await invoke("wc_save_settings", { settings: wcSettings });
+    await wcFlushPatch();
     const result = await invoke("wc_change_now");
     wcShowMessage(result, "success");
   } catch (err) {

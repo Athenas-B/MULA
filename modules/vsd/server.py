@@ -7,7 +7,9 @@ MP4 file using ffmpeg. Designed to be managed by the MULA app.
 
 import os
 import re
+import ssl
 import sys
+import hmac
 import uuid
 import shutil
 import logging
@@ -15,9 +17,12 @@ import platform
 import tempfile
 import threading
 import subprocess
+import http.client
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from time import time
@@ -41,7 +46,16 @@ LOG_DIR = Path(os.environ.get("VSD_LOG_DIR", str(_HERE / "logs")))
 LOG_FILE = LOG_DIR / "vsd.log"
 AUTO_OPEN = os.environ.get("VSD_AUTO_OPEN", "0").strip().lower() in ("1", "true", "yes")
 MAX_RETRIES = int(os.environ.get("VSD_MAX_RETRIES", "3"))
+# Segments downloaded in parallel per job (clamped to 1..16).
+SEGMENT_WORKERS = max(1, min(16, int(os.environ.get("VSD_SEGMENT_WORKERS", "6"))))
+FETCH_TIMEOUT = 30  # seconds, per HTTP request
+MAX_REDIRECTS = 10
 JOB_TTL_SECONDS = 3600  # Remove finished jobs after 1 hour
+
+# Per-launch secret from MULA that authorizes configuration changes. Removed from
+# the environment so ffmpeg and opened files never inherit it.
+ADMIN_TOKEN = os.environ.pop("VSD_ADMIN_TOKEN", "").strip()
+ADMIN_TOKEN_HEADER = "X-VSD-Admin-Token"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -65,7 +79,8 @@ app = Flask(__name__)
 
 # Only the VSD browser extension (and MULA itself, which sends no Origin header) may
 # talk to the server. Without this, any web page open in the browser could drive it,
-# e.g. POST /open to launch a local executable.
+# e.g. POST /open to launch a local executable. Configuration changes additionally
+# require the admin token (see _has_admin_token).
 _ALLOWED_ORIGIN_RE = re.compile(r"^(chrome-extension|moz-extension)://[A-Za-z0-9._-]+$")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
 
@@ -88,6 +103,22 @@ def _json_object() -> dict | None:
     """The request body as a JSON object, or None if it is missing, invalid or not an object."""
     data = request.get_json(force=True, silent=True)
     return data if isinstance(data, dict) else None
+
+
+def _has_admin_token() -> bool:
+    """True if the request carries the per-launch admin token MULA was started with.
+
+    With no token configured, nobody is authorized: an unset or empty
+    VSD_ADMIN_TOKEN disables configuration changes instead of opening them up.
+    """
+    if not ADMIN_TOKEN:
+        logger.warning(f"Refused {request.method} {request.path}: no admin token configured")
+        return False
+    supplied = request.headers.get(ADMIN_TOKEN_HEADER, "")
+    if not supplied or not hmac.compare_digest(supplied.encode(), ADMIN_TOKEN.encode()):
+        logger.warning(f"Refused {request.method} {request.path}: missing or wrong admin token")
+        return False
+    return True
 
 
 @app.before_request
@@ -166,21 +197,193 @@ def _is_http_url(url: str) -> bool:
     return urllib.parse.urlsplit(url).scheme.lower() in ("http", "https")
 
 
-def _fetch(url: str, headers: dict | None = None, retries: int = MAX_RETRIES) -> bytes:
-    """Fetch a URL with retry logic."""
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# A request on a kept-alive connection can fail like this when the server has
+# already closed it while idle; that is retried once on a fresh connection.
+_STALE_CONNECTION_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Hands 3xx responses back to _fetch_once, which follows them itself so that
+    every hop gets the http(s) scheme check and the cleaned headers."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Like urlopen (proxy-aware, fresh connection per request) but without following redirects.
+_URLLIB_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _urllib_request(url: str, headers: dict) -> tuple[int, str, object, bytes]:
+    """One GET through urllib. Returns (status, reason, headers, body) for 2xx and 3xx
+    responses and raises urllib.error.HTTPError for any other status."""
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with _URLLIB_OPENER.open(req, timeout=FETCH_TIMEOUT) as resp:
+            return resp.status, resp.reason, resp.headers, resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in _REDIRECT_CODES:
+            e.close()
+            return e.code, e.reason, e.headers, b""
+        raise
+
+
+class _ConnectionPool:
+    """Kept-alive http.client connections, shared by the workers of one download.
+
+    A worker checks a connection out for a single request and returns it
+    afterwards, so connections are reused across segments without ever being
+    used by two threads at once. Hosts that must be reached through a proxy are
+    reported by uses_proxy(); callers send those requests through urllib, which
+    honours the proxy settings (http.client does not).
+    """
+
+    def __init__(self, proxies: dict | None = None):
+        self._lock = threading.Lock()
+        self._idle: dict[tuple, list] = {}
+        self._closed = False
+        self._proxies = urllib.request.getproxies() if proxies is None else proxies
+        self._proxy_cache: dict[tuple, bool] = {}
+        self._ssl_context = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def uses_proxy(self, url: str) -> bool:
+        parts = urllib.parse.urlsplit(url)
+        key = (parts.scheme.lower(), parts.hostname or "")
+        with self._lock:
+            cached = self._proxy_cache.get(key)
+        if cached is not None:
+            return cached
+        if key[0] not in self._proxies:
+            result = False
+        else:
+            try:
+                result = not urllib.request.proxy_bypass(key[1])
+            except Exception:
+                result = True
+        with self._lock:
+            self._proxy_cache[key] = result
+        return result
+
+    def _connect(self, scheme: str, host: str, port: int) -> http.client.HTTPConnection:
+        if scheme == "https":
+            with self._lock:
+                if self._ssl_context is None:
+                    self._ssl_context = ssl.create_default_context()
+                context = self._ssl_context
+            return http.client.HTTPSConnection(host, port, timeout=FETCH_TIMEOUT, context=context)
+        return http.client.HTTPConnection(host, port, timeout=FETCH_TIMEOUT)
+
+    def _checkout(self, key: tuple) -> tuple[http.client.HTTPConnection, bool]:
+        """An idle connection for `key` (reused=True) or a new one (reused=False)."""
+        with self._lock:
+            idle = self._idle.get(key)
+            if idle:
+                return idle.pop(), True
+        return self._connect(*key), False
+
+    def _checkin(self, key: tuple, conn: http.client.HTTPConnection):
+        with self._lock:
+            if not self._closed:
+                self._idle.setdefault(key, []).append(conn)
+                return
+        conn.close()
+
+    def request(self, url: str, headers: dict) -> tuple[int, str, object, bytes]:
+        """One GET on a kept-alive connection. Returns (status, reason, headers, body)
+        for any status; redirects and errors are left to the caller."""
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        key = (scheme, parts.hostname or "", parts.port or _DEFAULT_PORTS[scheme])
+        target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+
+        while True:
+            conn, reused = self._checkout(key)
+            try:
+                conn.request("GET", target, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read()
+            except _STALE_CONNECTION_ERRORS:
+                conn.close()
+                if reused:
+                    continue  # the server dropped the idle connection; try a fresh one
+                raise
+            except BaseException:
+                conn.close()
+                raise
+            if resp.will_close:
+                conn.close()
+            else:
+                self._checkin(key, conn)
+            return resp.status, resp.reason, resp.headers, body
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            conns = [c for idle in self._idle.values() for c in idle]
+            self._idle.clear()
+        for conn in conns:
+            conn.close()
+
+
+def _fetch_once(url: str, headers: dict, pool: _ConnectionPool | None = None) -> bytes:
+    """GET `url` once, following redirects. `headers` must already be cleaned.
+
+    Requests go through `pool` (kept-alive connections) when one is given and the
+    host is not behind a proxy, otherwise through urllib. Every hop, including
+    each redirect target, must be http(s) and is sent with the same headers.
+    """
+    for _ in range(MAX_REDIRECTS + 1):
+        if not _is_http_url(url):
+            raise ValueError(f"Refusing to fetch non-HTTP URL: {url[:80]}")
+        if pool is not None and not pool.uses_proxy(url):
+            status, reason, resp_headers, body = pool.request(url, headers)
+        else:
+            status, reason, resp_headers, body = _urllib_request(url, headers)
+        if 200 <= status < 300:
+            return body
+        location = resp_headers.get("Location") if status in _REDIRECT_CODES else None
+        if not location:
+            raise urllib.error.HTTPError(url, status, reason, resp_headers, None)
+        url = urllib.parse.urljoin(url, location)
+    raise urllib.error.URLError(f"Too many redirects (more than {MAX_REDIRECTS})")
+
+
+def _fetch(
+    url: str,
+    headers: dict | None = None,
+    retries: int = MAX_RETRIES,
+    pool: _ConnectionPool | None = None,
+) -> bytes:
+    """Fetch a URL with retry logic.
+
+    With a `pool`, the first attempt uses a kept-alive connection; after a
+    connection-level failure the remaining attempts fall back to urllib (a fresh,
+    proxy-aware connection per request). HTTP error statuses are retried on the
+    same transport. A non-http(s) URL or redirect target is never retried.
+    """
     if not _is_http_url(url):
         raise ValueError(f"Refusing to fetch non-HTTP URL: {url[:80]}")
     req_headers = {"User-Agent": _DEFAULT_UA, **_clean_headers(headers)}
-    req = urllib.request.Request(url, headers=req_headers)
     retries = max(1, retries)
 
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read()
+            return _fetch_once(url, req_headers, pool)
+        except ValueError:
+            raise
         except Exception as e:
             last_err = e
+            if pool is not None and not isinstance(e, urllib.error.HTTPError):
+                pool = None
             if attempt < retries:
                 logger.warning(f"Fetch attempt {attempt}/{retries} failed for {url[:80]}: {e}")
     raise last_err
@@ -243,26 +446,52 @@ def _open_file(path: Path):
 def _download_segments(
     segments: list[str], tmpdir: Path, headers: dict | None, job_id: str
 ) -> list[Path]:
-    """Download all .ts segments to a temp directory."""
+    """Download all .ts segments to a temp directory, SEGMENT_WORKERS at a time.
+
+    Returns the downloaded files in playlist order (seg_00000, seg_00001, ...).
+    Each segment gets its own retries (_fetch). Once a segment has failed for good
+    the job cannot succeed, so segments that have not started yet are cancelled
+    and the returned list is shorter than `segments`; _run_download treats that
+    as a failure.
+    """
     total = len(segments)
     _set_job(job_id, total=total, current=0, stage="downloading")
-    seg_files = []
+    if not total:
+        return []
+    results: list[Path | None] = [None] * total
+    completed = 0
 
-    for i, url in enumerate(segments):
+    def download(i: int, url: str, pool: _ConnectionPool) -> Path:
         ext = Path(urllib.parse.urlparse(url).path).suffix or ".ts"
         seg_path = tmpdir / f"seg_{i:05d}{ext}"
-        try:
-            data = _fetch(url, headers)
-            seg_path.write_bytes(data)
-            seg_files.append(seg_path)
-            _set_job(job_id, current=len(seg_files))
-        except Exception as e:
-            logger.error(f"Segment {i+1}/{total} failed: {e}")
+        seg_path.write_bytes(_fetch(url, headers, pool=pool))
+        return seg_path
 
-        if (i + 1) % 20 == 0 or i == total - 1:
-            logger.info(f"Progress: {len(seg_files)}/{total} segments downloaded")
+    # The executor is shut down (all workers finished) before the pool is closed.
+    with _ConnectionPool() as pool, ThreadPoolExecutor(
+        max_workers=min(SEGMENT_WORKERS, total), thread_name_prefix=f"vsd-{job_id}"
+    ) as executor:
+        futures = {executor.submit(download, i, url, pool): i for i, url in enumerate(segments)}
+        failed = False
+        for future in as_completed(futures):
+            i = futures[future]
+            if future.cancelled():
+                continue
+            try:
+                results[i] = future.result()
+            except Exception as e:
+                logger.error(f"Segment {i+1}/{total} failed: {e}")
+                if not failed:
+                    failed = True
+                    for other in futures:
+                        other.cancel()
+                continue
+            completed += 1
+            _set_job(job_id, current=completed)
+            if completed % 20 == 0 or completed == total:
+                logger.info(f"Progress: {completed}/{total} segments downloaded")
 
-    return seg_files
+    return [p for p in results if p is not None]
 
 
 def _mux_with_ffmpeg(seg_files: list[Path], output_path: Path, metadata: dict | None = None):
@@ -358,9 +587,8 @@ def _run_download(job_id: str, url: str, title: str, headers: dict | None, raw_m
         if not seg_files:
             raise ValueError("No segments could be downloaded")
         if len(seg_files) < len(segments):
-            missing = len(segments) - len(seg_files)
             raise ValueError(
-                f"{missing} of {len(segments)} segments could not be downloaded; "
+                f"only {len(seg_files)} of {len(segments)} segments were downloaded; "
                 "the video would have gaps, so nothing was saved"
             )
 
@@ -502,8 +730,11 @@ def config_download_dir():
     if request.method == "GET":
         return jsonify({"download_dir": str(DOWNLOAD_DIR)})
 
-    if request.headers.get("Origin") is not None:
-        return jsonify({"error": "The download directory can only be changed from MULA"}), 403
+    # The token is the only authority: MULA sends it (and no Origin). An allowed
+    # extension Origin with the right token is accepted too, but extensions are
+    # never given the token; web origins never get here (_reject_untrusted_callers).
+    if not _has_admin_token():
+        return jsonify({"error": "The download directory can only be changed by MULA"}), 403
 
     data = _json_object()
     if data is None:
@@ -528,4 +759,6 @@ if __name__ == "__main__":
     logger.info(f"VSD Server starting on http://{SERVER_HOST}:{SERVER_PORT}")
     logger.info(f"Download dir: {DOWNLOAD_DIR}")
     logger.info(f"ffmpeg: {FFMPEG_PATH}")
+    if not ADMIN_TOKEN:
+        logger.warning("VSD_ADMIN_TOKEN is not set: changing the download directory is disabled")
     app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False, threaded=True)

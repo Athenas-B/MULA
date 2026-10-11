@@ -1,18 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use chrono::Local;
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
 
 mod elevated_helper;
+mod error;
 mod logger;
+mod smart;
 mod startup;
 mod util;
+mod vsd;
 mod wallchanger;
 
-static VSD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
-static VSD_LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -46,262 +43,6 @@ fn open_config_dir() -> Result<String, String> {
     Ok(config_dir.to_string_lossy().to_string())
 }
 
-// ── VSD Server commands ──
-
-fn get_vsd_server_path() -> Option<std::path::PathBuf> {
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-
-    let candidates: Vec<std::path::PathBuf> = vec![
-        // Development: relative to project root (exe is in src-tauri/target/debug/)
-        exe_dir.join("../../../modules/vsd/server.py"),
-        // Installed: next to the executable
-        exe_dir.join("modules/vsd/server.py"),
-    ];
-
-    // Also check legacy location
-    let mut all_candidates = candidates;
-    if let Some(home) = dirs::home_dir() {
-        all_candidates.push(home.join("CascadeProjects").join("VSD Experiment").join("companion").join("server.py"));
-    }
-
-    for candidate in all_candidates {
-        if candidate.exists() {
-            return candidate.canonicalize().ok().or(Some(candidate));
-        }
-    }
-    None
-}
-
-fn get_python_command(venv_dir: &Path) -> std::path::PathBuf {
-    // Prefer a local virtual environment, fall back to system python
-    let venv_python = if cfg!(target_os = "windows") {
-        venv_dir.join(".venv").join("Scripts").join("python.exe")
-    } else {
-        venv_dir.join(".venv").join("bin").join("python")
-    };
-    if venv_python.exists() {
-        return venv_python;
-    }
-
-    if cfg!(target_os = "windows") {
-        std::path::PathBuf::from("python")
-    } else {
-        std::path::PathBuf::from("python3")
-    }
-}
-
-fn push_vsd_log(line: String) {
-    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-        logs.push(line);
-        if logs.len() > 1000 {
-            logs.drain(0..100);
-        }
-    }
-}
-
-/// Forwards one output stream of the VSD server to the MULA log and the UI log buffer.
-fn spawn_vsd_log_reader(stream: impl std::io::Read + Send + 'static) {
-    std::thread::spawn(move || {
-        for line in BufReader::new(stream).lines() {
-            let Ok(line) = line else { continue };
-            log::info!("[VSD] {line}");
-            push_vsd_log(format!("{line}\n"));
-        }
-    });
-}
-
-#[tauri::command]
-async fn vsd_start() -> Result<(), String> {
-    util::blocking(move || {
-        let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
-
-        if proc_guard.is_some() {
-            return Err("VSD Server is already running".to_string());
-        }
-
-        let server_path = get_vsd_server_path().ok_or("Could not find VSD server.py")?;
-        let working_dir = server_path.parent().unwrap().to_path_buf();
-        let python = get_python_command(&working_dir);
-
-        if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-            logs.clear();
-        }
-
-        // Install dependencies if needed
-        let requirements = working_dir.join("requirements.txt");
-        if requirements.exists() {
-            push_vsd_log("[Checking dependencies...]\n".to_string());
-
-            let output = Command::new(&python)
-                .args(["-m", "pip", "install", "-r"])
-                .arg(&requirements)
-                .arg("--quiet")
-                .current_dir(&working_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|e| format!("Failed to run pip: {e}"))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                push_vsd_log(format!("[pip install failed: {}]\n", stderr.trim()));
-                return Err(format!("Failed to install dependencies: {}", stderr.trim()));
-            }
-            push_vsd_log("[Dependencies OK]\n".to_string());
-        }
-
-        // Pass configured download dir to server via env var
-        let mut child = Command::new(&python)
-            .arg(&server_path)
-            .current_dir(&working_dir)
-            .env("VSD_DOWNLOAD_DIR", vsd_get_download_dir())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to start VSD server: {e}"))?;
-
-        if let Some(stdout) = child.stdout.take() {
-            spawn_vsd_log_reader(stdout);
-        }
-        if let Some(stderr) = child.stderr.take() {
-            spawn_vsd_log_reader(stderr);
-        }
-
-        *proc_guard = Some(child);
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-async fn vsd_stop() -> Result<(), String> {
-    util::blocking(move || {
-        let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
-        let mut child = proc_guard.take().ok_or("VSD Server is not running")?;
-        child.kill().map_err(|e| format!("Failed to stop VSD server: {e}"))?;
-        let _ = child.wait();
-        Ok(())
-    })
-    .await
-}
-
-fn vsd_is_running_sync() -> bool {
-    if let Ok(mut proc_guard) = VSD_PROCESS.lock() {
-        if let Some(child) = proc_guard.as_mut() {
-            // Check if process is still alive
-            match child.try_wait() {
-                Ok(None) => true,     // still running
-                Ok(Some(_)) => {
-                    *proc_guard = None; // process exited
-                    false
-                }
-                Err(_) => false,
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    }
-}
-
-#[tauri::command]
-async fn vsd_is_running() -> bool {
-    tauri::async_runtime::spawn_blocking(vsd_is_running_sync)
-        .await
-        .unwrap_or(false)
-}
-
-/// Returns new log lines since last call (drains the buffer)
-#[tauri::command]
-fn vsd_get_logs() -> Vec<String> {
-    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-        let lines: Vec<String> = logs.drain(..).collect();
-        lines
-    } else {
-        vec![]
-    }
-}
-
-/// Read a key from vsd.conf
-fn read_vsd_config_value(key: &str) -> Option<String> {
-    read_config_value_at(&get_config_dir().join("vsd.conf"), key)
-}
-
-/// Write a key=value to vsd.conf (update if exists, append if not)
-fn write_vsd_config_value(key: &str, value: &str) -> Result<(), String> {
-    write_config_value_at(&get_config_dir().join("vsd.conf"), key, value)
-}
-
-fn read_config_value_at(config_path: &Path, key: &str) -> Option<String> {
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let prefix = format!("{key}=");
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix(&prefix).map(|val| val.trim().to_string()))
-}
-
-fn write_config_value_at(config_path: &Path, key: &str, value: &str) -> Result<(), String> {
-    let mut lines: Vec<String> = std::fs::read_to_string(config_path)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
-
-    let new_line = format!("{key}={value}");
-    let prefix = format!("{key}=");
-    match lines.iter_mut().find(|line| line.starts_with(&prefix)) {
-        Some(line) => *line = new_line,
-        None => lines.push(new_line),
-    }
-
-    util::write_atomic(config_path, &(lines.join("\n") + "\n"))
-}
-
-/// Get the MULA config directory (e.g. C:\Users\<user>\AppData\Roaming\mula)
-fn get_config_dir() -> std::path::PathBuf {
-    util::mula_config_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
-#[tauri::command]
-fn vsd_get_download_dir() -> String {
-    read_vsd_config_value("VSD_DOWNLOAD_DIR").unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|h| h.join("Downloads").join("VSD").to_string_lossy().to_string())
-            .unwrap_or_default()
-    })
-}
-
-#[tauri::command]
-fn vsd_set_download_dir(path: String) -> Result<(), String> {
-    write_vsd_config_value("VSD_DOWNLOAD_DIR", &path)?;
-
-    // If server is running, update it live via API
-    if vsd_is_running_sync() {
-        let body = serde_json::json!({ "path": path }).to_string();
-        let _ = std::thread::spawn(move || {
-            let req = urllib_post("http://127.0.0.1:8765/config/download_dir", &body);
-            if let Err(e) = req {
-                log::error!("Failed to update running server download dir: {e}");
-            }
-        });
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-fn vsd_get_autostart() -> bool {
-    read_vsd_config_value("VSD_AUTOSTART")
-        .map(|v| v == "true")
-        .unwrap_or(false)
-}
-
-#[tauri::command]
-fn vsd_set_autostart(enabled: bool) -> Result<(), String> {
-    write_vsd_config_value("VSD_AUTOSTART", if enabled { "true" } else { "false" })
-}
-
 /// Holds a handle to the tray menu's "Start MULA with Windows" check item so its
 /// checked state can be kept in sync with the System tab toggle, and vice versa.
 struct AutostartMenuState(tauri::menu::CheckMenuItem<tauri::Wry>);
@@ -326,57 +67,6 @@ fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> 
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     apply_autostart(&app, enabled)
-}
-
-fn urllib_post(url: &str, body: &str) -> Result<(), String> {
-    ureq::post(url)
-        .set("Content-Type", "application/json")
-        .send_string(body)
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Get the extension directory for a given browser target
-fn get_extension_dir(browser: &str) -> Option<std::path::PathBuf> {
-    let vsd_dir = get_vsd_server_path()?.parent()?.to_path_buf();
-    let ext_dir = vsd_dir.join("extension").join("dist").join(browser);
-    Some(ext_dir)
-}
-
-/// Get the extension build script path
-fn get_extension_build_script() -> Option<std::path::PathBuf> {
-    let vsd_dir = get_vsd_server_path()?.parent()?.to_path_buf();
-    let build_script = vsd_dir.join("extension").join("build.py");
-    if build_script.exists() { Some(build_script) } else { None }
-}
-
-/// Builds the browser extension and returns its folder (the UI reveals it).
-#[tauri::command]
-async fn vsd_install_extension(browser: String) -> Result<String, String> {
-    util::blocking(move || {
-        let build_script = get_extension_build_script().ok_or("Could not find extension build script")?;
-        let python = get_python_command(build_script.parent().unwrap());
-
-        let output = Command::new(&python)
-            .arg(&build_script)
-            .arg(&browser)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("Failed to run build script: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Build failed: {}", stderr.trim()));
-        }
-
-        let ext_dir = get_extension_dir(&browser).ok_or("Could not determine extension output directory")?;
-        if !ext_dir.exists() {
-            return Err(format!("Extension not found at {}", ext_dir.display()));
-        }
-        Ok(ext_dir.to_string_lossy().to_string())
-    })
-    .await
 }
 
 // ── Drive Test commands ──
@@ -833,394 +523,16 @@ fn find_drive(id: &str) -> Result<DriveInfo, String> {
         .ok_or_else(|| format!("Drive not found: {id}"))
 }
 
-fn extract_physical_drive_number(id: &str) -> Result<u32, String> {
-    let upper = id.to_uppercase();
-    let prefix = r"\\.\PHYSICALDRIVE";
-    let num_str = if upper.starts_with(prefix) {
-        &id[prefix.len()..]
-    } else if upper.starts_with("PHYSICALDRIVE") {
-        &id["PHYSICALDRIVE".len()..]
-    } else {
-        return Err(format!("Unrecognized drive device ID: {id}"));
-    };
-
-    num_str
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| format!("Could not parse drive number from: {id}"))
-}
-
-fn find_smartctl() -> Option<std::path::PathBuf> {
-    let known_paths = [
-        r"C:\Program Files\smartmontools\bin\smartctl.exe",
-        r"C:\Program Files (x86)\smartmontools\bin\smartctl.exe",
-    ];
-    for p in &known_paths {
-        let path = std::path::PathBuf::from(p);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    find_on_path("smartctl")
-}
-
-/// Finds `name` on PATH: the absolute path `where` reports (the elevated helper requires
-/// one), else the bare name if it can be run.
-fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
-    if let Ok(output) = Command::new("where").arg(name).output() {
-        let out = String::from_utf8_lossy(&output.stdout);
-        if let Some(first) = out.lines().map(str::trim).find(|l| !l.is_empty()) {
-            let path = std::path::PathBuf::from(first);
-            if path.is_absolute() && path.exists() {
-                return Some(path);
-            }
-        }
-    }
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok()
-        .then(|| std::path::PathBuf::from(name))
-}
-
-fn install_smartctl() -> Result<std::path::PathBuf, String> {
-    if cfg!(not(target_os = "windows")) {
-        return Err("smartctl not found. Please install smartmontools using your package manager.".to_string());
-    }
-
-    let winget = find_on_path("winget").ok_or("winget not found. Please install smartmontools manually from https://www.smartmontools.org/")?;
-
-    let output = Command::new(&winget)
-        .args([
-            "install",
-            "--id", "smartmontools.smartmontools",
-            "-e",
-            "--accept-source-agreements",
-            "--accept-package-agreements",
-            "--disable-interactivity",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run winget: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "winget install failed.\nstdout: {}\nstderr: {}",
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-
-    find_smartctl().ok_or_else(|| "smartmontools was installed but smartctl could not be found. Restart MULA or add C:\\Program Files\\smartmontools\\bin to PATH.".to_string())
-}
-
-/// Marker in error messages that tells the frontend smartctl is missing, so it can ask the
-/// user before calling `install_smartmontools`.
-const SMARTCTL_MISSING: &str = "SMARTCTL_MISSING";
-
-static SMARTCTL_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
-
-/// Finds smartctl. Never installs anything by itself; only successes are cached, so a
-/// smartctl installed later is picked up without restarting MULA.
-fn ensure_smartctl() -> Result<std::path::PathBuf, String> {
-    let mut guard = SMARTCTL_PATH.lock().map_err(|e| e.to_string())?;
-    if let Some(path) = guard.as_ref() {
-        return Ok(path.clone());
-    }
-    let path = find_smartctl()
-        .ok_or_else(|| format!("{SMARTCTL_MISSING}: smartmontools (smartctl) is not installed."))?;
-    *guard = Some(path.clone());
-    Ok(path)
-}
-
-/// Installs smartmontools with winget. Only called after the user agreed in the UI.
-#[tauri::command]
-async fn install_smartmontools() -> Result<String, String> {
-    util::logged_blocking("install_smartmontools", || {
-        let path = install_smartctl()?;
-        if let Ok(mut guard) = SMARTCTL_PATH.lock() {
-            *guard = Some(path.clone());
-        }
-        Ok(path.to_string_lossy().to_string())
-    })
-    .await
-}
-
-/// Drive id → (smartctl device, device type). Resolving a drive enumerates every disk through
-/// PowerShell and probes each smartctl device, which is far too slow to repeat on every poll.
-static SMART_DEVICES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, (String, String)>>> =
-    std::sync::LazyLock::new(Default::default);
-
-fn cached_smart_device(id: &str) -> Option<(String, String)> {
-    SMART_DEVICES.lock().ok()?.get(id).cloned()
-}
-
-fn remember_smart_device(id: &str, device: &str, dtype: &str) {
-    if let Ok(mut map) = SMART_DEVICES.lock() {
-        map.insert(id.to_string(), (device.to_string(), dtype.to_string()));
-    }
-}
-
-fn forget_smart_device(id: &str) {
-    if let Ok(mut map) = SMART_DEVICES.lock() {
-        map.remove(id);
-    }
-}
-
-fn sd_letter_to_number(s: &str) -> u32 {
-    let mut n = 0u32;
-    for c in s.chars() {
-        n = n * 26 + ((c as u32) - ('a' as u32) + 1);
-    }
-    n.saturating_sub(1)
-}
-
-fn physical_number_from_device(device: &str) -> Option<u32> {
-    let lower = device.to_lowercase();
-    if let Some(rest) = lower.strip_prefix("/dev/pd") {
-        rest.trim().parse().ok()
-    } else if let Some(rest) = lower.strip_prefix("pd") {
-        rest.trim().parse().ok()
-    } else if let Some(rest) = lower.strip_prefix("/dev/sd") {
-        Some(sd_letter_to_number(rest.trim()))
-    } else if let Some(rest) = lower.strip_prefix("/dev/hd") {
-        Some(sd_letter_to_number(rest.trim()))
-    } else if let Some(rest) = lower.strip_prefix(r"\\.\physicaldrive") {
-        rest.trim().parse().ok()
-    } else {
-        None
-    }
-}
-
-fn parse_smartctl_scan(smartctl: &std::path::Path) -> Result<Vec<(u32, String, String)>, String> {
-    let output = Command::new(smartctl)
-        .arg("--scan")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run smartctl --scan: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("smartctl --scan failed: {}", stderr.trim()));
-    }
-
-    Ok(parse_smartctl_scan_output(&String::from_utf8_lossy(&output.stdout)))
-}
-
-/// Parses `smartctl --scan` lines such as `/dev/sda -d ata # /dev/sda, ATA device` into
-/// (physical drive number, device, device type).
-fn parse_smartctl_scan_output(stdout: &str) -> Vec<(u32, String, String)> {
-    let mut devices = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 || parts[1] != "-d" {
-            continue;
-        }
-        let device = parts[0].to_string();
-        let dtype = parts[2].to_string();
-        if let Some(number) = physical_number_from_device(&device) {
-            devices.push((number, device, dtype));
-        }
-    }
-    devices
-}
-
-fn run_smartctl(smartctl: &std::path::Path, args: &[&str]) -> Result<(String, String, i32), String> {
-    let output = Command::new(smartctl)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run smartctl: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let code = output.status.code().unwrap_or(-1);
-    Ok((stdout, stderr, code))
-}
-
-fn parse_smartctl_serial(stdout: &str) -> Option<String> {
-    for line in stdout.lines() {
-        let lower = line.to_lowercase();
-        if let Some(idx) = lower.find("serial number") {
-            let after = &line[idx + "serial number".len()..];
-            let after = after.trim_start_matches(':').trim();
-            let placeholder = after.eq_ignore_ascii_case("[no information found]") || after.eq_ignore_ascii_case("unknown");
-            if !after.is_empty() && !placeholder {
-                return Some(after.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn normalize_serial(s: &str) -> String {
-    s.to_lowercase().trim().trim_end_matches('.').replace(' ', "")
-}
-
-const SELF_TEST_TYPES: &[&str] = &["short", "long", "conveyance", "offline"];
-
-fn validate_test_type(test_type: &str) -> Result<(), String> {
-    if SELF_TEST_TYPES.contains(&test_type) {
-        Ok(())
-    } else {
-        Err(format!("Unsupported self-test type: {test_type}"))
-    }
-}
-
-fn run_smartctl_on_device(
-    smartctl: &std::path::Path,
-    elevated: bool,
-    extra_args: &[&str],
-    device: &str,
-    dtype: &str,
-) -> Result<String, String> {
-    let mut args: Vec<&str> = extra_args.to_vec();
-    args.extend(["-d", dtype, device]);
-    let out = if elevated {
-        elevated_helper::run_smartctl_elevated(smartctl, &args)?
-    } else {
-        let (stdout, stderr, _code) = run_smartctl(smartctl, &args)?;
-        if stdout.trim().is_empty() && !stderr.trim().is_empty() {
-            return Err(format!("smartctl error: {}", stderr.trim()));
-        }
-        stdout
-    };
-    if out.trim().is_empty() {
-        return Err("smartctl returned no output".to_string());
-    }
-    Ok(out)
-}
-
-fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Result<String, String> {
-    let smartctl = ensure_smartctl()?;
-
-    if let Some((device, dtype)) = cached_smart_device(&id) {
-        match run_smartctl_on_device(&smartctl, elevated, extra_args, &device, &dtype) {
-            Ok(out) => return Ok(out),
-            Err(e) => {
-                log::warn!("Cached smartctl device {device} for {id} failed ({e}); resolving it again");
-                forget_smart_device(&id);
-            }
-        }
-    }
-
-    let number = extract_physical_drive_number(&id)?;
-    let pd_path = format!(r"/dev/pd{}", number);
-
-    // Look up the drive we already enumerated so we can match by serial.
-    let drive = find_drive(&id)?;
-    let expected_serial = normalize_serial(&drive.serial);
-
-    // Prefer the device and type reported by smartctl --scan, but verify the
-    // serial before trusting the mapping.
-    let scan = parse_smartctl_scan(&smartctl).unwrap_or_default();
-    let mut matched: Option<(String, String)> = None;
-
-    for (_n, device, dtype) in &scan {
-        let (info, _err, _code) = run_smartctl(&smartctl, &["-i", "-d", dtype, device])?;
-        if let Some(sn) = parse_smartctl_serial(&info) {
-            if normalize_serial(&sn) == expected_serial {
-                matched = Some((device.clone(), dtype.clone()));
-                break;
-            }
-        }
-    }
-
-    // If no serial match, fall back to the scan entry with the same physical number.
-    if matched.is_none() {
-        if let Some((_, device, dtype)) = scan.iter().find(|(n, _, _)| *n == number) {
-            matched = Some((device.clone(), dtype.clone()));
-        }
-    }
-
-    if let Some((device, dtype)) = matched {
-        let out = run_smartctl_on_device(&smartctl, elevated, extra_args, &device, &dtype)?;
-        remember_smart_device(&id, &device, &dtype);
-        return Ok(out);
-    }
-
-    // Fallback: try common device types on the /dev/pdN alias.
-    let fallback_types = ["sat", "nvme", "ata", "scsi"];
-    let mut last_error = String::new();
-    for dtype in &fallback_types {
-        match run_smartctl_on_device(&smartctl, elevated, extra_args, &pd_path, dtype) {
-            Ok(out) if !out.to_lowercase().contains("open failed") => {
-                remember_smart_device(&id, &pd_path, dtype);
-                return Ok(out);
-            }
-            Ok(out) => last_error = out,
-            Err(e) => last_error = e,
-        }
-    }
-
-    if !last_error.is_empty() {
-        return Err(format!("smartctl error: {}", last_error.trim()));
-    }
-
-    Err("smartctl command did not produce output for this drive.".to_string())
-}
-
-#[tauri::command]
-async fn get_drive_smart(id: String) -> Result<String, String> {
-    util::logged_blocking("get_drive_smart", move || run_smartctl_on_drive(id, false, &["-a"])).await
-}
-
-#[tauri::command]
-async fn get_drive_smart_elevated(id: String) -> Result<String, String> {
-    util::logged_blocking("get_drive_smart_elevated", move || run_smartctl_on_drive(id, true, &["-a"])).await
-}
-
-#[tauri::command]
-async fn run_drive_test_elevated(id: String, test_type: String) -> Result<String, String> {
-    util::logged_blocking("run_drive_test_elevated", move || {
-        validate_test_type(&test_type)?;
-        run_smartctl_on_drive(id, true, &["-t", &test_type])
-    })
-    .await
-}
-
-fn sanitize_for_path(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect()
-}
-
-#[tauri::command]
-async fn save_smart_snapshot(id: String, label: String) -> Result<String, String> {
-    util::logged_blocking("save_smart_snapshot", move || {
-        let data = run_smartctl_on_drive(id.clone(), true, &["-a"])?;
-
-        let config_dir = util::mula_config_dir().ok_or("Could not determine config directory")?;
-        let drive_dir = config_dir.join("snapshots").join(sanitize_for_path(&id));
-        std::fs::create_dir_all(&drive_dir)
-            .map_err(|e| format!("Failed to create snapshot directory: {e}"))?;
-
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let path = drive_dir.join(format!("smart_{label}_{timestamp}.txt"));
-        std::fs::write(&path, data).map_err(|e| format!("Failed to write snapshot file: {e}"))?;
-
-        Ok(path.to_string_lossy().to_string())
-    })
-    .await
-}
-
 /// Erases a drive and creates one NTFS partition (full format). Runs in its own elevated
 /// PowerShell with a dedicated UAC prompt, and refuses the disk Windows is running from.
 const FORMAT_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
-$ResultPath = '__RESULT_PATH__'
-$deviceId = '__DEVICE_ID__'
 function Write-Result([string]$text) {
     [IO.File]::WriteAllText($ResultPath, $text, (New-Object System.Text.UTF8Encoding $false))
 }
 try {
-    $wmiDisk = Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.DeviceID -eq $deviceId } | Select-Object -First 1
-    if (-not $wmiDisk) { throw "Disk not found for device '$deviceId'" }
+    $wmiDisk = Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.DeviceID -eq $DeviceId } | Select-Object -First 1
+    if (-not $wmiDisk) { throw "Disk not found for device '$DeviceId'" }
     $number = [int]$wmiDisk.Index
     $disk = Get-Disk -Number $number
     if ($disk.IsSystem -or $disk.IsBoot) {
@@ -1254,12 +566,8 @@ try {
 }
 "#;
 
-fn format_script_for(device_id: &str) -> String {
-    FORMAT_SCRIPT.replace("__DEVICE_ID__", &elevated_helper::ps_escape(device_id))
-}
-
 #[tauri::command]
-async fn format_drive(id: String) -> Result<String, String> {
+async fn format_drive(id: String) -> Result<String, error::CommandError> {
     util::blocking(move || {
         let drive = find_drive(&id)?;
         if drive.is_system {
@@ -1267,10 +575,11 @@ async fn format_drive(id: String) -> Result<String, String> {
                 "Refusing to format {}: it holds the running Windows installation ({}).",
                 drive.model,
                 system_drive_letter()
-            ));
+            )
+            .into());
         }
 
-        let result = elevated_helper::run_elevated_script(&format_script_for(&drive.device_id));
+        let result = elevated_helper::run_elevated_script(FORMAT_SCRIPT, &[("DeviceId", &drive.device_id)]);
         match &result {
             Ok(msg) => log::info!("format_drive {}: {msg}", drive.device_id),
             Err(e) => log::error!("format_drive {} failed: {e}", drive.device_id),
@@ -1288,12 +597,7 @@ async fn log_message(level: String, message: String) {
 /// Stops everything MULA started that would otherwise outlive it.
 fn shutdown() {
     elevated_helper::stop_helper();
-    if let Ok(mut guard) = VSD_PROCESS.lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
+    vsd::stop_process();
 }
 
 /// Runs a blocking tray action off the UI thread and logs failures.
@@ -1318,25 +622,25 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             open_config_dir,
-            vsd_start,
-            vsd_stop,
-            vsd_is_running,
-            vsd_get_logs,
-            vsd_get_download_dir,
-            vsd_set_download_dir,
-            vsd_get_autostart,
-            vsd_set_autostart,
-            vsd_install_extension,
+            vsd::vsd_start,
+            vsd::vsd_stop,
+            vsd::vsd_is_running,
+            vsd::vsd_get_logs,
+            vsd::vsd_get_download_dir,
+            vsd::vsd_set_download_dir,
+            vsd::vsd_get_autostart,
+            vsd::vsd_set_autostart,
+            vsd::vsd_install_extension,
             list_physical_drives,
-            get_drive_smart,
-            get_drive_smart_elevated,
-            run_drive_test_elevated,
-            save_smart_snapshot,
-            install_smartmontools,
+            smart::get_drive_smart,
+            smart::run_drive_test,
+            smart::get_drive_self_test_status,
+            smart::save_smart_snapshot,
+            smart::install_smartmontools,
             format_drive,
             log_message,
             wallchanger::wc_get_settings,
-            wallchanger::wc_save_settings,
+            wallchanger::wc_update_settings,
             wallchanger::wc_get_monitors,
             wallchanger::wc_change_now,
             wallchanger::wc_toggle_service,
@@ -1369,7 +673,7 @@ pub fn run() {
             let start = MenuItem::with_id(app, "start", "Start", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
 
-            let current_max_level = wallchanger::settings::load_config()
+            let current_max_level = wallchanger::settings::load()
                 .map(|s| s.maximum_source_level)
                 .unwrap_or(10);
             let mut max_level_items = Vec::new();
@@ -1439,9 +743,9 @@ pub fn run() {
                     }
                     id if id.starts_with("max_level_") => {
                         if let Ok(level) = id.trim_start_matches("max_level_").parse::<i32>() {
-                            let result = wallchanger::settings::update_config(|s| s.maximum_source_level = level);
+                            let result = wallchanger::settings::update(|s| s.maximum_source_level = level);
                             match result {
-                                Ok(_) => wallchanger::on_max_level_changed(app, level),
+                                Ok(settings) => wallchanger::on_settings_changed(app, &settings),
                                 Err(e) => log::error!("Failed to update max source level: {e}"),
                             }
                         }
@@ -1454,8 +758,11 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Start the VSD server if the user asked for it to start automatically.
+            vsd::autostart(app.handle().clone());
+
             // Resume the wallpaper service if it was running.
-            if wallchanger::settings::service_running().unwrap_or(false) {
+            if wallchanger::settings::service_running() {
                 let _ = wallchanger::service::start();
             }
 
@@ -1484,7 +791,6 @@ mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
 
     #[test]
     fn vendor_is_parsed_from_pnp_device_ids() {
@@ -1567,89 +873,12 @@ mod tests {
         assert_eq!(infer_connection_speed("", ""), "Unknown");
     }
 
-    #[test]
-    fn physical_drive_numbers_are_extracted_from_device_ids() {
-        assert_eq!(extract_physical_drive_number(r"\\.\PHYSICALDRIVE2"), Ok(2));
-        assert_eq!(extract_physical_drive_number(r"\\.\physicaldrive13"), Ok(13));
-        assert_eq!(extract_physical_drive_number("PHYSICALDRIVE0"), Ok(0));
-        assert!(extract_physical_drive_number("C:").is_err());
-        assert!(extract_physical_drive_number(r"\\.\PHYSICALDRIVEX").is_err());
-        assert!(extract_physical_drive_number(r"\\.\PHYSICALDRIVE").is_err());
-    }
 
-    #[test]
-    fn smartctl_device_names_map_to_physical_drive_numbers() {
-        assert_eq!(sd_letter_to_number("a"), 0);
-        assert_eq!(sd_letter_to_number("z"), 25);
-        assert_eq!(sd_letter_to_number("aa"), 26);
 
-        assert_eq!(physical_number_from_device("/dev/sda"), Some(0));
-        assert_eq!(physical_number_from_device("/dev/sdc"), Some(2));
-        assert_eq!(physical_number_from_device("/dev/hdb"), Some(1));
-        assert_eq!(physical_number_from_device("/dev/pd3"), Some(3));
-        assert_eq!(physical_number_from_device("pd7"), Some(7));
-        assert_eq!(physical_number_from_device(r"\\.\PhysicalDrive4"), Some(4));
-        assert_eq!(physical_number_from_device("/dev/nvme0"), None);
-        assert_eq!(physical_number_from_device("/dev/csmi0,1"), None);
-    }
 
-    #[test]
-    fn smartctl_scan_output_is_parsed() {
-        let output = "\
-/dev/sda -d ata # /dev/sda, ATA device
-/dev/nvme0 -d nvme # /dev/nvme0, NVMe device
-/dev/sdb -d sat # /dev/sdb [SAT], ATA device
-/dev/sdc -d scsi
-garbage line
-";
-        assert_eq!(
-            parse_smartctl_scan_output(output),
-            vec![
-                (0, "/dev/sda".to_string(), "ata".to_string()),
-                (1, "/dev/sdb".to_string(), "sat".to_string()),
-            ]
-        );
-        assert!(parse_smartctl_scan_output("").is_empty());
-    }
 
-    #[test]
-    fn serial_numbers_are_read_from_smartctl_info() {
-        let ata = "Device Model:     WDC WD3003FZEX\nSerial Number:    WD-WCC4N1234567\nFirmware Version: 01.01A01\n";
-        assert_eq!(parse_smartctl_serial(ata).as_deref(), Some("WD-WCC4N1234567"));
 
-        let nvme = "Model Number:                       Samsung SSD 970\nSerial Number:                      S4EWNX0N123456\n";
-        assert_eq!(parse_smartctl_serial(nvme).as_deref(), Some("S4EWNX0N123456"));
 
-        assert_eq!(parse_smartctl_serial("Model: X\n"), None);
-        assert_eq!(parse_smartctl_serial("Serial Number:\n"), None);
-    }
-
-    #[test]
-    fn smartctl_placeholder_serial_is_ignored() {
-        assert_eq!(parse_smartctl_serial("Serial Number:    [No Information Found]\n"), None);
-    }
-
-    #[test]
-    fn serials_are_normalized_for_comparison() {
-        assert_eq!(normalize_serial("  WD-ABC 123. "), "wd-abc123");
-        assert_eq!(normalize_serial("S4EWNX0N123456"), normalize_serial("s4ewnx0n123456"));
-    }
-
-    #[test]
-    fn drive_ids_are_made_safe_for_folder_names() {
-        assert_eq!(sanitize_for_path(r"\\.\PHYSICALDRIVE0"), "____PHYSICALDRIVE0");
-        assert_eq!(sanitize_for_path("abc-1_2"), "abc-1_2");
-    }
-
-    #[test]
-    fn only_known_self_test_types_are_accepted() {
-        for t in ["short", "long", "conveyance", "offline"] {
-            assert!(validate_test_type(t).is_ok(), "{t}");
-        }
-        for t in ["", "SHORT", "short; rm", "select,0-10", "-a"] {
-            assert!(validate_test_type(t).is_err(), "{t:?}");
-        }
-    }
 
     #[test]
     fn system_disk_is_detected_from_its_drive_letters() {
@@ -1667,72 +896,17 @@ garbage line
         assert_eq!(letter, letter.to_uppercase());
     }
 
-    #[test]
-    fn resolved_smart_devices_are_cached_per_drive() {
-        let id = r"\\.\PHYSICALDRIVE_TEST_CACHE";
-        assert_eq!(cached_smart_device(id), None);
-        remember_smart_device(id, "/dev/sdb", "sat");
-        assert_eq!(cached_smart_device(id), Some(("/dev/sdb".to_string(), "sat".to_string())));
-        forget_smart_device(id);
-        assert_eq!(cached_smart_device(id), None);
-    }
 
-    #[test]
-    fn missing_smartctl_errors_carry_the_marker_the_frontend_looks_for() {
-        assert_eq!(SMARTCTL_MISSING, "SMARTCTL_MISSING", "src/main.js checks for this exact text");
-    }
 
-    #[test]
-    fn config_values_are_read_and_written() {
-        let dir = TempDir::new("vsdconf");
-        let path = dir.join("nested").join("vsd.conf");
 
-        assert_eq!(read_config_value_at(&path, "VSD_AUTOSTART"), None);
 
-        write_config_value_at(&path, "VSD_DOWNLOAD_DIR", r"D:\Videos").unwrap();
-        write_config_value_at(&path, "VSD_AUTOSTART", "true").unwrap();
-        assert_eq!(read_config_value_at(&path, "VSD_DOWNLOAD_DIR").as_deref(), Some(r"D:\Videos"));
-        assert_eq!(read_config_value_at(&path, "VSD_AUTOSTART").as_deref(), Some("true"));
-
-        // Updating a key rewrites it in place and keeps the other lines.
-        write_config_value_at(&path, "VSD_AUTOSTART", "false").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "VSD_DOWNLOAD_DIR=D:\\Videos\nVSD_AUTOSTART=false\n"
-        );
-    }
-
-    #[test]
-    fn config_keys_do_not_match_by_prefix_and_values_may_contain_equals() {
-        let dir = TempDir::new("vsdconf2");
-        let path = dir.join("vsd.conf");
-        std::fs::write(&path, "VSD_DOWNLOAD_DIR_OLD=x\nURL=http://a/?b=c \n").unwrap();
-
-        assert_eq!(read_config_value_at(&path, "VSD_DOWNLOAD_DIR"), None);
-        assert_eq!(read_config_value_at(&path, "URL").as_deref(), Some("http://a/?b=c"));
-    }
-
-    #[test]
-    fn python_from_a_local_venv_is_preferred() {
-        let dir = TempDir::new("venv");
-        let system = get_python_command(dir.path());
-        assert!(system == Path::new("python") || system == Path::new("python3"));
-
-        let venv_python = if cfg!(target_os = "windows") {
-            dir.join(".venv").join("Scripts").join("python.exe")
-        } else {
-            dir.join(".venv").join("bin").join("python")
-        };
-        std::fs::create_dir_all(venv_python.parent().unwrap()).unwrap();
-        std::fs::write(&venv_python, b"").unwrap();
-        assert_eq!(get_python_command(dir.path()), venv_python);
-    }
 
     #[test]
     fn format_script_targets_only_the_requested_disk_and_guards_the_system_disk() {
         assert!(FORMAT_SCRIPT.contains("$disk.IsSystem -or $disk.IsBoot"));
         assert!(FORMAT_SCRIPT.contains("Initialize-Disk"), "Clear-Disk leaves the disk RAW");
-        let script = format_script_for(r"\\.\PHYSICALDRIVE1'; Remove-Item C:\");
-        assert!(script.contains(r"$deviceId = '\\.\PHYSICALDRIVE1''; Remove-Item C:\'"));
+        // The device id arrives as the $DeviceId variable (a literal, see ps_script).
+        assert!(FORMAT_SCRIPT.contains("$_.DeviceID -eq $DeviceId"));
+        assert!(!FORMAT_SCRIPT.contains("__"), "no text placeholders left");
     }
 }

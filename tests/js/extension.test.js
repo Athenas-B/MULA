@@ -4,6 +4,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import {
   EXT_SRC,
   loadScripts,
@@ -13,9 +14,11 @@ import {
   createFakeConsole,
   createFakeDocument,
   createFakeTimers,
+  createFakeMutationObserver,
 } from "./helpers/vm-loader.js";
 
 const ERRORLOG_JS = path.join(EXT_SRC, "errorlog.js");
+const CONFIG_JS = path.join(EXT_SRC, "config.js");
 const BACKGROUND_JS = path.join(EXT_SRC, "background.js");
 const CONTENT_JS = path.join(EXT_SRC, "content.js");
 const POPUP_JS = path.join(EXT_SRC, "popup.js");
@@ -123,40 +126,157 @@ describe("errorlog.js", () => {
   });
 });
 
+// ── config.js ───────────────────────────────────────────────────────────────
+
+function loadConfig({ storage = {}, fetch } = {}) {
+  const chrome = createFakeChrome({ storage });
+  const timers = createFakeTimers();
+  const fetchCalls = [];
+  const state = { fetch: fetch || (async () => response({ ok: true })) };
+  const globals = {
+    chrome,
+    AbortController,
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    fetch: (url, opts) => {
+      fetchCalls.push({ url, opts });
+      return state.fetch(url, opts);
+    },
+  };
+  const loaded = loadScripts([CONFIG_JS], globals);
+  return { ...loaded, fn: loaded.ctx, chrome, timers, state, fetchCalls };
+}
+
+describe("config.js", () => {
+  it("defines the default server", () => {
+    assert.equal(loadConfig().run("VSD_DEFAULT_SERVER"), "http://127.0.0.1:8765");
+  });
+
+  it("vsdGetServerUrl falls back to the default", async () => {
+    assert.equal(await loadConfig().fn.vsdGetServerUrl(), "http://127.0.0.1:8765");
+    assert.equal(await loadConfig({ storage: { serverUrl: "" } }).fn.vsdGetServerUrl(), "http://127.0.0.1:8765");
+    assert.equal(await loadConfig({ storage: { serverUrl: "   " } }).fn.vsdGetServerUrl(), "http://127.0.0.1:8765");
+  });
+
+  it("vsdGetServerUrl returns the stored URL without trailing slashes", async () => {
+    assert.equal(await loadConfig({ storage: { serverUrl: "http://10.0.0.2:9000" } }).fn.vsdGetServerUrl(), "http://10.0.0.2:9000");
+    assert.equal(await loadConfig({ storage: { serverUrl: " http://h:1// " } }).fn.vsdGetServerUrl(), "http://h:1");
+  });
+
+  it("vsdGetServerUrl resolves the default when storage throws", async () => {
+    const c = loadConfig();
+    c.chrome.storage.local.get = () => {
+      throw new Error("Extension context invalidated.");
+    };
+    assert.equal(await c.fn.vsdGetServerUrl(), "http://127.0.0.1:8765");
+  });
+
+  it("vsdServerJson fetches from the configured server and returns the JSON body", async () => {
+    const c = loadConfig({ storage: { serverUrl: "http://h:1/" }, fetch: async () => response({ job_id: "j" }) });
+    const init = { method: "POST", body: "{}" };
+    assert.deepEqual(plain(await c.fn.vsdServerJson("/download", init)), { job_id: "j" });
+    assert.equal(c.fetchCalls[0].url, "http://h:1/download");
+    assert.equal(c.fetchCalls[0].opts, init);
+  });
+
+  it("vsdServerJson falls back to {} for non-JSON or non-object bodies", async () => {
+    assert.deepEqual(plain(await loadConfig({ fetch: async () => response("not json") }).fn.vsdServerJson("/x")), {});
+    assert.deepEqual(plain(await loadConfig({ fetch: async () => response("null") }).fn.vsdServerJson("/x")), {});
+  });
+
+  it("vsdServerJson throws the server's error message, or the status, with err.status", async () => {
+    const withMessage = loadConfig({ fetch: async () => response({ error: "ffmpeg missing" }, { ok: false, status: 500 }) });
+    await assert.rejects(withMessage.fn.vsdServerJson("/download"), (err) => err.message === "ffmpeg missing" && err.status === 500);
+    const withoutBody = loadConfig({ fetch: async () => response("bad gateway", { ok: false, status: 502 }) });
+    await assert.rejects(withoutBody.fn.vsdServerJson("/download"), (err) => err.message === "Server error: 502" && err.status === 502);
+  });
+
+  it("vsdServerJson propagates network errors", async () => {
+    const c = loadConfig({
+      fetch: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+    });
+    await assert.rejects(c.fn.vsdServerJson("/logs"), /Failed to fetch/);
+  });
+
+  it("vsdServerJson aborts after the timeout and clears its timer otherwise", async () => {
+    const hanging = loadConfig({
+      fetch: (_url, opts) =>
+        new Promise((_resolve, reject) => opts.signal.addEventListener("abort", () => reject(new Error("aborted")))),
+    });
+    const promise = hanging.fn.vsdServerJson("/logs", { method: "GET" }, 1500);
+    await flush();
+    assert.deepEqual(hanging.timers.pending().map((t) => t.ms), [1500]);
+    assert.equal(hanging.fetchCalls[0].opts.method, "GET");
+    hanging.timers.runAll();
+    await assert.rejects(promise, /aborted/);
+
+    const fast = loadConfig();
+    await fast.fn.vsdServerJson("/logs", {}, 1500);
+    assert.deepEqual(fast.timers.pending(), []);
+  });
+});
+
 // ── background.js ───────────────────────────────────────────────────────────
 
-function loadBackground({ storage = {}, tabs = [], fetch } = {}) {
-  const chrome = createFakeChrome({ storage, tabs });
+function loadBackground({ storage = {}, tabs = [], fetch, asyncStorage = false } = {}) {
+  const chrome = createFakeChrome({ storage, tabs, asyncStorage });
   const console = createFakeConsole();
+  const timers = createFakeTimers();
   const fetchCalls = [];
   const state = { fetch: fetch || (async () => response(MEDIA_PLAYLIST)) };
   const globals = {
     chrome,
     console,
     URL,
+    AbortController,
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
     fetch: (url, opts) => {
       fetchCalls.push({ url, opts });
       return state.fetch(url, opts);
     },
     addEventListener: () => {},
   };
-  const loaded = loadScripts([ERRORLOG_JS, BACKGROUND_JS], globals);
+  const loaded = loadScripts([ERRORLOG_JS, CONFIG_JS, BACKGROUND_JS], globals);
   const send = (message, sender = {}) =>
     new Promise((resolve) => {
-      chrome.runtime.onMessage.fire(message, sender, resolve);
+      const [keepOpen] = chrome.runtime.onMessage.fire(message, sender, resolve);
+      if (keepOpen !== true) resolve(undefined);
     });
   return {
     ...loaded,
     fn: loaded.ctx,
     chrome,
+    console,
+    timers,
     state,
     fetchCalls,
     send,
     streams: () => chrome.store.streams || [],
     onBeforeRequest: (details) => chrome.webRequest.onBeforeRequest.listeners[0](details),
     onBeforeSendHeaders: (details) => chrome.webRequest.onBeforeSendHeaders.listeners[0](details),
+    /** Fire every pending timer once and let the resulting promise chains settle. */
+    tick: async () => {
+      timers.runAll();
+      await flush();
+    },
   };
 }
+
+/** A fetch stub answering /progress requests from `progress` (url -> body | Error). */
+function progressServer(progress) {
+  return async (url) => {
+    const id = decodeURIComponent(url.split("/progress/")[1] || "");
+    const value = typeof progress === "function" ? progress(id) : progress[id];
+    if (value instanceof Error) throw value;
+    if (value && value.httpStatus) return response({ error: value.error }, { ok: false, status: value.httpStatus });
+    return response(value || {});
+  };
+}
+
+const runningJob = (id, extra = {}) => ({ id, status: "running", stage: "starting", current: 0, total: 0, output: null, error: null, ...extra });
 
 describe("background.js helpers", () => {
   const bg = loadBackground();
@@ -224,6 +344,17 @@ describe("background.js helpers", () => {
     assert.equal(bg.fn.makePageHeaders("http//broken"), null);
   });
 
+  it("titleFromTabs matches the page or another tab of the same origin", () => {
+    const tabs = [
+      { url: "chrome-extension://abc/popup.html", title: "Popup" },
+      { url: "https://site.example.com/other", title: "Site tab" },
+    ];
+    assert.equal(bg.fn.titleFromTabs(tabs, "https://site.example.com/v/1"), "Site tab");
+    assert.equal(bg.fn.titleFromTabs(tabs, "https://nomatch.example.com/"), "");
+    assert.equal(bg.fn.titleFromTabs(tabs, "unknown"), "");
+    assert.equal(bg.fn.titleFromTabs(tabs, "chrome-extension://abc/popup.html"), "");
+  });
+
   it("registers the webRequest listeners with the expected options", () => {
     assert.deepEqual(plain(bg.chrome.webRequest.onBeforeRequest.calls[0]), [{ urls: ["<all_urls>"] }, []]);
     assert.deepEqual(plain(bg.chrome.webRequest.onBeforeSendHeaders.calls[0]), [
@@ -236,6 +367,12 @@ describe("background.js helpers", () => {
     assert.equal(bg.chrome.icons.length, 1);
     assert.equal(bg.chrome.icons[0].path[16], "icons/icon16.png");
     assert.equal(bg.chrome.icons[0].path[128], "icons/icon128.png");
+  });
+
+  it("uses the shared config instead of its own default server", () => {
+    assert.equal(bg.run("typeof DEFAULT_SERVER"), "undefined");
+    assert.equal(bg.run("typeof getServerUrl"), "undefined");
+    assert.equal(bg.run("typeof vsdServerJson"), "function");
   });
 });
 
@@ -273,12 +410,71 @@ describe("background.js hasTsSegments", () => {
   });
 });
 
+describe("background.js updateStore", () => {
+  it("serializes concurrent updates so both persist", async () => {
+    const bg = loadBackground({ asyncStorage: true });
+    await Promise.all([
+      bg.fn.updateStore((d) => {
+        d.streams.push({ url: "a" });
+      }),
+      bg.fn.updateStore((d) => {
+        d.streams.push({ url: "b" });
+      }),
+    ]);
+    assert.deepEqual(bg.streams().map((s) => s.url), ["a", "b"]);
+  });
+
+  it("the fake async storage really loses unserialized updates (control)", async () => {
+    const chrome = createFakeChrome({ asyncStorage: true });
+    const naive = (url) =>
+      new Promise((resolve) =>
+        chrome.storage.local.get({ streams: [] }, ({ streams }) => {
+          streams.push({ url });
+          chrome.storage.local.set({ streams }, resolve);
+        })
+      );
+    await Promise.all([naive("a"), naive("b")]);
+    assert.equal(chrome.store.streams.length, 1);
+  });
+
+  it("writes only when something changed, and only the changed keys", async () => {
+    const bg = loadBackground({ storage: { streams: [{ url: "a" }] } });
+    await bg.fn.updateStore(() => {});
+    await bg.fn.updateStore((d) => {
+      d.streams[0].url = "a";
+    });
+    assert.equal(bg.chrome.writes.length, 0);
+    await bg.fn.updateStore((d) => {
+      d.streams[0].title = "T";
+    });
+    assert.deepEqual(bg.chrome.writes, [{ streams: [{ url: "a", title: "T" }] }]);
+  });
+
+  it("resolves with the callback's result and survives a throwing update", async () => {
+    const bg = loadBackground();
+    await assert.rejects(
+      bg.fn.updateStore(() => {
+        throw new Error("bad update");
+      }),
+      /bad update/
+    );
+    assert.equal(
+      await bg.fn.updateStore((d) => {
+        d.streams.push({ url: "x" });
+        return 42;
+      }),
+      42
+    );
+    assert.deepEqual(bg.streams(), [{ url: "x" }]);
+  });
+});
+
 describe("background.js stream storage", () => {
   const URL_A = "https://cdn.example.com/a/index.m3u8";
 
-  it("addStream stores a new stream with page headers", () => {
+  it("addStream stores a new stream with page headers", async () => {
     const bg = loadBackground();
-    bg.fn.addStream(URL_A, "https://site.example.com/watch/1", "hls", "Title");
+    await bg.fn.addStream(URL_A, "https://site.example.com/watch/1", "hls", "Title");
     const [s] = bg.streams();
     assert.equal(bg.streams().length, 1);
     assert.equal(s.url, URL_A);
@@ -286,6 +482,7 @@ describe("background.js stream storage", () => {
     assert.equal(s.type, "hls");
     assert.equal(s.title, "Title");
     assert.equal(s.metadata, null);
+    assert.equal(s.job, undefined);
     assert.equal(typeof s.detectedAt, "number");
     assert.deepEqual(s.headers, {
       Referer: "https://site.example.com/watch/1",
@@ -294,43 +491,101 @@ describe("background.js stream storage", () => {
     });
   });
 
-  it("addStream ignores empty and non-HLS URLs", () => {
+  it("addStream ignores empty and non-HLS URLs", async () => {
     const bg = loadBackground();
-    bg.fn.addStream("", "https://site/");
-    bg.fn.addStream("https://cdn/video.mp4", "https://site/");
+    await bg.fn.addStream("", "https://site/");
+    await bg.fn.addStream("https://cdn/video.mp4", "https://site/");
     assert.deepEqual(bg.streams(), []);
   });
 
-  it("addStream deduplicates and only fills a missing title", () => {
+  it("addStream deduplicates, only fills a missing title and skips unchanged writes", async () => {
     const bg = loadBackground();
-    bg.fn.addStream(URL_A, "unknown", "hls", "");
-    bg.fn.addStream(URL_A, "unknown", "hls", "First");
-    bg.fn.addStream(URL_A, "unknown", "hls", "Second");
+    await bg.fn.addStream(URL_A, "unknown", "hls", "");
+    await bg.fn.addStream(URL_A, "unknown", "hls", "First");
+    await bg.fn.addStream(URL_A, "unknown", "hls", "Second");
     assert.equal(bg.streams().length, 1);
     assert.equal(bg.streams()[0].title, "First");
     assert.equal(bg.streams()[0].headers, null);
+    assert.equal(bg.chrome.writes.length, 2);
   });
 
-  it("addStream keeps the newest 50 streams, newest first", () => {
+  it("addStream keeps the newest 50 streams, newest first", async () => {
     const existing = Array.from({ length: 50 }, (_, i) => ({ url: `https://cdn/${i}.m3u8` }));
     const bg = loadBackground({ storage: { streams: existing } });
-    bg.fn.addStream(URL_A, "unknown");
+    await bg.fn.addStream(URL_A, "unknown");
     const streams = bg.streams();
     assert.equal(streams.length, 50);
     assert.equal(streams[0].url, URL_A);
     assert.equal(streams[49].url, "https://cdn/48.m3u8");
   });
 
-  it("addStream prefers explicitly passed headers", () => {
+  it("addStream prefers explicitly passed headers", async () => {
     const bg = loadBackground();
-    bg.fn.addStream(URL_A, "https://site/", "hls", "", { Referer: "explicit" });
+    await bg.fn.addStream(URL_A, "https://site/", "hls", "", { Referer: "explicit" });
     assert.deepEqual(bg.streams()[0].headers, { Referer: "explicit" });
   });
 
-  it("removeStream removes only the given URL", () => {
-    const bg = loadBackground({ storage: { streams: [{ url: "a" }, { url: "b" }] } });
-    bg.fn.removeStream("a");
+  it("removeStreams removes only the given URLs", async () => {
+    const bg = loadBackground({ storage: { streams: [{ url: "a" }, { url: "b" }, { url: "c" }] } });
+    await bg.fn.removeStreams(["a", "c"]);
     assert.deepEqual(bg.streams(), [{ url: "b" }]);
+  });
+});
+
+describe("background.js detection dedupe", () => {
+  const URL_A = "https://cdn.example.com/a/index.m3u8";
+  const PAGE = "https://site.example.com/watch/1";
+
+  it("verifies a new playlist before storing it", async () => {
+    const bg = loadBackground();
+    assert.equal(await bg.fn.detectStream(URL_A, PAGE, "hls", "T"), true);
+    assert.equal(bg.fetchCalls.length, 1);
+    assert.equal(bg.fetchCalls[0].opts.headers.Referer, PAGE);
+    assert.equal(bg.streams()[0].url, URL_A);
+  });
+
+  it("a second detection of a verified URL does no fetch and no storage write", async () => {
+    const bg = loadBackground();
+    await bg.fn.detectStream(URL_A, PAGE, "hls", "T");
+    const writes = bg.chrome.writes.length;
+    assert.equal(await bg.fn.detectStream(URL_A, PAGE, "hls", "T"), true);
+    assert.equal(bg.fetchCalls.length, 1);
+    assert.equal(bg.chrome.writes.length, writes);
+  });
+
+  it("concurrent detections of the same URL share one playlist fetch", async () => {
+    const bg = loadBackground();
+    await Promise.all([bg.fn.detectStream(URL_A, PAGE), bg.fn.detectStream(URL_A, PAGE), bg.fn.detectStream(URL_A, PAGE)]);
+    assert.equal(bg.fetchCalls.length, 1);
+    assert.equal(bg.streams().length, 1);
+  });
+
+  it("playlists without .ts segments are never stored and not refetched", async () => {
+    const bg = loadBackground({ fetch: async () => response(MASTER_PLAYLIST) });
+    assert.equal(await bg.fn.detectStream(URL_A, PAGE), false);
+    assert.equal(await bg.fn.detectStream(URL_A, PAGE), false);
+    bg.onBeforeRequest({ url: URL_A, tabId: -1, initiator: "https://site.example.com" });
+    await flush();
+    assert.equal(bg.fetchCalls.length, 1);
+    assert.deepEqual(bg.streams(), []);
+    assert.equal(bg.chrome.writes.length, 0);
+  });
+
+  it("repeated webRequest hits of a live playlist fetch it once", async () => {
+    const bg = loadBackground({ tabs: [{ id: 7, url: PAGE, title: "Live" }] });
+    for (let i = 0; i < 5; i++) {
+      bg.onBeforeRequest({ url: URL_A, tabId: 7, initiator: "https://site.example.com" });
+      await flush();
+    }
+    assert.equal(bg.fetchCalls.length, 1);
+    assert.equal(bg.chrome.writes.length, 1);
+  });
+
+  it("remembers at most 500 verified URLs", async () => {
+    const bg = loadBackground();
+    for (let i = 0; i <= 500; i++) await bg.fn.verifyPlaylist(`https://cdn/${i}.m3u8`, null);
+    assert.equal(bg.run("verifiedUrls.size"), 500);
+    assert.equal(bg.run("verifiedUrls.has('https://cdn/0.m3u8')"), false);
   });
 });
 
@@ -345,7 +600,7 @@ describe("background.js header capture (onBeforeSendHeaders)", () => {
     { name: "Authorization", value: "Bearer x" },
   ];
 
-  it("captures only referer/origin/user-agent/accept and uses them for new streams", () => {
+  it("captures only referer/origin/user-agent/accept and uses them for new streams", async () => {
     const bg = loadBackground();
     bg.onBeforeSendHeaders({ url: URL_A, initiator: "https://site.example.com", requestHeaders: headers });
     const expected = {
@@ -355,7 +610,7 @@ describe("background.js header capture (onBeforeSendHeaders)", () => {
       Origin: "https://site.example.com",
     };
     assert.deepEqual(plain(bg.run("capturedHeaders").get(URL_A)), expected);
-    bg.fn.addStream(URL_A, "https://other.example.com/page");
+    await bg.fn.addStream(URL_A, "https://other.example.com/page");
     assert.deepEqual(bg.streams()[0].headers, expected);
   });
 
@@ -424,12 +679,12 @@ describe("background.js request interception (onBeforeRequest)", () => {
     assert.equal(bg.streams()[0].pageUrl, "https://init.example.com");
   });
 
-  it("removes the stream again when it turns out to have no .ts segments", async () => {
+  it("never stores a playlist without .ts segments", async () => {
     const bg = loadBackground({ fetch: async () => response(MASTER_PLAYLIST) });
     bg.onBeforeRequest({ url: URL_A, tabId: -1, initiator: "https://site.example.com" });
-    assert.equal(bg.streams().length, 1);
     await flush();
     assert.deepEqual(bg.streams(), []);
+    assert.equal(bg.chrome.writes.length, 0);
   });
 
   it("stops detecting when detection is disabled in storage", async () => {
@@ -439,6 +694,229 @@ describe("background.js request interception (onBeforeRequest)", () => {
     await flush();
     assert.deepEqual(bg.streams(), []);
     assert.equal(bg.run("detectionEnabled"), false);
+  });
+});
+
+describe("background.js downloads", () => {
+  const STREAM = { url: "https://cdn/x.m3u8", title: "Video", headers: { Referer: "r" }, pageUrl: "https://site/v", metadata: { tags: ["t"] } };
+
+  it("download: posts the stream to the configured server, stores the job and schedules polling", async () => {
+    const bg = loadBackground({
+      storage: { serverUrl: "http://127.0.0.1:9999", streams: [STREAM] },
+      fetch: async () => response({ ok: true, job_id: "job-1" }),
+    });
+    await bg.tick(); // startup poll: nothing running
+    const res = await bg.send({ type: "download", url: "https://cdn/x.m3u8" });
+    assert.deepEqual(plain(res), { ok: true, job_id: "job-1" });
+    const call = bg.fetchCalls[0];
+    assert.equal(call.url, "http://127.0.0.1:9999/download");
+    assert.equal(call.opts.method, "POST");
+    assert.deepEqual(JSON.parse(call.opts.body), {
+      url: "https://cdn/x.m3u8",
+      title: "Video",
+      headers: { Referer: "r" },
+      pageUrl: "https://site/v",
+      metadata: { tags: ["t"] },
+    });
+    const { startedAt, ...job } = bg.streams()[0].job;
+    assert.equal(typeof startedAt, "number");
+    assert.deepEqual(job, { id: "job-1", status: "running", stage: "starting", current: 0, total: 0, output: null, error: null });
+    assert.deepEqual(bg.timers.pending().map((t) => t.ms), [1000]);
+    assert.equal(bg.chrome.store.activeJobs, undefined);
+  });
+
+  it("download: falls back to the default server and looks up a missing title from tabs", async () => {
+    const bg = loadBackground({
+      storage: { streams: [{ url: "https://cdn/x.m3u8", pageUrl: "https://site.example.com/v" }] },
+      tabs: [{ url: "https://site.example.com/v", title: "Tab title" }],
+      fetch: async () => response({ job_id: "j" }),
+    });
+    await bg.send({ type: "download", url: "https://cdn/x.m3u8" });
+    const call = bg.fetchCalls[0];
+    assert.equal(call.url, "http://127.0.0.1:8765/download");
+    const body = JSON.parse(call.opts.body);
+    assert.equal(body.title, "Tab title");
+    assert.equal(body.headers.Referer, "https://site.example.com/v");
+    assert.equal(bg.streams()[0].title, "Tab title");
+  });
+
+  it("download: reports server errors and unknown streams without storing a job", async () => {
+    const storage = { streams: [{ url: "https://cdn/x.m3u8" }] };
+    const withMessage = loadBackground({ storage, fetch: async () => response({ error: "ffmpeg missing" }, { ok: false, status: 500 }) });
+    assert.deepEqual(plain(await withMessage.send({ type: "download", url: "https://cdn/x.m3u8" })), { error: "ffmpeg missing" });
+    assert.equal(withMessage.streams()[0].job, undefined);
+    const withoutBody = loadBackground({ storage, fetch: async () => response("not json", { ok: false, status: 502 }) });
+    assert.deepEqual(plain(await withoutBody.send({ type: "download", url: "https://cdn/x.m3u8" })), { error: "Server error: 502" });
+    const noJobId = loadBackground({ storage, fetch: async () => response({ ok: true }) });
+    assert.deepEqual(plain(await noJobId.send({ type: "download", url: "https://cdn/x.m3u8" })), { error: "Server did not return a job id" });
+    const unknown = loadBackground();
+    assert.deepEqual(plain(await unknown.send({ type: "download", url: "https://cdn/x.m3u8" })), { error: "Stream not found" });
+    assert.equal(unknown.fetchCalls.length, 0);
+  });
+
+  it("download: returns the running job instead of starting a second one", async () => {
+    const bg = loadBackground({ storage: { streams: [{ ...STREAM, job: runningJob("j1") }] } });
+    assert.deepEqual(plain(await bg.send({ type: "download", url: STREAM.url })), { ok: true, job_id: "j1" });
+    assert.equal(bg.fetchCalls.length, 0);
+  });
+});
+
+describe("background.js job polling", () => {
+  it("writes progress into the stream record and stops polling when done", async () => {
+    const progress = { j1: { status: "running", stage: "downloading", current: 3, total: 10 } };
+    const bg = loadBackground({
+      storage: { streams: [{ url: "u1", job: runningJob("j1") }] },
+      fetch: progressServer(progress),
+    });
+    await bg.tick();
+    assert.equal(bg.fetchCalls[0].url, "http://127.0.0.1:8765/progress/j1");
+    assert.deepEqual(plain(bg.streams()[0].job), runningJob("j1", { stage: "downloading", current: 3, total: 10 }));
+    assert.deepEqual(bg.timers.pending().map((t) => t.ms), [1000]);
+
+    // Unchanged progress does not rewrite storage.
+    const writes = bg.chrome.writes.length;
+    await bg.tick();
+    assert.equal(bg.chrome.writes.length, writes);
+
+    progress.j1 = { status: "done", stage: "done", current: 10, total: 10, output: "C:/out.mp4" };
+    await bg.tick();
+    assert.deepEqual(plain(bg.streams()[0].job), {
+      id: "j1", status: "done", stage: "done", current: 10, total: 10, output: "C:/out.mp4", error: null,
+    });
+    assert.deepEqual(bg.timers.pending(), []);
+    assert.equal(bg.fetchCalls.length, 3);
+  });
+
+  it("stores server-side job errors and stops", async () => {
+    const bg = loadBackground({
+      storage: { streams: [{ url: "u1", job: runningJob("j1") }] },
+      fetch: progressServer({ j1: { status: "error", error: "HTTP 403" } }),
+    });
+    await bg.tick();
+    assert.equal(bg.streams()[0].job.status, "error");
+    assert.equal(bg.streams()[0].job.error, "HTTP 403");
+    assert.deepEqual(bg.timers.pending(), []);
+  });
+
+  it("resumes polling of running jobs from storage when the worker starts", async () => {
+    const bg = loadBackground({
+      storage: {
+        streams: [
+          { url: "u1", job: runningJob("j1") },
+          { url: "u2", job: { id: "j2", status: "done", output: "x" } },
+          { url: "u3" },
+        ],
+      },
+      fetch: progressServer({ j1: { status: "running", current: 1, total: 2 } }),
+    });
+    assert.deepEqual(bg.timers.pending().map((t) => t.ms), [0]);
+    await bg.tick();
+    assert.deepEqual(bg.fetchCalls.map((c) => c.url), ["http://127.0.0.1:8765/progress/j1"]);
+    assert.equal(bg.streams()[0].job.current, 1);
+  });
+
+  it("does nothing on start when no job is running", async () => {
+    const bg = loadBackground({ storage: { streams: [{ url: "u2", job: { id: "j2", status: "done" } }] } });
+    await bg.tick();
+    assert.equal(bg.fetchCalls.length, 0);
+    assert.deepEqual(bg.timers.pending(), []);
+  });
+
+  it("uses one poll loop for all running jobs", async () => {
+    const bg = loadBackground({
+      storage: { streams: [{ url: "u1", job: runningJob("j1") }, { url: "u2", job: runningJob("j2") }] },
+      fetch: progressServer({ j1: { status: "running", current: 1, total: 5 }, j2: { status: "done", output: "o2" } }),
+    });
+    assert.equal(bg.timers.pending().length, 1);
+    await bg.tick();
+    assert.equal(bg.fetchCalls.length, 2);
+    assert.deepEqual(bg.streams().map((s) => s.job.status), ["running", "done"]);
+    assert.equal(bg.timers.pending().length, 1);
+    bg.fn.schedulePoll();
+    bg.fn.schedulePoll(0);
+    assert.equal(bg.timers.pending().length, 1);
+  });
+
+  it("a new job started while polling is idle restarts the loop", async () => {
+    const bg = loadBackground({
+      storage: { streams: [{ url: "u1" }] },
+      fetch: async (url) => (url.endsWith("/download") ? response({ job_id: "j1" }) : response({ status: "running", current: 2, total: 4 })),
+    });
+    await bg.tick();
+    assert.deepEqual(bg.timers.pending(), []);
+    await bg.send({ type: "download", url: "u1" });
+    await bg.tick();
+    assert.equal(bg.streams()[0].job.current, 2);
+  });
+
+  it("marks a job unknown to the server as failed right away", async () => {
+    const bg = loadBackground({
+      storage: { streams: [{ url: "u1", job: runningJob("j1") }] },
+      fetch: progressServer({ j1: { httpStatus: 404, error: "Unknown job" } }),
+    });
+    await bg.tick();
+    assert.equal(bg.streams()[0].job.status, "error");
+    assert.equal(bg.streams()[0].job.error, "Unknown job");
+    assert.deepEqual(bg.timers.pending(), []);
+  });
+
+  it("retries network failures before giving up", async () => {
+    let fail = true;
+    const bg = loadBackground({
+      storage: { streams: [{ url: "u1", job: runningJob("j1") }] },
+      fetch: progressServer(() => (fail ? new TypeError("Failed to fetch") : { status: "running", current: 5, total: 9 })),
+    });
+    await bg.tick();
+    await bg.tick();
+    assert.equal(bg.streams()[0].job.status, "running");
+    assert.equal(bg.streams()[0].job.failures, 2);
+    fail = false;
+    await bg.tick();
+    assert.equal(bg.streams()[0].job.failures, undefined);
+    assert.equal(bg.streams()[0].job.current, 5);
+    fail = true;
+    for (let i = 0; i < 10; i++) await bg.tick();
+    assert.equal(bg.streams()[0].job.status, "error");
+    assert.equal(bg.streams()[0].job.error, "Failed to fetch");
+    assert.deepEqual(bg.timers.pending(), []);
+  });
+
+  it("does not resurrect a stream removed while its progress request was in flight", async () => {
+    let release;
+    const bg = loadBackground({
+      storage: { streams: [{ url: "u1", job: runningJob("j1") }] },
+      fetch: () => new Promise((resolve) => (release = () => resolve(response({ status: "running", current: 1, total: 2 })))),
+    });
+    bg.timers.runAll();
+    await flush();
+    await bg.send({ type: "remove", url: "u1" });
+    release();
+    await flush();
+    assert.deepEqual(bg.streams(), []);
+    assert.deepEqual(bg.timers.pending(), []);
+  });
+
+  it("refresh: resumes polling and fills missing titles from open tabs", async () => {
+    const bg = loadBackground({
+      storage: {
+        streams: [
+          { url: "a", pageUrl: "https://site.example.com/v/1", title: "" },
+          { url: "b", pageUrl: "unknown" },
+          { url: "c", pageUrl: "https://x.example.com/", title: "Keep" },
+          { url: "d", pageUrl: "chrome-extension://abc/popup.html" },
+          { url: "e", pageUrl: "https://nomatch.example.com/" },
+        ],
+      },
+      tabs: [
+        { url: "chrome-extension://abc/popup.html", title: "Popup" },
+        { url: "https://site.example.com/other", title: "Site tab" },
+        { url: "https://x.example.com/", title: "X tab" },
+      ],
+    });
+    await bg.tick();
+    assert.deepEqual(plain(await bg.send({ type: "refresh" })), { ok: true });
+    assert.deepEqual(bg.streams().map((s) => s.title ?? null), ["Site tab", null, "Keep", null, null]);
+    assert.deepEqual(bg.timers.pending().map((t) => t.ms), [0]);
   });
 });
 
@@ -454,14 +932,15 @@ describe("background.js message handling", () => {
       },
     });
     const res = await bg.send({ type: "metadata", metadata: { title: "new" } }, { tab: { url: "https://site/p" } });
+    await flush();
     assert.deepEqual(plain(res), { ok: true });
     assert.deepEqual(bg.streams().map((s) => s.metadata?.title ?? null), ["new", "old", null]);
     // New streams for the same page pick the metadata up as well.
-    bg.fn.addStream("https://cdn/d.m3u8", "https://site/p");
+    await bg.fn.addStream("https://cdn/d.m3u8", "https://site/p");
     assert.deepEqual(bg.streams()[0].metadata, { title: "new" });
   });
 
-  it("detected: adds reported streams with the page title and checks HLS segments", async () => {
+  it("detected: verifies and adds reported streams with the page title", async () => {
     const bg = loadBackground();
     const res = await bg.send(
       { type: "detected", title: "Page title", streams: [{ url: "https://cdn/x.m3u8", type: "hls" }] },
@@ -479,6 +958,7 @@ describe("background.js message handling", () => {
   it("detected: ignored while detection is disabled", async () => {
     const bg = loadBackground({ storage: { detectionEnabled: false } });
     const res = await bg.send({ type: "detected", streams: [{ url: "https://cdn/x.m3u8", type: "hls" }] }, { tab: { url: "https://s/" } });
+    await flush();
     assert.deepEqual(plain(res), { ok: true });
     assert.deepEqual(bg.streams(), []);
   });
@@ -489,139 +969,42 @@ describe("background.js message handling", () => {
     assert.deepEqual(bg.streams(), [{ url: "b" }]);
   });
 
-  it("clear: keeps only the given URLs and their jobs", async () => {
-    const bg = loadBackground({
-      storage: { streams: [{ url: "a" }, { url: "b" }, { url: "c" }], activeJobs: { a: "j1", b: "j2" } },
-    });
-    await bg.send({ type: "clear", keepUrls: ["b", "c"] });
-    assert.deepEqual(bg.streams(), [{ url: "b" }, { url: "c" }]);
-    assert.deepEqual(bg.chrome.store.activeJobs, { b: "j2" });
+  const MIXED = [
+    { url: "idle" },
+    { url: "running", job: { id: "j1", status: "running" } },
+    { url: "done", job: { id: "j2", status: "done" } },
+    { url: "failed", job: { id: "j3", status: "error" } },
+  ];
+
+  it("clear: keeps finished jobs and, when protected, running ones", async () => {
+    const bg = loadBackground({ storage: { streams: MIXED } });
+    await bg.send({ type: "clear", protectActive: true });
+    assert.deepEqual(bg.streams().map((s) => s.url), ["running", "done", "failed"]);
   });
 
-  it("clear: without keepUrls removes everything", async () => {
-    const bg = loadBackground({ storage: { streams: [{ url: "a" }], activeJobs: { a: "j1" } } });
-    await bg.send({ type: "clear" });
-    assert.deepEqual(bg.streams(), []);
-    assert.deepEqual(bg.chrome.store.activeJobs, {});
+  it("clear: drops running downloads when not protected", async () => {
+    const bg = loadBackground({ storage: { streams: MIXED } });
+    await bg.send({ type: "clear", protectActive: false });
+    assert.deepEqual(bg.streams().map((s) => s.url), ["done", "failed"]);
   });
 
-  it("removeUrls: removes the given URLs and their jobs", async () => {
-    const bg = loadBackground({
-      storage: { streams: [{ url: "a" }, { url: "b" }], activeJobs: { a: "j1", b: "j2" } },
-    });
-    await bg.send({ type: "removeUrls", urls: ["a"] });
-    assert.deepEqual(bg.streams(), [{ url: "b" }]);
-    assert.deepEqual(bg.chrome.store.activeJobs, { b: "j2" });
+  it("clearSaved: removes streams whose stored job is done", async () => {
+    const bg = loadBackground({ storage: { streams: MIXED } });
+    await bg.send({ type: "clearSaved" });
+    assert.deepEqual(bg.streams().map((s) => s.url), ["idle", "running", "failed"]);
   });
 
-  it("clearSaved: removes saved streams and finished jobs, keeps running ones", async () => {
-    const bg = loadBackground({
-      storage: {
-        streams: [{ url: "saved", saved: true }, { url: "done" }, { url: "running" }, { url: "idle" }],
-        activeJobs: { done: "j1", running: "j2" },
-      },
-    });
-    await bg.send({ type: "clearSaved", jobProgress: { j1: { status: "done" }, j2: { status: "running" } } });
-    assert.deepEqual(bg.streams().map((s) => s.url), ["running", "idle"]);
-    assert.deepEqual(bg.chrome.store.activeJobs, { running: "j2" });
-  });
-
-  it("clearJob: drops the job and marks the stream as saved", async () => {
-    const bg = loadBackground({ storage: { streams: [{ url: "a" }], activeJobs: { a: "j1", b: "j2" } } });
-    await bg.send({ type: "clearJob", url: "a" });
-    assert.deepEqual(bg.chrome.store.activeJobs, { b: "j2" });
-    assert.equal(bg.streams()[0].saved, true);
-  });
-
-  it("getActiveJobs returns the stored jobs", async () => {
-    const bg = loadBackground({ storage: { activeJobs: { a: "j1" } } });
-    assert.deepEqual(plain(await bg.send({ type: "getActiveJobs" })), { a: "j1" });
-  });
-
-  it("clearAllData resets streams, jobs and the error log", async () => {
-    const bg = loadBackground({ storage: { streams: [{ url: "a" }], activeJobs: { a: "j" }, errorLog: [{}], serverUrl: "x" } });
+  it("clearAllData resets streams and the error log", async () => {
+    const bg = loadBackground({ storage: { streams: [{ url: "a" }], errorLog: [{}], serverUrl: "x" } });
     await bg.send({ type: "clearAllData" });
-    assert.deepEqual(bg.chrome.store, { streams: [], activeJobs: {}, errorLog: [], serverUrl: "x" });
+    assert.deepEqual(bg.chrome.store, { streams: [], errorLog: [], serverUrl: "x" });
   });
 
-  it("getStreams fills missing titles from open tabs of the same origin", async () => {
-    const bg = loadBackground({
-      storage: {
-        streams: [
-          { url: "a", pageUrl: "https://site.example.com/v/1", title: "" },
-          { url: "b", pageUrl: "unknown" },
-          { url: "c", pageUrl: "https://x.example.com/", title: "Keep" },
-          { url: "d", pageUrl: "chrome-extension://abc/popup.html" },
-          { url: "e", pageUrl: "https://nomatch.example.com/" },
-        ],
-      },
-      tabs: [
-        { url: "chrome-extension://abc/popup.html", title: "Popup" },
-        { url: "https://site.example.com/other", title: "Site tab" },
-        { url: "https://x.example.com/", title: "X tab" },
-      ],
-    });
-    const streams = plain(await bg.send({ type: "getStreams" }));
-    assert.deepEqual(streams.map((s) => s.title ?? null), ["Site tab", null, "Keep", null, null]);
-  });
-
-  it("download: posts the stream to the configured server and records the job", async () => {
-    const bg = loadBackground({
-      storage: {
-        serverUrl: "http://127.0.0.1:9999",
-        streams: [
-          { url: "https://cdn/x.m3u8", title: "Video", headers: { Referer: "r" }, pageUrl: "https://site/v", metadata: { tags: ["t"] } },
-        ],
-      },
-      fetch: async () => response({ job_id: "job-1" }),
-    });
-    const res = await bg.send({ type: "download", url: "https://cdn/x.m3u8" });
-    assert.deepEqual(plain(res), { job_id: "job-1" });
-    const call = bg.fetchCalls[0];
-    assert.equal(call.url, "http://127.0.0.1:9999/download");
-    assert.equal(call.opts.method, "POST");
-    assert.deepEqual(JSON.parse(call.opts.body), {
-      url: "https://cdn/x.m3u8",
-      title: "Video",
-      headers: { Referer: "r" },
-      pageUrl: "https://site/v",
-      metadata: { tags: ["t"] },
-    });
-    assert.deepEqual(bg.chrome.store.activeJobs, { "https://cdn/x.m3u8": "job-1" });
-  });
-
-  it("download: falls back to the default server and looks up a missing title from tabs", async () => {
-    const bg = loadBackground({
-      storage: { streams: [{ url: "https://cdn/x.m3u8", pageUrl: "https://site.example.com/v" }] },
-      tabs: [{ url: "https://site.example.com/v", title: "Tab title" }],
-      fetch: async () => response({ job_id: "j" }),
-    });
-    await bg.send({ type: "download", url: "https://cdn/x.m3u8" });
-    const call = bg.fetchCalls[0];
-    assert.equal(call.url, "http://127.0.0.1:8765/download");
-    const body = JSON.parse(call.opts.body);
-    assert.equal(body.title, "Tab title");
-    assert.equal(body.headers.Referer, "https://site.example.com/v");
-  });
-
-  it("download: reports server errors", async () => {
-    const withMessage = loadBackground({ fetch: async () => response({ error: "ffmpeg missing" }, { ok: false, status: 500 }) });
-    assert.deepEqual(plain(await withMessage.send({ type: "download", url: "https://cdn/x.m3u8" })), { error: "ffmpeg missing" });
-    const withoutBody = loadBackground({ fetch: async () => response("not json", { ok: false, status: 502 }) });
-    assert.deepEqual(plain(await withoutBody.send({ type: "download", url: "https://cdn/x.m3u8" })), { error: "Server error: 502" });
-  });
-
-  it("progress: proxies the server and maps failures to status 'error'", async () => {
-    const ok = loadBackground({ fetch: async () => response({ status: "running", current: 3, total: 10 }) });
-    assert.deepEqual(plain(await ok.send({ type: "progress", job_id: "j1" })), { status: "running", current: 3, total: 10 });
-    assert.equal(ok.fetchCalls[0].url, "http://127.0.0.1:8765/progress/j1");
-
-    const failing = loadBackground({
-      fetch: async () => {
-        throw new Error("connection refused");
-      },
-    });
-    assert.deepEqual(plain(await failing.send({ type: "progress", job_id: "j1" })), { status: "error", error: "connection refused" });
+  it("does not keep the channel open for unknown or removed message types", () => {
+    const bg = loadBackground();
+    for (const type of ["nope", "getActiveJobs", "progress", "clearJob", "getStreams"]) {
+      assert.deepEqual(bg.chrome.runtime.onMessage.fire({ type }, {}, () => {}), [false], type);
+    }
   });
 });
 
@@ -632,21 +1015,46 @@ function loadContent({ title = "Page", href = "https://site.example.com/watch/1"
   const console = createFakeConsole();
   const timers = createFakeTimers();
   const document = createFakeDocument();
+  const mo = createFakeMutationObserver();
   document.title = title;
   for (const [sel, el] of Object.entries(queries)) document.setQuery(sel, el);
   for (const [sel, list] of Object.entries(queryAll)) document.setQueryAll(sel, list);
+  const connects = [];
+  const connect = chrome.runtime.connect;
+  chrome.runtime.connect = (info) => {
+    connects.push(info);
+    return connect(info);
+  };
+  const location = { href };
   const globals = {
     chrome,
     console,
     document,
-    location: { href },
+    location,
+    MutationObserver: mo.MutationObserver,
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
     setInterval: timers.setInterval,
     clearInterval: timers.clearInterval,
   };
   const loaded = loadScripts([CONTENT_JS], globals);
-  return { ...loaded, fn: loaded.ctx, chrome, console, timers, document };
+  return {
+    ...loaded,
+    fn: loaded.ctx,
+    chrome,
+    console,
+    timers,
+    document,
+    location,
+    mo,
+    connects,
+    ofType: (type) => chrome.sent.filter((m) => m.type === type),
+    /** Simulate a DOM mutation and let the throttled scan run. */
+    mutate: () => {
+      mo.trigger();
+      timers.runAll();
+    },
+  };
 }
 
 describe("content.js", () => {
@@ -693,20 +1101,44 @@ describe("content.js", () => {
     });
   });
 
-  it("sends metadata on load and schedules periodic tasks", () => {
+  it("connects the port, sends metadata once on load and observes the DOM instead of polling", () => {
     const c = loadContent();
     assert.equal(c.chrome.port.name, "content");
     assert.equal(c.chrome.sent.length, 1);
     assert.equal(c.chrome.sent[0].type, "metadata");
     assert.equal(c.chrome.sent[0].pageUrl, "https://site.example.com/watch/1");
-    assert.deepEqual(
-      c.timers.pending().map(({ ms, repeat }) => ({ ms, repeat })),
-      [
-        { ms: 2000, repeat: false },
-        { ms: 5000, repeat: true },
-        { ms: 3000, repeat: true },
-      ]
-    );
+    assert.deepEqual(c.timers.pending(), []);
+    assert.equal(c.mo.instances.length, 1);
+    const [{ target, options }] = c.mo.instances[0].targets;
+    assert.equal(target, c.document.documentElement);
+    assert.equal(options.subtree, true);
+    assert.equal(options.childList, true);
+  });
+
+  it("sends metadata only when it changed", () => {
+    const c = loadContent({ title: "One" });
+    c.mutate();
+    c.mutate();
+    assert.equal(c.ofType("metadata").length, 1);
+    c.document.title = "Two";
+    c.mutate();
+    assert.equal(c.ofType("metadata").length, 2);
+    assert.equal(c.ofType("metadata")[1].metadata.title, "Two");
+    c.mutate();
+    assert.equal(c.ofType("metadata").length, 2);
+    // A SPA navigation (new URL, same metadata) is reported as well.
+    c.location.href = "https://site.example.com/watch/2";
+    c.mutate();
+    assert.equal(c.ofType("metadata").length, 3);
+    assert.equal(c.ofType("metadata")[2].pageUrl, "https://site.example.com/watch/2");
+  });
+
+  it("throttles mutation-triggered scans", () => {
+    const c = loadContent();
+    for (let i = 0; i < 5; i++) c.mo.trigger();
+    assert.deepEqual(c.timers.pending().map((t) => t.ms), [1000]);
+    c.timers.runAll();
+    assert.deepEqual(c.timers.pending(), []);
   });
 
   it("scan reports only HLS <video> sources", () => {
@@ -721,7 +1153,7 @@ describe("content.js", () => {
         ],
       },
     });
-    const detected = c.chrome.sent.find((m) => m.type === "detected");
+    const [detected] = c.ofType("detected");
     assert.ok(detected);
     assert.deepEqual(detected.streams, [
       { url: "https://cdn/x.m3u8?token=1", type: "hls" },
@@ -731,20 +1163,66 @@ describe("content.js", () => {
     assert.equal(typeof detected.metadata, "object");
   });
 
+  it("reports each HLS source only once", () => {
+    const videos = [{ src: "https://cdn/a.m3u8" }];
+    const c = loadContent({ queryAll: { video: videos } });
+    c.mutate();
+    assert.equal(c.ofType("detected").length, 1);
+    videos.push({ src: "https://cdn/b.m3u8" });
+    c.mutate();
+    const detected = c.ofType("detected");
+    assert.equal(detected.length, 2);
+    assert.deepEqual(detected[1].streams, [{ url: "https://cdn/b.m3u8", type: "hls" }]);
+  });
+
+  it("re-reports sources when detection is switched back on", () => {
+    const c = loadContent({ queryAll: { video: [{ src: "https://cdn/a.m3u8" }] } });
+    c.chrome.storage.local.set({ detectionEnabled: false });
+    c.mutate();
+    assert.equal(c.ofType("detected").length, 1);
+    c.chrome.storage.local.set({ detectionEnabled: true });
+    c.timers.runAll();
+    assert.equal(c.ofType("detected").length, 2);
+  });
+
   it("scan sends nothing when no HLS video is present", () => {
     const c = loadContent({ queryAll: { video: [{ src: "https://cdn/video.mp4" }] } });
     assert.equal(c.chrome.sent.some((m) => m.type === "detected"), false);
   });
 
-  it("stops all work after the background port disconnects", () => {
+  it("stops all work after the port disconnects with an invalidated context", () => {
+    const c = loadContent();
+    c.mo.trigger();
+    c.chrome.runtime.id = undefined;
+    c.chrome.port.onDisconnect.fire();
+    assert.equal(c.run("contextValid"), false);
+    assert.equal(c.mo.instances[0].disconnected, true);
+    assert.deepEqual(c.timers.pending(), []);
+    const before = c.chrome.sent.length;
+    c.fn.scan();
+    c.fn.sendMetadata();
+    c.fn.scheduleScan();
+    assert.equal(c.chrome.sent.length, before);
+    assert.equal(c.connects.length, 1);
+  });
+
+  it("treats an immediate disconnect as a dead context", () => {
     const c = loadContent();
     c.chrome.port.onDisconnect.fire();
     assert.equal(c.run("contextValid"), false);
-    assert.deepEqual(c.timers.pending().map((t) => t.ms), [2000]);
-    const before = c.chrome.sent.length;
+    assert.equal(c.connects.length, 1);
+  });
+
+  it("reconnects and re-sends everything when only the background worker restarted", () => {
+    const c = loadContent({ queryAll: { video: [{ src: "https://cdn/a.m3u8" }] } });
+    assert.equal(c.ofType("detected").length, 1);
+    c.run("Date.now = () => 8.64e15");
+    c.chrome.port.onDisconnect.fire();
+    assert.equal(c.run("contextValid"), true);
+    assert.equal(c.connects.length, 2);
     c.timers.runAll();
-    c.fn.scan();
-    assert.equal(c.chrome.sent.length, before);
+    assert.equal(c.ofType("metadata").length, 2);
+    assert.equal(c.ofType("detected").length, 2);
   });
 
   it("treats a throwing chrome.runtime.id as an invalidated context", () => {
@@ -755,9 +1233,11 @@ describe("content.js", () => {
       },
     });
     const before = c.chrome.sent.length;
+    c.document.title = "changed";
     c.fn.sendMetadata();
     assert.equal(c.chrome.sent.length, before);
     assert.equal(c.run("contextValid"), false);
+    assert.equal(c.mo.instances[0].disconnected, true);
   });
 
   it("sendMessageSafe logs unexpected lastError values only", () => {
@@ -785,8 +1265,8 @@ describe("content.js", () => {
 
 // ── popup.js ────────────────────────────────────────────────────────────────
 
-function loadPopup({ storage = {}, search = "", onSend } = {}) {
-  const chrome = createFakeChrome({ storage, onSend: onSend || (() => undefined) });
+function loadPopup({ storage = {}, search = "", onSend, chrome: sharedChrome, fetch } = {}) {
+  const chrome = sharedChrome || createFakeChrome({ storage, onSend: onSend || (() => undefined) });
   const console = createFakeConsole();
   const timers = createFakeTimers();
   const document = createFakeDocument();
@@ -794,6 +1274,8 @@ function loadPopup({ storage = {}, search = "", onSend } = {}) {
   for (const id of ["streams", "status", "clear", "clearSaved", "copyLogs", "clearLogs", "popout", "protectActive", "detectionEnabled"]) {
     el[id] = document.add(id);
   }
+  const fetchCalls = [];
+  const clipboard = [];
   const globals = {
     chrome,
     console,
@@ -802,27 +1284,25 @@ function loadPopup({ storage = {}, search = "", onSend } = {}) {
     AbortController,
     location: { search },
     screen: { availLeft: 0, availWidth: 1920, availTop: 0 },
-    fetch: async () => response({}),
+    navigator: { clipboard: { writeText: async (text) => clipboard.push(text) } },
+    fetch: (url, opts) => {
+      fetchCalls.push({ url, opts });
+      return (fetch || (async () => response({})))(url, opts);
+    },
     addEventListener: () => {},
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
     setInterval: timers.setInterval,
     clearInterval: timers.clearInterval,
   };
-  const loaded = loadScripts([ERRORLOG_JS, POPUP_JS], globals);
-  return { ...loaded, fn: loaded.ctx, chrome, timers, document, el };
+  const loaded = loadScripts([ERRORLOG_JS, CONFIG_JS, POPUP_JS], globals);
+  const items = () => el.streams.children;
+  const buttons = (li) => li.children.at(-1).children;
+  return { ...loaded, fn: loaded.ctx, chrome, console, timers, document, el, fetchCalls, clipboard, items, buttons };
 }
 
 describe("popup.js helpers", () => {
   const p = loadPopup();
-
-  it("getServerUrl uses the server configured in the options page", async () => {
-    assert.equal(await p.fn.getServerUrl(), "http://127.0.0.1:8765");
-    const configured = loadPopup({ storage: { serverUrl: "http://localhost:9000" } });
-    assert.equal(await configured.fn.getServerUrl(), "http://localhost:9000");
-    const blank = loadPopup({ storage: { serverUrl: "" } });
-    assert.equal(await blank.fn.getServerUrl(), "http://127.0.0.1:8765");
-  });
 
   it("formatProgress describes each job state", () => {
     assert.equal(p.fn.formatProgress(null), "Starting...");
@@ -874,13 +1354,10 @@ describe("popup.js helpers", () => {
     assert.equal(p.fn.buildTooltip({}), "");
   });
 
-  it("isJobActive is true for unknown or running jobs only", () => {
-    const q = loadPopup();
-    q.run("jobProgress.set('run', { status: 'running' }); jobProgress.set('done', { status: 'done' }); jobProgress.set('err', { status: 'error' })");
-    assert.equal(q.fn.isJobActive("missing"), true);
-    assert.equal(q.fn.isJobActive("run"), true);
-    assert.equal(q.fn.isJobActive("done"), false);
-    assert.equal(q.fn.isJobActive("err"), false);
+  it("has no hardcoded server URL or in-memory job state", () => {
+    assert.equal(p.run("typeof SERVER_URL"), "undefined");
+    assert.equal(p.run("typeof jobProgress"), "undefined");
+    assert.equal(p.run("typeof activeJobs"), "undefined");
   });
 });
 
@@ -890,14 +1367,15 @@ describe("popup.js UI", () => {
     assert.equal(loadPopup().document.documentElement.classList.contains("popout"), false);
   });
 
-  it("loads toggles from storage and saves detection changes", () => {
+  it("loads toggles from storage and saves changes", () => {
     const p = loadPopup({ storage: { detectionEnabled: false, protectActiveDownloads: false } });
     assert.equal(p.el.detectionEnabled.checked, false);
     assert.equal(p.el.protectActive.checked, false);
+    assert.equal(p.el.status.textContent, "Detection paused");
     p.el.detectionEnabled.checked = true;
     p.el.detectionEnabled.onchange();
     assert.equal(p.chrome.store.detectionEnabled, true);
-    assert.equal(p.el.status.textContent, "Scanning...");
+    assert.equal(p.el.status.textContent, "No HLS streams detected yet.");
     p.el.detectionEnabled.checked = false;
     p.el.detectionEnabled.onchange();
     assert.equal(p.el.status.textContent, "Detection paused");
@@ -906,42 +1384,45 @@ describe("popup.js UI", () => {
     assert.equal(p.chrome.store.protectActiveDownloads, true);
   });
 
-  it("renders the empty state", () => {
+  it("asks the background to refresh on open and never polls", () => {
     const p = loadPopup();
-    p.fn.render([]);
-    assert.equal(p.el.status.textContent, "No HLS streams detected yet.");
-    assert.equal(p.el.streams.children.length, 0);
+    assert.deepEqual(p.chrome.sent, [{ type: "refresh" }]);
+    assert.deepEqual(p.timers.pending(), []);
   });
 
-  it("renders streams with buttons reflecting their job state", () => {
+  it("renders the empty state", () => {
     const p = loadPopup();
-    p.run(`
-      activeJobs.set('u3', 'j3'); jobProgress.set('j3', { status: 'running', current: 3, total: 10 });
-      activeJobs.set('u4', 'j4'); jobProgress.set('j4', { status: 'done', output: 'C:/out.mp4' });
-      activeJobs.set('u5', 'j5'); jobProgress.set('j5', { status: 'error', error: 'boom' });
-    `);
-    p.fn.render([
-      { url: "u1", title: "First", pageUrl: "https://site/1" },
-      { url: "u2", saved: true },
-      { url: "u3" },
-      { url: "u4" },
-      { url: "u5" },
-    ]);
-    assert.equal(p.el.status.textContent, "5 stream(s) detected");
-    const items = p.el.streams.children;
-    assert.equal(items.length, 5);
+    assert.equal(p.el.status.textContent, "No HLS streams detected yet.");
+    assert.equal(p.items().length, 0);
+  });
 
-    const buttons = (li) => li.children.at(-1).children;
+  it("renders streams from storage with buttons reflecting their stored job", () => {
+    const p = loadPopup({
+      storage: {
+        streams: [
+          { url: "u1", title: "First", pageUrl: "https://site/1" },
+          { url: "u2", job: { id: "j2", status: "done", output: "C:/out.mp4" } },
+          { url: "u3", job: { id: "j3", status: "running", current: 3, total: 10 } },
+          { url: "u4", job: { id: "j4", status: "running", stage: "muxing" } },
+          { url: "u5", job: { id: "j5", status: "error", error: "boom" } },
+          { url: "u6", job: { id: "j6", status: "done", output: null } },
+        ],
+      },
+    });
+    assert.equal(p.el.status.textContent, "6 stream(s) detected");
+    const items = p.items();
+    assert.equal(items.length, 6);
     const summary = items.map((li) => {
-      const [dl, , openFile] = buttons(li);
+      const [dl, , openFile] = p.buttons(li);
       return [dl.textContent, dl.disabled, openFile.disabled];
     });
     assert.deepEqual(summary, [
       ["Download via ffmpeg", false, true],
       ["Saved", true, false],
       ["Downloading 3/10...", true, true],
-      ["Saved", true, false],
+      ["Muxing...", true, true],
       ["Error: boom", true, true],
+      ["Saved", true, true],
     ]);
 
     // Title only rendered when present.
@@ -951,85 +1432,209 @@ describe("popup.js UI", () => {
     assert.match(items[0].title, /^Metadata saved in file:/);
   });
 
+  it("re-renders on storage changes, reusing existing rows", () => {
+    const p = loadPopup({ storage: { streams: [{ url: "u1" }] } });
+    const [row1] = p.items();
+    p.chrome.storage.local.set({ streams: [{ url: "u2", title: "New" }, { url: "u1", job: { id: "j", status: "running", current: 1, total: 4 } }] });
+    const items = p.items();
+    assert.equal(items.length, 2);
+    assert.equal(items[1], row1);
+    assert.equal(p.buttons(row1)[0].textContent, "Downloading 1/4...");
+    assert.equal(items[0].children[0].textContent, "New");
+    assert.equal(p.el.status.textContent, "2 stream(s) detected");
+
+    p.chrome.storage.local.set({ streams: [{ url: "u1", title: "Now titled", job: { id: "j", status: "done", output: "o" } }] });
+    assert.equal(p.items().length, 1);
+    assert.equal(p.items()[0], row1);
+    assert.equal(row1.children[0].textContent, "Now titled");
+    assert.equal(p.buttons(row1)[0].textContent, "Saved");
+    assert.equal(p.buttons(row1)[2].disabled, false);
+
+    p.chrome.storage.local.set({ streams: [] });
+    assert.equal(p.items().length, 0);
+    assert.equal(p.run("rows.size"), 0);
+  });
+
+  it("ignores changes from other storage areas and unrelated keys", () => {
+    const p = loadPopup({ storage: { streams: [{ url: "u1" }] } });
+    p.chrome.storage.onChanged.fire({ streams: { newValue: [] } }, "sync");
+    p.chrome.storage.local.set({ errorLog: [{}] });
+    assert.equal(p.items().length, 1);
+  });
+
+  it("follows detection toggles made elsewhere", () => {
+    const p = loadPopup({ storage: { streams: [{ url: "u1" }] } });
+    p.chrome.storage.local.set({ detectionEnabled: false, protectActiveDownloads: false });
+    assert.equal(p.el.detectionEnabled.checked, false);
+    assert.equal(p.el.protectActive.checked, false);
+    assert.equal(p.el.status.textContent, "1 stream(s) detected (detection paused)");
+  });
+
   it("'Open page' opens a tab only for known pages", () => {
-    const p = loadPopup();
-    p.fn.render([{ url: "u1", pageUrl: "https://site/1" }, { url: "u2", pageUrl: "unknown" }]);
-    for (const li of p.el.streams.children) li.children.at(-1).children[1].onclick();
+    const p = loadPopup({ storage: { streams: [{ url: "u1", pageUrl: "https://site/1" }, { url: "u2", pageUrl: "unknown" }] } });
+    for (const li of p.items()) p.buttons(li)[1].onclick();
     assert.deepEqual(plain(p.chrome.created), [{ url: "https://site/1" }]);
   });
 
-  it("startDownload shows server errors and re-enables the button", () => {
-    const p = loadPopup({ onSend: (msg) => (msg.type === "download" ? { error: "server down" } : undefined) });
-    const btn = { disabled: false, textContent: "" };
-    p.fn.startDownload("u1", btn);
-    assert.equal(btn.textContent, "Error: server down");
-    assert.equal(btn.disabled, false);
-  });
-
-  it("startDownload ignores disabled buttons", () => {
-    const p = loadPopup();
-    const before = p.chrome.sent.length;
-    p.fn.startDownload("u1", { disabled: true });
-    assert.equal(p.chrome.sent.length, before);
-  });
-
-  it("startDownload starts polling and clears the job once done", () => {
-    let progress = { status: "running", current: 1, total: 4 };
+  it("'Open file' asks the configured server to open the stored output", async () => {
     const p = loadPopup({
+      storage: { serverUrl: "http://h:2", streams: [{ url: "u1", job: { id: "j", status: "done", output: "C:/v.mp4" } }, { url: "u2" }] },
+    });
+    await p.buttons(p.items()[1])[2].onclick();
+    assert.equal(p.fetchCalls.length, 0);
+    await p.buttons(p.items()[0])[2].onclick();
+    assert.equal(p.fetchCalls[0].url, "http://h:2/open");
+    assert.equal(p.fetchCalls[0].opts.method, "POST");
+    assert.deepEqual(JSON.parse(p.fetchCalls[0].opts.body), { path: "C:/v.mp4" });
+  });
+
+  it("'Remove' asks the background to remove the stream", () => {
+    const p = loadPopup({ storage: { streams: [{ url: "u1" }] } });
+    p.buttons(p.items()[0])[3].onclick();
+    assert.deepEqual(p.chrome.sent.at(-1), { type: "remove", url: "u1" });
+  });
+
+  it("download shows 'Starting...' while the request is pending, then follows storage", async () => {
+    let labelWhilePending;
+    const p = loadPopup({
+      storage: { streams: [{ url: "u1" }] },
       onSend: (msg) => {
-        if (msg.type === "download") return { job_id: "j1" };
-        if (msg.type === "progress") return progress;
-        return undefined;
+        if (msg.type !== "download") return undefined;
+        labelWhilePending = [p.buttons(p.items()[0])[0].textContent, p.buttons(p.items()[0])[0].disabled];
+        p.chrome.storage.local.set({ streams: [{ url: "u1", job: { id: "j1", status: "running", stage: "starting" } }] });
+        return { ok: true, job_id: "j1" };
       },
     });
-    p.assign("cachedStreams", [{ url: "u1" }]);
-    const btn = { disabled: false, textContent: "" };
-    p.fn.startDownload("u1", btn);
-    assert.equal(p.run("activeJobs.get('u1')"), "j1");
-    const intervals = () => p.timers.pending().filter((t) => t.ms === 1000);
-    assert.equal(intervals().length, 1);
-
-    p.timers.runAll();
-    assert.equal(p.run("jobProgress.get('j1').current"), 1);
-    assert.equal(intervals().length, 1);
-
-    progress = { status: "done", output: "C:/x.mp4" };
-    p.timers.runAll();
-    assert.equal(intervals().length, 0);
-    assert.ok(p.chrome.sent.some((m) => m.type === "clearJob" && m.url === "u1"));
+    await p.buttons(p.items()[0])[0].onclick();
+    assert.deepEqual(labelWhilePending, ["Starting...", true]);
+    const dl = p.buttons(p.items()[0])[0];
+    assert.equal(dl.textContent, "Starting...");
+    assert.equal(dl.disabled, true);
+    assert.deepEqual(p.timers.pending(), []);
+    p.chrome.storage.local.set({ streams: [{ url: "u1", job: { id: "j1", status: "running", current: 2, total: 8 } }] });
+    assert.equal(dl.textContent, "Downloading 2/8...");
   });
 
-  it("restarts polling for jobs stored by the background on load", () => {
-    const p = loadPopup({ onSend: (msg) => (msg.type === "getActiveJobs" ? { u9: "j9" } : msg.type === "getStreams" ? [] : undefined) });
-    assert.equal(p.run("activeJobs.get('u9')"), "j9");
+  it("download shows start errors and allows a retry", async () => {
+    const p = loadPopup({
+      storage: { streams: [{ url: "u1" }] },
+      onSend: (msg) => (msg.type === "download" ? { error: "server down" } : undefined),
+    });
+    await p.fn.startDownload("u1");
+    const dl = p.buttons(p.items()[0])[0];
+    assert.equal(dl.textContent, "Error: server down");
+    assert.equal(dl.disabled, false);
   });
 
-  it("'Clear' keeps saved streams, finished jobs and (optionally) active downloads", () => {
+  it("download reports a missing response or a runtime error", async () => {
+    const p = loadPopup({ storage: { streams: [{ url: "u1" }] } });
+    await p.fn.startDownload("u1");
+    assert.equal(p.buttons(p.items()[0])[0].textContent, "Error: no response");
+    p.chrome.runtime.sendMessage = (_msg, cb) => {
+      p.chrome.runtime.lastError = { message: "Receiving end does not exist." };
+      cb(undefined);
+      p.chrome.runtime.lastError = undefined;
+    };
+    await p.fn.startDownload("u1");
+    assert.equal(p.buttons(p.items()[0])[0].textContent, "Error: Receiving end does not exist.");
+  });
+
+  it("download is not sent for streams that already have a job", async () => {
+    const p = loadPopup({ storage: { streams: [{ url: "u1", job: { id: "j", status: "running" } }] } });
+    await p.fn.startDownload("u1");
+    assert.equal(p.chrome.sent.some((m) => m.type === "download"), false);
+  });
+
+  it("'Clear' passes the protect-active-downloads setting", () => {
     const p = loadPopup();
     p.el.protectActive.checked = true;
-    p.run(`
-      activeJobs.set('u1', 'j1'); jobProgress.set('j1', { status: 'running' });
-      activeJobs.set('u2', 'j2'); jobProgress.set('j2', { status: 'done' });
-      activeJobs.set('u3', 'j3');
-    `);
-    p.assign("cachedStreams", [{ url: "u4", saved: true }, { url: "u5" }]);
     p.el.clear.onclick();
-    const msg = p.chrome.sent.find((m) => m.type === "clear");
-    assert.deepEqual(msg.keepUrls.sort(), ["u1", "u2", "u3", "u4"]);
+    p.el.protectActive.checked = false;
+    p.el.clear.onclick();
+    assert.deepEqual(
+      p.chrome.sent.filter((m) => m.type === "clear"),
+      [
+        { type: "clear", protectActive: true },
+        { type: "clear", protectActive: false },
+      ]
+    );
   });
 
-  it("'Clear' drops active downloads when protection is off", () => {
+  it("'Clear saved' and 'Clear logs' send their messages", () => {
     const p = loadPopup();
-    p.el.protectActive.checked = false;
-    p.run(`
-      activeJobs.set('u1', 'j1'); jobProgress.set('j1', { status: 'running' });
-      activeJobs.set('u2', 'j2'); jobProgress.set('j2', { status: 'error' });
-    `);
-    p.el.clear.onclick();
-    const msg = p.chrome.sent.find((m) => m.type === "clear");
-    assert.deepEqual(msg.keepUrls, ["u2"]);
-    assert.deepEqual(plain(p.run("[...activeJobs.keys()]")), ["u2"]);
-    assert.equal(p.run("jobProgress.has('j1')"), false);
+    p.el.clearSaved.onclick();
+    p.el.clearLogs.onclick();
+    assert.deepEqual(p.chrome.sent.slice(1), [{ type: "clearSaved" }, { type: "clearAllData" }]);
+  });
+
+  it("'Copy logs' copies storage, error log and the server log", async () => {
+    const p = loadPopup({
+      storage: { serverUrl: "http://h:3", streams: [{ url: "u1" }], errorLog: [{ timestamp: "T", context: "popup", level: "error", message: "oops" }] },
+      fetch: async () => response({ log: "server line" }),
+    });
+    await p.el.copyLogs.onclick();
+    assert.equal(p.fetchCalls[0].url, "http://h:3/logs?lines=200");
+    const [report] = p.clipboard;
+    assert.match(report, /=== VSD Diagnostics ===/);
+    assert.match(report, /Server: http:\/\/h:3/);
+    assert.match(report, /"url": "u1"/);
+    assert.match(report, /\[T\] \(popup\/error\) oops/);
+    assert.match(report, /--- Server Log ---\nserver line/);
+    assert.equal(p.el.copyLogs.textContent, "Copied!");
+  });
+
+  it("'Copy logs' notes an unavailable server", async () => {
+    const p = loadPopup({
+      fetch: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+    });
+    await p.el.copyLogs.onclick();
+    assert.match(p.clipboard[0], /--- Server ---\nServer unavailable\./);
+  });
+
+  it("'Pop out' opens the popup in a window", () => {
+    const p = loadPopup();
+    p.el.popout.onclick();
+    assert.equal(p.chrome.created[0].url, "chrome-extension://test-extension-id/popup.html?popout=1");
+    assert.equal(p.chrome.created[0].type, "popup");
+  });
+});
+
+describe("popup.js + background.js", () => {
+  it("'Clear saved' removes streams whose stored job is done and the popup re-renders", async () => {
+    const chrome = createFakeChrome({
+      storage: {
+        streams: [
+          { url: "u1", job: { id: "j1", status: "done", output: "o" } },
+          { url: "u2", job: { id: "j2", status: "error", error: "x" } },
+          { url: "u3" },
+        ],
+      },
+    });
+    // Route popup messages to the background's onMessage listener.
+    chrome.onSend = (msg) => {
+      chrome.runtime.onMessage.fire(msg, {}, () => {});
+      return { ok: true };
+    };
+    const timers = createFakeTimers();
+    loadScripts([ERRORLOG_JS, CONFIG_JS, BACKGROUND_JS], {
+      chrome,
+      console: createFakeConsole(),
+      URL,
+      AbortController,
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+      fetch: async () => response({}),
+      addEventListener: () => {},
+    });
+    const p = loadPopup({ chrome });
+    assert.equal(p.items().length, 3);
+    p.el.clearSaved.onclick();
+    await flush();
+    assert.deepEqual(chrome.store.streams.map((s) => s.url), ["u2", "u3"]);
+    assert.equal(p.items().length, 2);
+    assert.equal(p.el.status.textContent, "2 stream(s) detected");
   });
 });
 
@@ -1044,7 +1649,7 @@ function loadOptions({ storage = {} } = {}) {
     save: document.add("save"),
     msg: document.add("msg"),
   };
-  loadScripts([OPTIONS_JS], {
+  loadScripts([CONFIG_JS, OPTIONS_JS], {
     chrome,
     document,
     console: createFakeConsole(),
@@ -1055,16 +1660,22 @@ function loadOptions({ storage = {} } = {}) {
 }
 
 describe("options.js", () => {
-  it("shows the default server URL", () => {
-    assert.equal(loadOptions().el.serverUrl.value, "http://127.0.0.1:8765");
-  });
-
-  it("shows the stored server URL", () => {
-    assert.equal(loadOptions({ storage: { serverUrl: "http://10.0.0.2:9000" } }).el.serverUrl.value, "http://10.0.0.2:9000");
-  });
-
-  it("saves the trimmed URL and shows a transient confirmation", () => {
+  it("shows the default server URL (also as placeholder)", async () => {
     const o = loadOptions();
+    await flush();
+    assert.equal(o.el.serverUrl.value, "http://127.0.0.1:8765");
+    assert.equal(o.el.serverUrl.placeholder, "http://127.0.0.1:8765");
+  });
+
+  it("shows the stored server URL", async () => {
+    const o = loadOptions({ storage: { serverUrl: "http://10.0.0.2:9000" } });
+    await flush();
+    assert.equal(o.el.serverUrl.value, "http://10.0.0.2:9000");
+  });
+
+  it("saves the trimmed URL and shows a transient confirmation", async () => {
+    const o = loadOptions();
+    await flush();
     o.el.serverUrl.value = "  http://localhost:1234  ";
     o.el.save.onclick();
     assert.equal(o.chrome.store.serverUrl, "http://localhost:1234");
@@ -1072,5 +1683,23 @@ describe("options.js", () => {
     assert.deepEqual(o.timers.pending().map((t) => t.ms), [2000]);
     o.timers.runAll();
     assert.equal(o.el.msg.textContent, "");
+  });
+});
+
+// ── manifests / pages ───────────────────────────────────────────────────────
+
+describe("extension packaging", () => {
+  const EXT_DIR = path.dirname(EXT_SRC);
+  const read = (...p) => readFileSync(path.join(EXT_DIR, ...p), "utf8");
+
+  it("loads config.js before the scripts that use it", () => {
+    const firefox = JSON.parse(read("firefox", "manifest.json"));
+    assert.deepEqual(firefox.background.scripts, ["errorlog.js", "config.js", "background.js"]);
+    const chrome = JSON.parse(read("chrome", "manifest.json"));
+    assert.equal(chrome.background.service_worker, "background.js");
+    assert.match(read("src", "background.js"), /importScripts\('errorlog\.js', 'config\.js'\)/);
+    const scripts = (html) => [...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(scripts(read("src", "popup.html")), ["errorlog.js", "config.js", "popup.js"]);
+    assert.deepEqual(scripts(read("src", "options.html")), ["config.js", "options.js"]);
   });
 });

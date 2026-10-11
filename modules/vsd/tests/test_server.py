@@ -9,12 +9,16 @@ the module is imported. Nothing here touches the network, ffmpeg, the real
 ~/Downloads/VSD folder or modules/vsd/logs.
 """
 
+import http.server
 import logging
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from time import time
 from unittest import mock
@@ -33,6 +37,9 @@ os.environ["VSD_PORT"] = "8765"
 os.environ["VSD_AUTO_OPEN"] = "0"
 os.environ["VSD_MAX_RETRIES"] = "3"
 os.environ["VSD_FFMPEG"] = "ffmpeg-test-binary"
+os.environ["VSD_SEGMENT_WORKERS"] = "6"
+ADMIN_TOKEN = "test-admin-token-0123456789abcdef"
+os.environ["VSD_ADMIN_TOKEN"] = ADMIN_TOKEN
 
 _VSD_DIR = Path(__file__).resolve().parent.parent
 if str(_VSD_DIR) not in sys.path:
@@ -70,6 +77,8 @@ class _ServerStateMixin:
         self._orig_log_file = server.LOG_FILE
         self._orig_host = server.SERVER_HOST
         self._orig_auto_open = server.AUTO_OPEN
+        self._orig_admin_token = server.ADMIN_TOKEN
+        self._orig_segment_workers = server.SEGMENT_WORKERS
         with server._jobs_lock:
             server._jobs.clear()
             server._produced_outputs.clear()
@@ -83,6 +92,8 @@ class _ServerStateMixin:
         server.LOG_FILE = self._orig_log_file
         server.SERVER_HOST = self._orig_host
         server.AUTO_OPEN = self._orig_auto_open
+        server.ADMIN_TOKEN = self._orig_admin_token
+        server.SEGMENT_WORKERS = self._orig_segment_workers
         with server._jobs_lock:
             server._jobs.clear()
             server._produced_outputs.clear()
@@ -419,22 +430,31 @@ class MayOpenTests(_ServerStateMixin, unittest.TestCase):
         self.assertTrue(server._may_open(f.resolve()))
 
 
+def _urllib_resp(data, status=200, reason="OK", headers=None):
+    """A stand-in for what _URLLIB_OPENER.open returns (a context manager)."""
+    cm = mock.MagicMock()
+    resp = cm.__enter__.return_value
+    resp.status, resp.reason, resp.headers = status, reason, headers or {}
+    resp.read.return_value = data
+    return cm
+
+
 class FetchTests(unittest.TestCase):
+    """_fetch without a connection pool: every request goes through urllib."""
+
+    def _open(self, **kw):
+        return mock.patch.object(server._URLLIB_OPENER, "open", **kw)
+
     def test_rejects_non_http_schemes_without_network(self):
-        with mock.patch.object(server.urllib.request, "urlopen") as urlopen:
+        with self._open() as urlopen:
             for url in ("file:///C:/secret.txt", "ftp://a/b", "javascript:x", "C:\\x.ts"):
                 with self.subTest(url=url):
                     with self.assertRaises(ValueError):
                         server._fetch(url)
             urlopen.assert_not_called()
 
-    def _resp(self, data):
-        cm = mock.MagicMock()
-        cm.__enter__.return_value.read.return_value = data
-        return cm
-
     def test_success_sends_ua_and_cleaned_headers(self):
-        with mock.patch.object(server.urllib.request, "urlopen", return_value=self._resp(b"OK")) as urlopen:
+        with self._open(return_value=_urllib_resp(b"OK")) as urlopen:
             data = server._fetch("https://a.com/x.ts", {"Host": "evil", "Referer": "https://a.com/"})
         self.assertEqual(data, b"OK")
         req = urlopen.call_args.args[0]
@@ -445,29 +465,275 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(urlopen.call_args.kwargs.get("timeout"), 30)
 
     def test_caller_can_override_user_agent(self):
-        with mock.patch.object(server.urllib.request, "urlopen", return_value=self._resp(b"")) as urlopen:
+        with self._open(return_value=_urllib_resp(b"")) as urlopen:
             server._fetch("https://a.com/x", {"User-Agent": "Custom/1.0"})
         self.assertEqual(urlopen.call_args.args[0].get_header("User-agent"), "Custom/1.0")
 
     def test_retries_then_succeeds(self):
-        with mock.patch.object(
-            server.urllib.request, "urlopen",
-            side_effect=[OSError("boom"), OSError("boom2"), self._resp(b"data")],
-        ) as urlopen:
+        with self._open(side_effect=[OSError("boom"), OSError("boom2"), _urllib_resp(b"data")]) as urlopen:
             self.assertEqual(server._fetch("https://a.com/x", retries=3), b"data")
         self.assertEqual(urlopen.call_count, 3)
 
     def test_raises_last_error_after_retries(self):
         errors = [OSError("e1"), OSError("e2")]
-        with mock.patch.object(server.urllib.request, "urlopen", side_effect=errors) as urlopen:
+        with self._open(side_effect=errors) as urlopen:
             with self.assertRaises(OSError) as ctx:
                 server._fetch("https://a.com/x", retries=2)
         self.assertIs(ctx.exception, errors[1])
         self.assertEqual(urlopen.call_count, 2)
 
     def test_zero_retries_still_attempts_once(self):
-        with mock.patch.object(server.urllib.request, "urlopen", return_value=self._resp(b"data")):
+        with self._open(return_value=_urllib_resp(b"data")):
             self.assertEqual(server._fetch("https://a.com/x", retries=0), b"data")
+
+    def test_http_error_status_is_retried(self):
+        err = urllib.error.HTTPError("https://a.com/x", 503, "Unavailable", {}, None)
+        with self._open(side_effect=[err, _urllib_resp(b"data")]) as urlopen:
+            self.assertEqual(server._fetch("https://a.com/x", retries=3), b"data")
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_urllib_redirect_is_followed_by_fetch_with_the_same_headers(self):
+        redirect = urllib.error.HTTPError(
+            "https://a.com/x", 302, "Found", {"Location": "https://cdn.b.com/y.ts"}, None
+        )
+        with self._open(side_effect=[redirect, _urllib_resp(b"data")]) as urlopen:
+            data = server._fetch("https://a.com/x", {"Referer": "r", "Connection": "keep-alive"})
+        self.assertEqual(data, b"data")
+        first, second = (c.args[0] for c in urlopen.call_args_list)
+        self.assertEqual(second.full_url, "https://cdn.b.com/y.ts")
+        self.assertEqual(second.header_items(), first.header_items())
+        self.assertEqual(second.get_header("Referer"), "r")
+        self.assertIsNone(second.get_header("Connection"))
+
+    def test_redirect_to_non_http_scheme_is_refused_and_not_retried(self):
+        for location in ("file:///C:/Windows/win.ini", "ftp://a.com/x.ts", "javascript:alert(1)"):
+            redirect = urllib.error.HTTPError("https://a.com/x", 302, "Found", {"Location": location}, None)
+            with self.subTest(location=location), self._open(side_effect=[redirect]) as urlopen:
+                with self.assertRaises(ValueError):
+                    server._fetch("https://a.com/x", retries=3)
+                self.assertEqual(urlopen.call_count, 1)
+
+    def test_too_many_redirects(self):
+        def loop(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 302, "Found", {"Location": "/again"}, None)
+
+        with self._open(side_effect=loop) as urlopen:
+            with self.assertRaises(urllib.error.URLError) as ctx:
+                server._fetch("https://a.com/x", retries=1)
+        self.assertIn("Too many redirects", str(ctx.exception))
+        self.assertEqual(urlopen.call_count, server.MAX_REDIRECTS + 1)
+
+    def test_redirect_without_location_is_an_error(self):
+        redirect = urllib.error.HTTPError("https://a.com/x", 302, "Found", {}, None)
+        with self._open(side_effect=[redirect]):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                server._fetch("https://a.com/x", retries=1)
+        self.assertEqual(ctx.exception.code, 302)
+
+    def test_opener_does_not_follow_redirects_itself(self):
+        handlers = [h for h in server._URLLIB_OPENER.handlers
+                    if isinstance(h, urllib.request.HTTPRedirectHandler)]
+        self.assertEqual(len(handlers), 1)
+        self.assertIsInstance(handlers[0], server._NoRedirectHandler)
+        self.assertIsNone(handlers[0].redirect_request(None, None, 302, "Found", {}, "file:///x"))
+
+
+class _FakeResponse:
+    def __init__(self, body=b"ok", status=200, headers=None, will_close=False):
+        self.body, self.status, self.reason = body, status, "OK"
+        self.headers = headers or {}
+        self.will_close = will_close
+
+    def read(self):
+        return self.body
+
+
+class _FakeConnection:
+    """Records requests; `responses` items are _FakeResponse or exceptions to raise."""
+
+    def __init__(self, key, responses):
+        self.key = key
+        self.responses = list(responses)
+        self.requests = []
+        self.closed = False
+
+    def request(self, method, target, headers=None):
+        self.requests.append((method, target, headers))
+        item = self.responses.pop(0) if self.responses else _FakeResponse()
+        if isinstance(item, BaseException):
+            raise item
+        self._pending = item
+
+    def getresponse(self):
+        return self._pending
+
+    def close(self):
+        self.closed = True
+
+
+class ConnectionPoolTests(unittest.TestCase):
+    def setUp(self):
+        self.pool = server._ConnectionPool(proxies={})
+        self.addCleanup(self.pool.close)
+        self.created = []
+        self.next_responses = []  # one list of responses per connection to be created
+
+        def connect(scheme, host, port):
+            conn = _FakeConnection((scheme, host, port),
+                                   self.next_responses.pop(0) if self.next_responses else [])
+            self.created.append(conn)
+            return conn
+
+        p = mock.patch.object(self.pool, "_connect", side_effect=connect)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_reuses_one_connection_per_host(self):
+        for i in range(3):
+            self.pool.request(f"https://cdn.a.com/s{i}.ts", {"Referer": "r"})
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(self.created[0].key, ("https", "cdn.a.com", 443))
+        self.assertEqual([r[1] for r in self.created[0].requests], ["/s0.ts", "/s1.ts", "/s2.ts"])
+        self.assertEqual(self.created[0].requests[0][2], {"Referer": "r"})
+        self.assertFalse(self.created[0].closed)
+
+    def test_separate_connections_per_scheme_host_and_port(self):
+        for url in ("https://a.com/x", "http://a.com/x", "https://a.com:8443/x", "https://b.com/x",
+                    "https://a.com/y"):
+            self.pool.request(url, {})
+        self.assertEqual(
+            [c.key for c in self.created],
+            [("https", "a.com", 443), ("http", "a.com", 80), ("https", "a.com", 8443),
+             ("https", "b.com", 443)],
+        )
+
+    def test_request_target_keeps_query_and_drops_fragment(self):
+        self.pool.request("https://a.com/p/s.ts?token=abc&x=1#frag", {})
+        self.pool.request("https://a.com", {})
+        self.assertEqual([r[1] for r in self.created[0].requests], ["/p/s.ts?token=abc&x=1", "/"])
+
+    def test_returns_status_headers_and_body_for_any_status(self):
+        self.next_responses = [[_FakeResponse(b"nope", status=404, headers={"X": "1"})]]
+        status, _, headers, body = self.pool.request("https://a.com/x", {})
+        self.assertEqual((status, headers, body), (404, {"X": "1"}, b"nope"))
+
+    def test_connection_closed_when_server_will_close_it(self):
+        self.next_responses = [[_FakeResponse(will_close=True)]]
+        self.pool.request("https://a.com/x", {})
+        self.pool.request("https://a.com/y", {})
+        self.assertEqual(len(self.created), 2)
+        self.assertTrue(self.created[0].closed)
+
+    def test_stale_reused_connection_is_retried_on_a_fresh_one(self):
+        self.next_responses = [[_FakeResponse(b"1"), ConnectionResetError("idle timeout")],
+                               [_FakeResponse(b"2")]]
+        self.assertEqual(self.pool.request("https://a.com/1", {})[3], b"1")
+        self.assertEqual(self.pool.request("https://a.com/2", {})[3], b"2")
+        self.assertEqual(len(self.created), 2)
+        self.assertTrue(self.created[0].closed)
+
+    def test_failure_on_a_fresh_connection_is_raised(self):
+        self.next_responses = [[ConnectionResetError("refused")]]
+        with self.assertRaises(ConnectionResetError):
+            self.pool.request("https://a.com/x", {})
+        self.assertEqual(len(self.created), 1)
+        self.assertTrue(self.created[0].closed)
+
+    def test_failed_connection_is_not_reused(self):
+        self.next_responses = [[TimeoutError("slow")]]
+        with self.assertRaises(TimeoutError):
+            self.pool.request("https://a.com/x", {})
+        self.pool.request("https://a.com/y", {})
+        self.assertEqual(len(self.created), 2)
+        self.assertTrue(self.created[0].closed)
+
+    def test_close_closes_idle_connections_and_later_checkins(self):
+        self.pool.request("https://a.com/x", {})
+        self.pool.close()
+        self.assertTrue(self.created[0].closed)
+        self.pool.request("https://a.com/y", {})  # still works, but is not kept
+        self.assertTrue(self.created[1].closed)
+
+    def test_uses_proxy(self):
+        self.assertFalse(server._ConnectionPool(proxies={}).uses_proxy("https://a.com/x"))
+        pool = server._ConnectionPool(proxies={"https": "http://proxy:3128"})
+        with mock.patch.object(server.urllib.request, "proxy_bypass", return_value=False):
+            self.assertTrue(pool.uses_proxy("https://a.com/x"))
+        self.assertFalse(pool.uses_proxy("http://a.com/x"))  # no proxy for http
+        pool = server._ConnectionPool(proxies={"https": "http://proxy:3128"})
+        with mock.patch.object(server.urllib.request, "proxy_bypass", return_value=True):
+            self.assertFalse(pool.uses_proxy("https://intranet/x"))
+
+
+class PooledFetchTests(unittest.TestCase):
+    """_fetch / _fetch_once with a pool: transport choice, redirects and fallback."""
+
+    def setUp(self):
+        self.pool = mock.Mock(spec=server._ConnectionPool)
+        self.pool.uses_proxy.return_value = False
+        p = mock.patch.object(server._URLLIB_OPENER, "open")
+        self.urlopen = p.start()
+        self.addCleanup(p.stop)
+
+    def test_pool_is_used_when_no_proxy_applies(self):
+        self.pool.request.return_value = (200, "OK", {}, b"data")
+        self.assertEqual(server._fetch("https://a.com/x", {"Referer": "r"}, pool=self.pool), b"data")
+        url, headers = self.pool.request.call_args.args
+        self.assertEqual(url, "https://a.com/x")
+        self.assertEqual(headers, {"User-Agent": server._DEFAULT_UA, "Referer": "r"})
+        self.urlopen.assert_not_called()
+
+    def test_urllib_is_used_for_proxied_hosts(self):
+        self.pool.uses_proxy.return_value = True
+        self.urlopen.return_value = _urllib_resp(b"via proxy")
+        self.assertEqual(server._fetch("https://a.com/x", pool=self.pool), b"via proxy")
+        self.pool.request.assert_not_called()
+
+    def test_transport_error_falls_back_to_urllib_for_remaining_attempts(self):
+        self.pool.request.side_effect = ConnectionRefusedError("refused")
+        self.urlopen.side_effect = [OSError("still down"), _urllib_resp(b"data")]
+        self.assertEqual(server._fetch("https://a.com/x", retries=3, pool=self.pool), b"data")
+        self.assertEqual(self.pool.request.call_count, 1)
+        self.assertEqual(self.urlopen.call_count, 2)
+
+    def test_http_error_status_keeps_using_the_pool(self):
+        self.pool.request.side_effect = [(503, "Unavailable", {}, b""), (200, "OK", {}, b"data")]
+        self.assertEqual(server._fetch("https://a.com/x", retries=3, pool=self.pool), b"data")
+        self.assertEqual(self.pool.request.call_count, 2)
+        self.urlopen.assert_not_called()
+
+    def test_http_error_status_is_raised_after_retries(self):
+        self.pool.request.return_value = (404, "Not Found", {}, b"")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            server._fetch("https://a.com/x", retries=2, pool=self.pool)
+        self.assertEqual(ctx.exception.code, 404)
+        self.assertEqual(self.pool.request.call_count, 2)
+
+    def test_redirect_is_followed_on_the_pool_with_the_same_headers(self):
+        self.pool.request.side_effect = [
+            (301, "Moved", {"Location": "/v2/s.ts?sig=1"}, b""),
+            (200, "OK", {}, b"data"),
+        ]
+        data = server._fetch("https://a.com/v1/s.ts", {"Host": "x", "Cookie": "c"}, pool=self.pool)
+        self.assertEqual(data, b"data")
+        (url1, h1), (url2, h2) = (c.args for c in self.pool.request.call_args_list)
+        self.assertEqual(url2, "https://a.com/v2/s.ts?sig=1")
+        self.assertEqual(h1, h2)
+        self.assertEqual(h2, {"User-Agent": server._DEFAULT_UA, "Cookie": "c"})
+
+    def test_redirect_to_non_http_scheme_is_refused(self):
+        self.pool.request.return_value = (302, "Found", {"Location": "file:///etc/passwd"}, b"")
+        with self.assertRaises(ValueError):
+            server._fetch("https://a.com/x", retries=3, pool=self.pool)
+        self.assertEqual(self.pool.request.call_count, 1)
+        self.urlopen.assert_not_called()
+
+    def test_redirect_to_a_proxied_host_switches_to_urllib(self):
+        self.pool.uses_proxy.side_effect = lambda url: "proxied" in url
+        self.pool.request.return_value = (302, "Found", {"Location": "https://proxied.com/s.ts"}, b"")
+        self.urlopen.return_value = _urllib_resp(b"data")
+        self.assertEqual(server._fetch("https://a.com/x", pool=self.pool), b"data")
+        self.assertEqual(self.urlopen.call_args.args[0].full_url, "https://proxied.com/s.ts")
 
 
 class OpenFileTests(unittest.TestCase):
@@ -493,22 +759,298 @@ class OpenFileTests(unittest.TestCase):
 # ── Download pipeline (network / ffmpeg mocked) ─────────────────────────────
 
 class DownloadSegmentsTests(_ServerStateMixin, unittest.TestCase):
-    def test_downloads_and_tracks_progress_skipping_failures(self):
-        segs = ["https://a.com/s0.ts", "https://a.com/s1.ts?x=1", "https://a.com/s2"]
+    WAIT = 5  # seconds; generous upper bound so a broken implementation fails instead of hanging
 
-        def fake_fetch(url, headers=None):
-            if "s1" in url:
-                raise OSError("fail")
+    def _segs(self, n):
+        return [f"https://a.com/s{i}.ts" for i in range(n)]
+
+    def test_downloads_and_tracks_progress(self):
+        segs = ["https://a.com/s0.ts", "https://a.com/s1.ts?x=1", "https://a.com/s2"]
+        calls = []
+
+        def fake_fetch(url, headers=None, **kw):
+            calls.append((url, headers, kw))
             return url.encode()
 
         server._set_job("job1")
         with mock.patch.object(server, "_fetch", side_effect=fake_fetch):
             files = server._download_segments(segs, self.tmp, {"Referer": "r"}, "job1")
 
-        self.assertEqual([f.name for f in files], ["seg_00000.ts", "seg_00002.ts"])
-        self.assertEqual(files[0].read_bytes(), b"https://a.com/s0.ts")
+        self.assertEqual([f.name for f in files], ["seg_00000.ts", "seg_00001.ts", "seg_00002.ts"])
+        self.assertEqual(files[1].read_bytes(), b"https://a.com/s1.ts?x=1")
         job = server._jobs["job1"]
-        self.assertEqual((job["total"], job["current"], job["stage"]), (3, 2, "downloading"))
+        self.assertEqual((job["total"], job["current"], job["stage"]), (3, 3, "downloading"))
+        # Every segment shares one connection pool and gets the caller's headers.
+        self.assertTrue(all(h == {"Referer": "r"} for _, h, _ in calls))
+        pools = {id(kw["pool"]) for _, _, kw in calls}
+        self.assertEqual(len(pools), 1)
+        self.assertIsInstance(calls[0][2]["pool"], server._ConnectionPool)
+
+    def test_empty_segment_list(self):
+        server._set_job("job0")
+        with mock.patch.object(server, "_fetch") as fetch:
+            self.assertEqual(server._download_segments([], self.tmp, None, "job0"), [])
+        fetch.assert_not_called()
+        self.assertEqual(server._jobs["job0"]["total"], 0)
+
+    def test_order_preserved_when_segments_complete_out_of_order(self):
+        n = 5
+        segs = self._segs(n)
+        finished = [threading.Event() for _ in range(n)]
+        completion_order = []
+        lock = threading.Lock()
+
+        def fake_fetch(url, headers=None, **kw):
+            i = segs.index(url)
+            # Segment i only completes after segment i+1: completion order is n-1, ..., 0.
+            if i + 1 < n and not finished[i + 1].wait(self.WAIT):
+                raise TimeoutError(f"segment {i + 1} never finished")
+            with lock:
+                completion_order.append(i)
+            finished[i].set()
+            return f"data{i}".encode()
+
+        server._set_job("job1")
+        with mock.patch.object(server, "_fetch", side_effect=fake_fetch):
+            files = server._download_segments(segs, self.tmp, None, "job1")
+
+        self.assertEqual(completion_order, list(reversed(range(n))))
+        self.assertEqual([f.name for f in files], [f"seg_{i:05d}.ts" for i in range(n)])
+        self.assertEqual([f.read_bytes() for f in files], [f"data{i}".encode() for i in range(n)])
+        self.assertEqual(server._jobs["job1"]["current"], n)
+
+    def test_downloads_run_in_parallel_up_to_the_worker_limit(self):
+        server.SEGMENT_WORKERS = 3
+        segs = self._segs(9)
+        barrier = threading.Barrier(3, timeout=self.WAIT)  # needs 3 concurrent fetches to pass
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def fake_fetch(url, headers=None, **kw):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait()
+                return b"x"
+            finally:
+                with lock:
+                    active -= 1
+
+        server._set_job("job1")
+        with mock.patch.object(server, "_fetch", side_effect=fake_fetch):
+            files = server._download_segments(segs, self.tmp, None, "job1")
+        self.assertEqual(len(files), 9)
+        self.assertEqual(peak, 3)
+
+    def test_progress_counts_up_to_total_under_the_jobs_lock(self):
+        n = 25
+        segs = self._segs(n)
+        seen = []
+        real_set_job = server._set_job
+
+        def recording_set_job(job_id, **kwargs):
+            if "current" in kwargs:
+                seen.append(kwargs["current"])
+            real_set_job(job_id, **kwargs)
+
+        lock_held = []
+        real_lock = server._jobs_lock
+
+        class CheckingLock:
+            def __enter__(self):
+                real_lock.acquire()
+                lock_held.append(True)
+                return self
+
+            def __exit__(self, *exc):
+                real_lock.release()
+
+        def fake_fetch(url, headers=None, **kw):
+            return b"x"
+
+        server._set_job("job1")
+        with mock.patch.object(server, "_fetch", side_effect=fake_fetch), \
+                mock.patch.object(server, "_set_job", side_effect=recording_set_job), \
+                mock.patch.object(server, "_jobs_lock", CheckingLock()):
+            server._download_segments(segs, self.tmp, None, "job1")
+
+        self.assertEqual(seen, list(range(n + 1)))  # 0, then one step per finished segment
+        self.assertEqual(len(lock_held), n + 1)     # every update went through the lock
+        job = server._jobs["job1"]
+        self.assertEqual((job["current"], job["total"]), (n, n))
+
+    def test_each_segment_gets_its_own_retries(self):
+        segs = self._segs(4)
+        attempts = {}
+        pools_seen = {}
+        lock = threading.Lock()
+
+        def flaky_fetch_once(url, headers, pool=None):
+            with lock:
+                attempts[url] = attempts.get(url, 0) + 1
+                pools_seen.setdefault(url, []).append(pool is not None)
+                n = attempts[url]
+            if n < server.MAX_RETRIES:
+                raise ConnectionResetError(f"attempt {n}")
+            return url.encode()
+
+        server._set_job("job1")
+        with mock.patch.object(server, "_fetch_once", side_effect=flaky_fetch_once):
+            files = server._download_segments(segs, self.tmp, None, "job1")
+
+        self.assertEqual(len(files), 4)
+        self.assertEqual(attempts, {u: server.MAX_RETRIES for u in segs})
+        # The first attempt uses the shared pool; after a transport error, urllib takes over.
+        for url in segs:
+            self.assertEqual(pools_seen[url], [True] + [False] * (server.MAX_RETRIES - 1))
+        self.assertEqual(server._jobs["job1"]["current"], 4)
+
+    def test_permanent_failure_returns_fewer_files(self):
+        segs = self._segs(3)
+        ok_done = threading.Event()
+
+        def fake_fetch(url, headers=None, **kw):
+            if url.endswith("s1.ts"):
+                ok_done.wait(self.WAIT)  # let the other segments start first
+                raise OSError("gone")
+            if url.endswith("s2.ts"):
+                ok_done.set()
+            return b"x"
+
+        server._set_job("job1")
+        with mock.patch.object(server, "_fetch", side_effect=fake_fetch):
+            files = server._download_segments(segs, self.tmp, None, "job1")
+        self.assertEqual([f.name for f in files], ["seg_00000.ts", "seg_00002.ts"])
+        self.assertEqual(server._jobs["job1"]["current"], 2)
+
+    def test_permanent_failure_cancels_segments_that_have_not_started(self):
+        server.SEGMENT_WORKERS = 1
+        segs = self._segs(6)
+        fetched = []
+
+        def fake_fetch(url, headers=None, **kw):
+            fetched.append(url)
+            if url.endswith("s0.ts"):
+                raise OSError("gone")
+            # Give the main thread time to cancel the queued segments.
+            threading.Event().wait(0.5)
+            return b"x"
+
+        server._set_job("job1")
+        with mock.patch.object(server, "_fetch", side_effect=fake_fetch):
+            files = server._download_segments(segs, self.tmp, None, "job1")
+        # s0 failed; at most the segment already picked up by the worker ran.
+        self.assertLessEqual(len(fetched), 2)
+        self.assertEqual(fetched[0], segs[0])
+        self.assertLess(len(files), len(segs))
+
+
+class _LoopbackHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP/1.1 keep-alive test server on 127.0.0.1 (nothing leaves the machine)."""
+
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        with self.server.stats_lock:
+            self.server.connections += 1
+
+    def do_GET(self):
+        with self.server.stats_lock:
+            self.server.requests.append((self.path, dict(self.headers)))
+        if self.path.startswith("/redirect-to-file"):
+            self._send(302, b"", {"Location": "file:///C:/Windows/win.ini"})
+        elif self.path.startswith("/redirect"):
+            self._send(302, b"", {"Location": "/seg/redirected.ts"})
+        elif self.path.startswith("/missing"):
+            self._send(404, b"not found")
+        else:
+            self._send(200, self.path.encode())
+
+    def _send(self, status, body, headers=None):
+        self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class LoopbackHttpTests(_ServerStateMixin, unittest.TestCase):
+    """Real http.client/urllib traffic against a local server, to prove keep-alive
+    reuse and redirect handling end to end."""
+
+    def setUp(self):
+        super().setUp()
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackHandler)
+        httpd.daemon_threads = True
+        httpd.block_on_close = False
+        httpd.stats_lock = threading.Lock()
+        httpd.connections = 0
+        httpd.requests = []
+        self.httpd = httpd
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        # Never route loopback traffic through a system proxy.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), server._NoRedirectHandler)
+        p = mock.patch.object(server, "_URLLIB_OPENER", opener)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_pool_reuses_one_connection_for_sequential_requests(self):
+        with server._ConnectionPool(proxies={}) as pool:
+            for i in range(5):
+                self.assertEqual(server._fetch(f"{self.base}/seg/{i}.ts", {"Referer": "r"}, pool=pool),
+                                 f"/seg/{i}.ts".encode())
+        self.assertEqual(self.httpd.connections, 1)
+        self.assertEqual(len(self.httpd.requests), 5)
+        self.assertEqual(self.httpd.requests[0][1].get("Referer"), "r")
+        self.assertEqual(self.httpd.requests[0][1].get("User-Agent"), server._DEFAULT_UA)
+
+    def test_urllib_path_opens_a_connection_per_request(self):
+        for i in range(3):
+            server._fetch(f"{self.base}/seg/{i}.ts")
+        self.assertEqual(self.httpd.connections, 3)
+
+    def test_redirects_followed_on_both_transports(self):
+        with server._ConnectionPool(proxies={}) as pool:
+            self.assertEqual(server._fetch(f"{self.base}/redirect", pool=pool), b"/seg/redirected.ts")
+        self.assertEqual(server._fetch(f"{self.base}/redirect"), b"/seg/redirected.ts")
+        self.assertEqual([p for p, _ in self.httpd.requests],
+                         ["/redirect", "/seg/redirected.ts"] * 2)
+
+    def test_redirect_to_file_refused_on_both_transports(self):
+        with server._ConnectionPool(proxies={}) as pool:
+            with self.assertRaises(ValueError):
+                server._fetch(f"{self.base}/redirect-to-file", pool=pool)
+        with self.assertRaises(ValueError):
+            server._fetch(f"{self.base}/redirect-to-file")
+        self.assertEqual(len(self.httpd.requests), 2)  # no retries
+
+    def test_http_error_status(self):
+        with server._ConnectionPool(proxies={}) as pool:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                server._fetch(f"{self.base}/missing", retries=2, pool=pool)
+        self.assertEqual(ctx.exception.code, 404)
+        self.assertEqual(self.httpd.connections, 1)  # both attempts on the kept-alive connection
+
+    def test_download_segments_end_to_end(self):
+        server.SEGMENT_WORKERS = 3
+        segs = [f"{self.base}/seg/{i}.ts" for i in range(12)]
+        server._set_job("job1")
+        with mock.patch.object(server.urllib.request, "getproxies", return_value={}):
+            files = server._download_segments(segs, self.tmp, None, "job1")
+        self.assertEqual([f.read_bytes() for f in files], [f"/seg/{i}.ts".encode() for i in range(12)])
+        self.assertLessEqual(self.httpd.connections, 3)
+        self.assertEqual(server._jobs["job1"]["current"], 12)
 
 
 class MuxWithFfmpegTests(_ServerStateMixin, unittest.TestCase):
@@ -586,7 +1128,7 @@ class RunDownloadTests(_ServerStateMixin, unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def _fake_fetch(self, url, headers=None):
+    def _fake_fetch(self, url, headers=None, **kw):
         if url == self.PLAYLIST_URL:
             return self.PLAYLIST
         return b"segment"
@@ -634,7 +1176,7 @@ class RunDownloadTests(_ServerStateMixin, unittest.TestCase):
         mux.assert_not_called()
 
     def test_all_segments_failing_marks_error(self):
-        def fetch(url, headers=None):
+        def fetch(url, headers=None, **kw):
             if url == self.PLAYLIST_URL:
                 return self.PLAYLIST
             raise OSError("404")
@@ -644,11 +1186,15 @@ class RunDownloadTests(_ServerStateMixin, unittest.TestCase):
         self.assertIn("No segments could be downloaded", server._jobs["job4"]["error"])
 
     def test_missing_segments_fail_the_job_instead_of_saving_a_gappy_video(self):
-        def fetch(url, headers=None):
+        s0_done = threading.Event()
+
+        def fetch(url, headers=None, **kw):
             if url == self.PLAYLIST_URL:
                 return self.PLAYLIST
             if url.endswith("s1.ts"):
+                s0_done.wait(5)
                 raise OSError("timed out")
+            s0_done.set()
             return b"ts"
 
         with mock.patch.object(server, "_fetch", side_effect=fetch), \
@@ -656,9 +1202,34 @@ class RunDownloadTests(_ServerStateMixin, unittest.TestCase):
             server._run_download("job7", self.PLAYLIST_URL, "", None, {})
         job = server._jobs["job7"]
         self.assertEqual(job["status"], "error")
-        self.assertIn("1 of 2 segments", job["error"])
+        self.assertIn("only 1 of 2 segments", job["error"])
         mux.assert_not_called()
         self.assertFalse(self.work.exists())
+
+    def test_one_segment_failing_after_its_retries_fails_the_job(self):
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:4,\ns%d.ts\n" % i for i in range(8))
+        attempts = {}
+        lock = threading.Lock()
+
+        def fetch_once(url, headers, pool=None):
+            if url == self.PLAYLIST_URL:
+                return playlist
+            with lock:
+                attempts[url] = attempts.get(url, 0) + 1
+            if url.endswith("/s3.ts"):
+                raise OSError("connection timed out")
+            return b"ts"
+
+        with mock.patch.object(server, "_fetch_once", side_effect=fetch_once), \
+                mock.patch.object(server, "_mux_with_ffmpeg") as mux:
+            server._run_download("job8", self.PLAYLIST_URL, "", None, {})
+        job = server._jobs["job8"]
+        self.assertEqual((job["status"], job["stage"]), ("error", "error"))
+        self.assertIn("of 8 segments were downloaded", job["error"])
+        self.assertEqual(attempts["https://cdn.a.com/v/720p/s3.ts"], server.MAX_RETRIES)
+        mux.assert_not_called()
+        self.assertFalse(self.work.exists())
+        self.assertEqual(os.listdir(self.download_dir), [])
 
     def test_ffmpeg_failure_marks_error(self):
         with mock.patch.object(server, "_fetch", side_effect=self._fake_fetch), \
@@ -1051,7 +1622,8 @@ class OpenEndpointTests(_ClientMixin, unittest.TestCase):
         f = self.download_dir / "video.mp4"
         f.write_bytes(b"x")
         new_dir = self.tmp / "new_downloads"
-        r = self.client.post("/config/download_dir", json={"path": str(new_dir)})
+        r = self.client.post("/config/download_dir", json={"path": str(new_dir)},
+                             headers={"X-VSD-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.client.post("/open", json={"path": str(f)}).status_code, 403)
         server._produced_outputs.add(os.path.normcase(str(f.resolve())))
@@ -1059,43 +1631,109 @@ class OpenEndpointTests(_ClientMixin, unittest.TestCase):
 
 
 class ConfigDownloadDirTests(_ClientMixin, unittest.TestCase):
-    def test_get(self):
-        r = self.client.get("/config/download_dir", headers={"Origin": EXT_ORIGIN})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.get_json(), {"download_dir": str(self.download_dir)})
+    """POST requires X-VSD-Admin-Token == VSD_ADMIN_TOKEN. The token is the only
+    authority: no Origin (MULA) or an allowed extension Origin are both accepted
+    with it; web origins are rejected by the global Origin guard regardless."""
 
-    def test_post_from_mula_changes_dir_and_creates_it(self):
+    TOKEN_HEADER = {"X-VSD-Admin-Token": ADMIN_TOKEN}
+
+    def _post(self, path, headers=None):
+        return self.client.post("/config/download_dir", json={"path": str(path)}, headers=headers or {})
+
+    def _assert_refused(self, r, new_dir):
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("only be changed by MULA", r.get_json()["error"])
+        self.assertFalse(new_dir.exists())
+        self.assertEqual(server.DOWNLOAD_DIR, self.download_dir)
+
+    def test_token_read_from_env_and_removed_from_it(self):
+        self.assertEqual(server.ADMIN_TOKEN, ADMIN_TOKEN)
+        self.assertNotIn("VSD_ADMIN_TOKEN", os.environ)  # not inherited by ffmpeg / opened apps
+
+    def test_get_needs_no_token(self):
+        for headers in ({}, {"Origin": EXT_ORIGIN}):
+            with self.subTest(headers=headers):
+                r = self.client.get("/config/download_dir", headers=headers)
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.get_json(), {"download_dir": str(self.download_dir)})
+
+    def test_post_with_correct_token_changes_dir_and_creates_it(self):
         new_dir = self.tmp / "nested" / "new"
-        r = self.client.post("/config/download_dir", json={"path": str(new_dir)})
+        r = self._post(new_dir, self.TOKEN_HEADER)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json(), {"ok": True, "download_dir": str(new_dir)})
         self.assertTrue(new_dir.is_dir())
         self.assertEqual(server.DOWNLOAD_DIR, new_dir)
         self.assertEqual(self.client.get("/health").get_json()["download_dir"], str(new_dir))
 
+    def test_post_missing_token_refused(self):
+        self._assert_refused(self._post(self.tmp / "d"), self.tmp / "d")
+
+    def test_post_wrong_token_refused(self):
+        new_dir = self.tmp / "d"
+        for token in ("wrong", ADMIN_TOKEN[:-1], ADMIN_TOKEN + "x", ADMIN_TOKEN.upper(),
+                      " " + ADMIN_TOKEN, "", "Ω"):
+            with self.subTest(token=token):
+                self._assert_refused(self._post(new_dir, {"X-VSD-Admin-Token": token}), new_dir)
+
+    def test_token_in_another_header_refused(self):
+        new_dir = self.tmp / "d"
+        for name in ("Authorization", "X-Admin-Token", "Cookie"):
+            with self.subTest(header=name):
+                self._assert_refused(self._post(new_dir, {name: ADMIN_TOKEN}), new_dir)
+
+    def test_header_name_is_case_insensitive(self):
+        new_dir = self.tmp / "d"
+        self.assertEqual(self._post(new_dir, {"x-vsd-admin-token": ADMIN_TOKEN}).status_code, 200)
+
+    def test_post_refused_when_token_not_configured(self):
+        server.ADMIN_TOKEN = ""
+        new_dir = self.tmp / "d"
+        for headers in ({}, {"X-VSD-Admin-Token": ""}, {"X-VSD-Admin-Token": ADMIN_TOKEN}):
+            with self.subTest(headers=headers):
+                self._assert_refused(self._post(new_dir, headers), new_dir)
+
+    def test_post_token_compared_in_constant_time(self):
+        with mock.patch.object(server.hmac, "compare_digest", wraps=server.hmac.compare_digest) as cmp:
+            self.assertEqual(self._post(self.tmp / "d", self.TOKEN_HEADER).status_code, 200)
+        cmp.assert_called_once_with(ADMIN_TOKEN.encode(), ADMIN_TOKEN.encode())
+
     def test_post_missing_path(self):
-        r = self.client.post("/config/download_dir", json={})
+        r = self.client.post("/config/download_dir", json={}, headers=self.TOKEN_HEADER)
         self.assertEqual(r.status_code, 400)
         self.assertEqual(server.DOWNLOAD_DIR, self.download_dir)
 
-    def test_post_refused_from_extension_origin(self):
+    def test_post_without_token_checked_before_body(self):
+        r = self.client.post("/config/download_dir", data="not json", content_type="application/json")
+        self.assertEqual(r.status_code, 403)
+
+    def test_post_from_extension_origin_without_token_refused(self):
         new_dir = self.tmp / "ext_dir"
         for origin in (EXT_ORIGIN, MOZ_ORIGIN):
             with self.subTest(origin=origin):
-                r = self.client.post("/config/download_dir", json={"path": str(new_dir)},
-                                     headers={"Origin": origin})
-                self.assertEqual(r.status_code, 403)
-                self.assertIn("only be changed from MULA", r.get_json()["error"])
+                self._assert_refused(self._post(new_dir, {"Origin": origin}), new_dir)
+
+    def test_post_from_extension_origin_with_token_allowed(self):
+        # Documented decision: the token alone authorizes. Extensions are never given it.
+        new_dir = self.tmp / "ext_dir"
+        r = self._post(new_dir, {"Origin": EXT_ORIGIN, **self.TOKEN_HEADER})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(server.DOWNLOAD_DIR, new_dir)
+
+    def test_post_from_web_origin_refused_even_with_token(self):
+        new_dir = self.tmp / "web_dir"
+        r = self._post(new_dir, {"Origin": "https://evil.com", **self.TOKEN_HEADER})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.get_json(), {"error": "Forbidden origin"})
         self.assertFalse(new_dir.exists())
         self.assertEqual(server.DOWNLOAD_DIR, self.download_dir)
 
-    def test_post_refused_from_web_origin(self):
-        new_dir = self.tmp / "web_dir"
-        r = self.client.post("/config/download_dir", json={"path": str(new_dir)},
-                             headers={"Origin": "https://evil.com"})
+    def test_post_with_token_but_rebinding_host_refused(self):
+        new_dir = self.tmp / "d"
+        r = self._post(new_dir, {"Host": "attacker.com:8765", **self.TOKEN_HEADER})
         self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.get_json(), {"error": "Forbidden host"})
         self.assertFalse(new_dir.exists())
-        self.assertEqual(server.DOWNLOAD_DIR, self.download_dir)
 
 
 if __name__ == "__main__":

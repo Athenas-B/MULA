@@ -13,7 +13,7 @@
     "<all_urls>"
   ],
   "background": {
-    "scripts": ["errorlog.js", "background.js"],
+    "scripts": ["errorlog.js", "config.js", "background.js"],
     "persistent": false
   },
   "content_scripts": [

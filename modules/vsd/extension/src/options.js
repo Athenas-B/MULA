@@ -4,7 +4,9 @@ const serverUrlInput = document.getElementById('serverUrl');
 const saveBtn = document.getElementById('save');
 const msgDiv = document.getElementById('msg');
 
-chrome.storage.local.get({ serverUrl: 'http://127.0.0.1:8765' }, ({ serverUrl }) => {
+serverUrlInput.placeholder = VSD_DEFAULT_SERVER;
+
+vsdGetServerUrl().then((serverUrl) => {
   serverUrlInput.value = serverUrl;
 });
 

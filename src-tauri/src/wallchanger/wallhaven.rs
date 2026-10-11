@@ -2,20 +2,25 @@
 //! exposes the cached images to the rest of the Wall Changer pipeline.
 //!
 //! Search results are cached per source in a `manifest.json` and reused for [`RESULTS_TTL`],
-//! so a wallpaper change normally does no network I/O at all. When a refresh fails (offline,
-//! rate limited, ...) the previously downloaded images keep being used.
+//! so a wallpaper change normally does no network I/O at all. Stale results are refreshed on a
+//! background thread while the cached images keep being used; only a source with nothing
+//! cached yet is fetched synchronously. When a refresh fails (offline, rate limited, ...) the
+//! previously downloaded images keep being used.
 
 use super::images::NetworkPolicy;
-use super::settings::{Settings, Source};
+use super::settings::Purity;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_WALLHAVEN_PURITY: &str = "110";
+/// Parallel image downloads (the API's rate limit only applies to search requests).
+const DOWNLOAD_WORKERS: usize = 4;
 /// How long fetched search results are reused before Wallhaven is queried again.
 const RESULTS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Wallhaven allows 45 API requests per minute.
@@ -52,11 +57,6 @@ struct Manifest {
     files: Vec<String>,
 }
 
-pub fn is_wallhaven_url(path: &str) -> bool {
-    let p = path.trim().to_lowercase();
-    (p.starts_with("http://") || p.starts_with("https://")) && p.contains("wallhaven.cc")
-}
-
 /// Removes API keys from text that may end up in logs or the UI.
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -73,74 +73,99 @@ pub fn redact(text: &str) -> String {
     out
 }
 
-/// Returns the cached image files for a Wallhaven source, refreshing the search results first
-/// when they are older than [`RESULTS_TTL`] and `network` allows it.
-pub fn images_for_source(source: &Source, settings: &Settings, network: NetworkPolicy) -> Result<Vec<PathBuf>, String> {
-    let base_url = source.path.trim();
-    if base_url.is_empty() {
+/// What to do for a source, given the state of its cache.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    UseCache,
+    UseCacheAndRefreshInBackground,
+    RefreshNow,
+}
+
+fn plan(fresh: bool, network: NetworkPolicy, has_cached_files: bool) -> Plan {
+    match (fresh, network, has_cached_files) {
+        (true, _, _) | (_, NetworkPolicy::CacheOnly, _) => Plan::UseCache,
+        (false, NetworkPolicy::RefreshWhenStale, true) => Plan::UseCacheAndRefreshInBackground,
+        (false, NetworkPolicy::RefreshWhenStale, false) => Plan::RefreshNow,
+    }
+}
+
+/// Cache folders with a background refresh in flight.
+static REFRESHING: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+/// Everything a refresh needs, owned so it can run on another thread.
+#[derive(Clone)]
+struct RefreshJob {
+    url: String,
+    page_limit: i32,
+    purity: Purity,
+    api_key: Option<String>,
+    cache_dir: PathBuf,
+    query: String,
+}
+
+/// Returns the cached image files of a Wallhaven source. Stale search results are refreshed
+/// in the background (or right away when nothing is cached yet), if `network` allows it.
+pub fn images_for_source(
+    url: &str,
+    page_limit: i32,
+    purity: Purity,
+    api_key: Option<&str>,
+    network: NetworkPolicy,
+) -> Result<Vec<PathBuf>, String> {
+    let url = url.trim();
+    if url.is_empty() {
         return Ok(Vec::new());
     }
 
-    let cache_dir = source_cache_dir(base_url)?;
-    let query = query_signature(source, settings);
+    let cache_dir = source_cache_dir(url)?;
+    let query = query_signature(url, page_limit, purity, api_key.is_some());
     let manifest = read_manifest(&cache_dir);
     let fresh = manifest
         .as_ref()
         .is_some_and(|m| m.query == query && now_secs().saturating_sub(m.fetched_at) < RESULTS_TTL.as_secs());
+    let cached = cached_files(&cache_dir, manifest.as_ref());
 
-    if fresh || network == NetworkPolicy::CacheOnly {
-        return Ok(cached_files(&cache_dir, manifest.as_ref()));
+    let job = RefreshJob {
+        url: url.to_string(),
+        page_limit,
+        purity,
+        api_key: api_key.map(str::to_string),
+        cache_dir,
+        query,
+    };
+    match plan(fresh, network, !cached.is_empty()) {
+        Plan::UseCache => Ok(cached),
+        Plan::UseCacheAndRefreshInBackground => {
+            refresh_in_background(job);
+            Ok(cached)
+        }
+        Plan::RefreshNow => refresh(&job).map_err(|e| redact(&e)),
     }
+}
 
-    match refresh(source, settings, &cache_dir, query) {
-        Ok(files) => Ok(files),
-        Err(e) => {
-            let cached = cached_files(&cache_dir, manifest.as_ref());
-            if cached.is_empty() {
-                Err(redact(&e))
-            } else {
-                log::warn!(
-                    "Wallhaven refresh failed, using {} cached image(s): {}",
-                    cached.len(),
-                    redact(&e)
-                );
-                Ok(cached)
-            }
+fn refresh_in_background(job: RefreshJob) {
+    {
+        let mut running = REFRESHING.lock().unwrap_or_else(|p| p.into_inner());
+        if !running.insert(job.cache_dir.clone()) {
+            return;
         }
     }
+    std::thread::spawn(move || {
+        match refresh(&job) {
+            Ok(files) => log::info!("Refreshed Wallhaven source ({} image(s))", files.len()),
+            Err(e) => log::warn!("Wallhaven refresh failed; keeping cached images: {}", redact(&e)),
+        }
+        REFRESHING.lock().unwrap_or_else(|p| p.into_inner()).remove(&job.cache_dir);
+    });
 }
 
-fn query_signature(source: &Source, settings: &Settings) -> String {
-    format!(
-        "{}|purity={}|pages={}|apikey={}",
-        source.path.trim(),
-        effective_purity(source),
-        source.wallhaven_page_limit,
-        settings.use_wallhaven_api_key && !settings.wallhaven_api_key.is_empty()
-    )
+fn query_signature(url: &str, page_limit: i32, purity: Purity, has_api_key: bool) -> String {
+    format!("{}|purity={}|pages={page_limit}|apikey={has_api_key}", url.trim(), purity.as_param())
 }
 
-fn effective_purity(source: &Source) -> &str {
-    if source.wallhaven_purity.is_empty() {
-        DEFAULT_WALLHAVEN_PURITY
-    } else {
-        &source.wallhaven_purity
-    }
-}
-
-fn refresh(source: &Source, settings: &Settings, cache_dir: &Path, query: String) -> Result<Vec<PathBuf>, String> {
-    let base_url = source.path.trim();
-    let api_key = if settings.use_wallhaven_api_key && !settings.wallhaven_api_key.is_empty() {
-        Some(settings.wallhaven_api_key.as_str())
-    } else {
-        None
-    };
-    let page_limit = if source.wallhaven_page_limit == 0 {
-        u32::MAX
-    } else {
-        source.wallhaven_page_limit.max(1) as u32
-    };
-    let purity = effective_purity(source);
+fn refresh(job: &RefreshJob) -> Result<Vec<PathBuf>, String> {
+    let page_limit = if job.page_limit == 0 { u32::MAX } else { job.page_limit.max(1) as u32 };
+    let purity = job.purity.as_param();
 
     let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
     let mut image_urls = Vec::new();
@@ -151,9 +176,9 @@ fn refresh(source: &Source, settings: &Settings, cache_dir: &Path, query: String
             std::thread::sleep(API_REQUEST_SPACING);
         }
 
-        let url = build_api_url(base_url, page, purity)?;
+        let url = build_api_url(&job.url, page, &purity)?;
         let mut request = agent.get(&url);
-        if let Some(key) = api_key {
+        if let Some(key) = &job.api_key {
             // A header keeps the key out of URLs, and so out of logs and error messages.
             request = request.set("X-API-Key", key);
         }
@@ -189,15 +214,27 @@ fn refresh(source: &Source, settings: &Settings, cache_dir: &Path, query: String
         }
     }
 
-    let mut files = Vec::new();
-    for url in &image_urls {
-        match download_image(&agent, url, cache_dir) {
-            Ok(path) => files.push(path),
-            Err(e) => log::warn!("Skipping Wallhaven image {url}: {e}"),
-        }
-    }
+    let files = download_all(&agent, &image_urls, &job.cache_dir);
+    record_refresh(&job.cache_dir, job.query.clone(), image_urls.len(), files)
+}
 
-    record_refresh(cache_dir, query, image_urls.len(), files)
+/// Downloads `urls` with a few workers, returning the files in the order of `urls`.
+fn download_all(agent: &ureq::Agent, urls: &[String], dir: &Path) -> Vec<PathBuf> {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<PathBuf>>> = Mutex::new(vec![None; urls.len()]);
+    std::thread::scope(|scope| {
+        for _ in 0..DOWNLOAD_WORKERS.min(urls.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(url) = urls.get(i) else { break };
+                match download_image(agent, url, dir) {
+                    Ok(path) => results.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(path),
+                    Err(e) => log::warn!("Skipping Wallhaven image {url}: {e}"),
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_else(|p| p.into_inner()).into_iter().flatten().collect()
 }
 
 /// Stores the result of a refresh. If images were found but none could be downloaded (e.g.
@@ -255,38 +292,13 @@ fn cached_files(cache_dir: &Path, manifest: Option<&Manifest>) -> Vec<PathBuf> {
 }
 
 fn source_cache_dir(url: &str) -> Result<PathBuf, String> {
-    let root = super::settings::config_dir()?.join("wallhaven");
-    let dir = root.join(cache_folder_name(url));
-
-    // Folders used to be named with `DefaultHasher`, whose output is not stable across Rust
-    // releases. Adopt such a folder instead of downloading everything again.
-    let legacy = root.join(legacy_cache_folder_name(url));
-    if !dir.exists() && legacy.is_dir() {
-        if let Err(e) = fs::rename(&legacy, &dir) {
-            log::warn!("Could not migrate Wallhaven cache folder {}: {e}", legacy.display());
-        }
-    }
-
+    let dir = super::settings::config_dir()?.join("wallhaven").join(cache_folder_name(url));
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create Wallhaven cache directory: {e}"))?;
     Ok(dir)
 }
 
-/// 64-bit FNV-1a: stable across builds, unlike `DefaultHasher`.
 fn cache_folder_name(url: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in url.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("fnv{hash:016x}")
-}
-
-fn legacy_cache_folder_name(url: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    format!("fnv{:016x}", crate::util::stable_hash(url.as_bytes()))
 }
 
 fn build_api_url(input: &str, page: u32, purity: &str) -> Result<String, String> {
@@ -395,18 +407,10 @@ fn download_image(agent: &ureq::Agent, url: &str, dir: &Path) -> Result<PathBuf,
 }
 
 fn sanitize_filename(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() || "._-".contains(c) {
-            out.push(c);
-        } else {
-            out.push('_');
-        }
+    match crate::util::safe_file_name(name, "._-") {
+        safe if safe.is_empty() => "image.jpg".to_string(),
+        safe => safe,
     }
-    if out.is_empty() {
-        out.push_str("image.jpg");
-    }
-    out
 }
 
 fn is_valid_image(path: &Path) -> bool {
@@ -461,21 +465,31 @@ mod tests {
 mod helper_tests {
     use super::*;
 
-    fn source(path: &str) -> Source {
-        serde_json::from_value(serde_json::json!({ "path": path })).unwrap()
-    }
-
-    fn settings() -> Settings {
-        serde_json::from_str("{}").unwrap()
+    #[test]
+    fn stale_results_are_refreshed_in_the_background_unless_nothing_is_cached() {
+        use NetworkPolicy::*;
+        assert_eq!(plan(true, RefreshWhenStale, true), Plan::UseCache);
+        assert_eq!(plan(false, CacheOnly, false), Plan::UseCache);
+        assert_eq!(plan(false, RefreshWhenStale, true), Plan::UseCacheAndRefreshInBackground);
+        assert_eq!(plan(false, RefreshWhenStale, false), Plan::RefreshNow);
     }
 
     #[test]
-    fn only_http_urls_on_wallhaven_count_as_wallhaven_sources() {
-        assert!(is_wallhaven_url("https://wallhaven.cc/search?q=forest"));
-        assert!(is_wallhaven_url("  HTTP://WALLHAVEN.CC/api/v1/search  "));
-        assert!(!is_wallhaven_url(r"C:\Pictures\wallhaven.cc"));
-        assert!(!is_wallhaven_url("https://example.com/search?q=x"));
-        assert!(!is_wallhaven_url(""));
+    fn parallel_downloads_keep_the_url_order_and_skip_failures() {
+        let dir = crate::test_support::TempDir::new("wh_download_all");
+        // Already-downloaded valid files are reused without any network access.
+        for name in ["a.png", "b.png", "c.png"] {
+            crate::test_support::write_png(&dir.join(name), 2, 2);
+        }
+        let urls: Vec<String> = ["c.png", "a.png", "b.png"].iter().map(|n| format!("https://w.wallhaven.cc/full/{n}")).collect();
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_millis(1)).build();
+        let files = download_all(&agent, &urls, dir.path());
+        assert_eq!(files, vec![dir.join("c.png"), dir.join("a.png"), dir.join("b.png")]);
+
+        // An unreachable URL is skipped rather than failing the batch.
+        let mut with_bad = urls.clone();
+        with_bad.insert(1, "http://127.0.0.1:9/missing.png".to_string());
+        assert_eq!(download_all(&agent, &with_bad, dir.path()).len(), 3);
     }
 
     #[test]
@@ -529,40 +543,14 @@ mod helper_tests {
 
     #[test]
     fn the_query_signature_changes_with_everything_that_affects_results() {
-        let s = settings();
-        let base = source("https://wallhaven.cc/search?q=x");
-        let sig = query_signature(&base, &s);
-        assert_eq!(sig, query_signature(&source("  https://wallhaven.cc/search?q=x  "), &s), "whitespace is ignored");
-
-        let mut purity = base.clone();
-        purity.wallhaven_purity = "111".into();
-        let mut pages = base.clone();
-        pages.wallhaven_page_limit = 0;
-        let mut keyed = s.clone();
-        keyed.use_wallhaven_api_key = true;
-        keyed.wallhaven_api_key = "k".into();
-
-        assert_ne!(query_signature(&purity, &s), sig);
-        assert_ne!(query_signature(&pages, &s), sig);
-        assert_ne!(query_signature(&base, &keyed), sig);
-        assert!(!query_signature(&base, &keyed).contains("=k|") && !query_signature(&base, &keyed).ends_with("=k"),
-            "the API key itself must not be stored in the manifest");
-    }
-
-    #[test]
-    fn empty_purity_falls_back_to_sfw_and_sketchy() {
-        assert_eq!(effective_purity(&source("x")), "110");
-        let mut s = source("x");
-        s.wallhaven_purity = "100".into();
-        assert_eq!(effective_purity(&s), "100");
-    }
-
-    #[test]
-    fn legacy_folder_names_are_sixteen_hex_digits() {
-        let name = legacy_cache_folder_name("https://wallhaven.cc/search?q=x");
-        assert_eq!(name.len(), 16);
-        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(name, cache_folder_name("https://wallhaven.cc/search?q=x"));
+        let url = "https://wallhaven.cc/search?q=x";
+        let sig = query_signature(url, 1, Purity::default(), false);
+        assert_eq!(sig, query_signature("  https://wallhaven.cc/search?q=x  ", 1, Purity::default(), false));
+        assert_ne!(query_signature(url, 1, Purity { nsfw: true, ..Purity::default() }, false), sig);
+        assert_ne!(query_signature(url, 0, Purity::default(), false), sig);
+        let keyed = query_signature(url, 1, Purity::default(), true);
+        assert_ne!(keyed, sig);
+        assert!(keyed.ends_with("apikey=true"), "only whether a key is used is recorded, never the key");
     }
 
     #[test]
@@ -575,10 +563,10 @@ mod helper_tests {
     #[test]
     fn cache_only_never_touches_the_network() {
         // An unreachable host would make a refresh fail; CacheOnly must not even try.
-        let src = source("https://wallhaven.cc/search?q=mula-unit-test-cache-only");
-        let files = images_for_source(&src, &settings(), NetworkPolicy::CacheOnly).unwrap();
+        let url = "https://wallhaven.cc/search?q=mula-unit-test-cache-only";
+        let files = images_for_source(url, 1, Purity::default(), None, NetworkPolicy::CacheOnly).unwrap();
         assert!(files.is_empty());
-        let dir = super::super::settings::config_dir().unwrap().join("wallhaven").join(cache_folder_name(src.path.trim()));
+        let dir = super::super::settings::config_dir().unwrap().join("wallhaven").join(cache_folder_name(url));
         let _ = fs::remove_dir_all(dir);
     }
 

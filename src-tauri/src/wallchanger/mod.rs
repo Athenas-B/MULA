@@ -91,32 +91,25 @@ pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
     }
 }
 
-/// Keeps the tray's "Max source level" items and the Wall Changer tab in sync after a change.
-pub fn on_max_level_changed(app: &tauri::AppHandle, level: i32) {
+/// Every settings change (UI or tray) ends here: the tray's "Max source level" items are synced
+/// and the Wall Changer tab re-renders from the `wc-settings-changed` event.
+pub fn on_settings_changed(app: &tauri::AppHandle, settings: &Settings) {
     use tauri::Emitter;
-    sync_max_level_menu(app, level);
-    let _ = app.emit("max-level-changed", level);
+    sync_max_level_menu(app, settings.maximum_source_level);
+    let _ = app.emit("wc-settings-changed", settings);
 }
 
 #[tauri::command]
 pub async fn wc_get_settings() -> Result<Settings, String> {
-    blocking(settings::load_config).await
+    blocking(settings::load).await
 }
 
-/// Saves the user-editable configuration only; runtime state (queue positions, statistics,
-/// image cache, service on/off) lives in a separate file the UI never writes.
+/// Applies a partial update (`{ setting: value, ... }`) and returns the normalized settings.
 #[tauri::command]
-pub async fn wc_save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
-    let saved = blocking(move || {
-        let mut settings = settings;
-        settings::normalize(&mut settings);
-        settings::save_config(&settings)?;
-        Ok(settings)
-    })
-    .await?;
-
-    on_max_level_changed(&app, saved.maximum_source_level);
-    Ok(())
+pub async fn wc_update_settings(app: tauri::AppHandle, patch: serde_json::Value) -> Result<Settings, String> {
+    let saved = blocking(move || settings::update_with_patch(patch)).await?;
+    on_settings_changed(&app, &saved);
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -132,7 +125,7 @@ pub async fn wc_change_now() -> Result<String, String> {
 #[tauri::command]
 pub async fn wc_toggle_service() -> Result<bool, String> {
     blocking(|| {
-        let running = !settings::service_running()?;
+        let running = !settings::service_running();
         service::set_running(running)?;
         Ok(running)
     })
@@ -142,9 +135,9 @@ pub async fn wc_toggle_service() -> Result<bool, String> {
 #[tauri::command]
 pub async fn wc_get_status() -> Result<serde_json::Value, String> {
     blocking(|| {
-        let config = settings::load_config()?;
+        let config = settings::load()?;
         Ok(serde_json::json!({
-            "running": settings::service_running()?,
+            "running": settings::service_running(),
             "interval_minutes": config.interval_minutes,
             "maximum_source_level": config.maximum_source_level,
         }))
@@ -160,16 +153,17 @@ pub async fn wc_get_queue_preview() -> Result<Vec<QueuePreview>, String> {
 #[tauri::command]
 pub async fn wc_get_monitor_preview() -> Result<Vec<preview::MonitorPreview>, String> {
     blocking(|| {
-        let settings = settings::load_config()?;
+        let settings = settings::load()?;
         preview::build_monitor_previews(&settings)
     })
     .await
 }
 
 fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
-    let mut settings = settings::load()?;
+    let settings = settings::load()?;
+    let mut runtime = settings::load_state()?;
     // The preview must stay cheap: only use Wallhaven images that are already downloaded.
-    let images = images::load_images(&mut settings, images::NetworkPolicy::CacheOnly)?;
+    let images = images::load_images(&settings, &mut runtime.image_cache_entries, images::NetworkPolicy::CacheOnly)?;
     let monitors = monitors::get_monitors().unwrap_or_default();
 
     let queues = queue::build_queues(&images, &monitors, &settings);
@@ -183,7 +177,8 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
     if queue::uses_shared_queue(&settings, monitors.len()) {
         if let Some(queue) = queues.get("shared").cloned() {
             previews.push(build_queue_preview(
-                &mut settings,
+                &mut runtime,
+                settings.rotation_mode,
                 "shared".to_string(),
                 "Shared queue".to_string(),
                 &queue,
@@ -201,7 +196,8 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
                     monitor.height
                 );
                 previews.push(build_queue_preview(
-                    &mut settings,
+                    &mut runtime,
+                    settings.rotation_mode,
                     key,
                     label,
                     &queue,
@@ -215,14 +211,14 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
 }
 
 fn build_queue_preview(
-    settings: &mut Settings,
+    runtime: &mut settings::RuntimeState,
+    rotation_mode: settings::RotationMode,
     key: String,
     label: String,
     queue: &[queue::RankedImage],
     rotation_label: &str,
 ) -> QueuePreview {
-    let rotation_mode = settings.rotation_mode;
-    let state = queue::ensure_queue_state(settings, &key, queue);
+    let state = queue::ensure_queue_state(runtime, &key, queue);
     let next_path = match rotation_mode {
         settings::RotationMode::Sequence => queue::peek_next_sequence_path(queue, state),
         settings::RotationMode::Random => None,

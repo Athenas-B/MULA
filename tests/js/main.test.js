@@ -310,195 +310,40 @@ describe("wcHexToArgb", () => {
   });
 });
 
-describe("isWallhavenUrl", () => {
-  it("accepts http(s) wallhaven URLs (case/whitespace-insensitive)", () => {
-    assert.equal(pure.isWallhavenUrl("https://wallhaven.cc/search?q=cats"), true);
-    assert.equal(pure.isWallhavenUrl("  HTTP://WALLHAVEN.CC/api/v1/search  "), true);
+describe("errorText", () => {
+  it("describes typed command errors", () => {
+    assert.equal(pure.errorText({ kind: "smartctl_missing" }), "smartmontools (smartctl) is not installed.");
+    assert.equal(pure.errorText({ kind: "elevation_declined" }), "Administrator rights were declined.");
+    assert.equal(pure.errorText({ kind: "needs_elevation", message: "Open failed: Access denied" }), "Open failed: Access denied");
+    assert.equal(pure.errorText({ kind: "other", message: "boom" }), "boom");
   });
 
-  it("rejects folders, other schemes, other hosts and empty values", () => {
-    assert.equal(pure.isWallhavenUrl("C:\\wallhaven.cc\\pics"), false);
-    assert.equal(pure.isWallhavenUrl("ftp://wallhaven.cc/x"), false);
-    assert.equal(pure.isWallhavenUrl("https://example.com/"), false);
-    assert.equal(pure.isWallhavenUrl(""), false);
-    assert.equal(pure.isWallhavenUrl(null), false);
-    assert.equal(pure.isWallhavenUrl(undefined), false);
+  it("passes plain strings and Error objects through", () => {
+    assert.equal(pure.errorText("diskpart failed"), "diskpart failed");
+    assert.equal(pure.errorText(new Error("nope")), "nope");
   });
 });
 
-describe("wcParsePurity / wcBuildPurity", () => {
-  const parse = (v) => plain(pure.wcParsePurity(v));
-
-  it("defaults to SFW + Sketchy", () => {
-    assert.deepEqual(parse(undefined), [true, true, false]);
-    assert.deepEqual(parse(""), [true, true, false]);
-  });
-
-  it("parses valid bit strings", () => {
-    assert.deepEqual(parse("100"), [true, false, false]);
-    assert.deepEqual(parse("011"), [false, true, true]);
-    assert.deepEqual(parse("111"), [true, true, true]);
-    assert.deepEqual(parse(" 101 "), [true, false, true]);
-    assert.deepEqual(parse(101), [true, false, true]);
-  });
-
-  it("pads short strings with zeros", () => {
-    assert.deepEqual(parse("1"), [true, false, false]);
-    assert.deepEqual(parse("01"), [false, true, false]);
-  });
-
-  it("falls back to the default for invalid strings", () => {
-    assert.deepEqual(parse("abc"), [true, true, false]);
-    assert.deepEqual(parse("1111"), [true, true, false]);
-    assert.deepEqual(parse("102"), [true, true, false]);
-  });
-
-  it("never yields 'nothing selected' (000 becomes SFW only)", () => {
-    assert.deepEqual(parse("000"), [true, false, false]);
-    assert.equal(pure.wcBuildPurity([false, false, false]), "100");
-  });
-
-  it("builds bit strings", () => {
-    assert.equal(pure.wcBuildPurity([true, false, true]), "101");
-    assert.equal(pure.wcBuildPurity([false, true, false]), "010");
-  });
-
-  it("round-trips", () => {
-    for (const s of ["100", "010", "001", "110", "101", "011", "111"]) {
-      assert.equal(pure.wcBuildPurity(pure.wcParsePurity(s)), s);
-    }
-  });
-});
-
-describe("needsAdminRights", () => {
-  it("detects access/permission problems", () => {
-    for (const msg of [
-      "OpenFile failed, Error=5",
-      "Access is denied.",
-      "ACCESS DENIED",
-      "This command requires admin rights",
-      "Requires administrator privileges",
-      "Elevation required",
-      "Permission denied",
-    ]) {
-      assert.equal(pure.needsAdminRights(msg), true, msg);
-    }
-  });
-
-  it("accepts non-string input such as errors", () => {
-    assert.equal(pure.needsAdminRights(new Error("Access denied")), true);
-    assert.equal(pure.needsAdminRights(null), false);
-  });
-
-  it("returns false for unrelated output", () => {
-    assert.equal(pure.needsAdminRights("SMART overall-health self-assessment test result: PASSED"), false);
-    assert.equal(pure.needsAdminRights("/dev/pd1: Unable to detect device type"), false);
-  });
-});
-
-describe("extractSelfTestProgress", () => {
-  const ATA_IN_PROGRESS = [
-    "=== START OF READ SMART DATA SECTION ===",
-    "SMART overall-health self-assessment test result: PASSED",
-    "",
-    "General SMART Values:",
-    "Offline data collection status:  (0x00)\tOffline data collection activity",
-    "\t\t\t\t\twas never started.",
-    "Self-test execution status:      ( 249)\tSelf-test routine in progress...",
-    "\t\t\t\t\t90% of test remaining.",
-    "Total time to complete Offline ",
-    "data collection: \t\t(    0) seconds.",
-    "",
-    "SMART Self-test log structure revision number 1",
-    "Num  Test_Description    Status                  Remaining  LifeTime(hours)  LBA_of_first_error",
-    "# 1  Short offline       Completed without error       00%      1234         -",
-    "",
-    "SMART Selective self-test log data structure revision number 1",
-  ].join("\n");
-
-  const ATA_DONE = [
-    "Self-test execution status:      (   0)\tThe previous self-test routine completed",
-    "\t\t\t\t\twithout error or no self-test has ever ",
-    "\t\t\t\t\tbeen run.",
-    "Total time to complete Offline ",
-    "",
-    "SMART Self-test log structure revision number 1",
-    "# 1  Extended offline    Completed without error       00%      1300         -",
-  ].join("\n");
-
-  const ATA_FAILED = [
-    "Self-test execution status:      ( 121)\tThe previous self-test completed having",
-    "\t\t\t\t\tthe read element of the test failed.",
-    "Total time to complete Offline ",
-    "SMART Self-test log structure revision number 1",
-    "# 1  Short offline       Completed: read failure       90%      1301         123456",
-  ].join("\n");
-
-  it("extracts status and log sections of an in-progress ATA test", () => {
-    const r = pure.extractSelfTestProgress(ATA_IN_PROGRESS);
-    assert.match(r.status, /^Self-test execution status:/);
-    assert.match(r.status, /Self-test routine in progress/);
-    assert.ok(!r.status.includes("Total time"), r.status);
-    assert.match(r.log, /^SMART Self-test log structure revision number 1/);
-    assert.match(r.log, /Completed without error/);
-    assert.ok(!r.log.includes("Selective"), r.log);
-    assert.equal(r.inProgress, true);
-    assert.equal(r.hasFailed, false);
-    assert.equal(r.text, `${r.status}\n\n${r.log}`);
-  });
-
-  it(
-    "reports remaining percentage for smartctl's 'NN% of test remaining.' format",
-    () => {
-      assert.equal(pure.extractSelfTestProgress(ATA_IN_PROGRESS).progress, "90% remaining");
-    }
-  );
-
-  it("parses 'NN% remaining' progress", () => {
-    const r = pure.extractSelfTestProgress("Self-test status: Extended self-test in progress, 40% remaining\n");
-    assert.equal(r.inProgress, true);
-    assert.equal(r.progress, "40% remaining");
-  });
-
-  it("parses 'NN% left' progress", () => {
-    assert.equal(pure.extractSelfTestProgress("Self-test status: in progress 15% left").progress, "15% remaining");
-  });
-
-  it("recognizes a completed test", () => {
-    const r = pure.extractSelfTestProgress(ATA_DONE);
-    assert.equal(r.inProgress, false);
-    assert.equal(r.hasFailed, false);
-    assert.equal(r.progress, null);
-    assert.match(r.log, /Extended offline/);
-  });
-
-  it("recognizes a failed test", () => {
-    const r = pure.extractSelfTestProgress(ATA_FAILED);
-    assert.equal(r.hasFailed, true);
-    assert.equal(r.inProgress, false);
-  });
-
-  it("treats 'No self-test in progress' as not in progress", () => {
-    assert.equal(pure.extractSelfTestProgress("Self-test status: No self-test in progress\n").inProgress, false);
-    assert.equal(pure.extractSelfTestProgress("Self-test status: No selftest in progress\n").inProgress, false);
-  });
-
-  it("handles NVMe-style output", () => {
-    const r = pure.extractSelfTestProgress(
-      "Self-test Log (NVMe Log 0x06)\nSelf-test status: Short self-test in progress (12% completed)\nNo Self-tests Logged"
+describe("formatSelfTestStatus", () => {
+  it("lists the status and the log, most recent first", () => {
+    const text = pure.formatSelfTestStatus({
+      status: "in progress, 90% remaining",
+      log: [
+        { test: "Short offline", result: "Completed without error", passed: true, hours: 1200 },
+        { test: "Extended offline", result: "Aborted by host", passed: null, hours: null },
+      ],
+    });
+    assert.equal(
+      text,
+      "Self-test status: in progress, 90% remaining\n\n" +
+        "Self-test log (most recent first):\n" +
+        "  Short offline: Completed without error (at 1200 h)\n" +
+        "  Extended offline: Aborted by host"
     );
-    assert.equal(r.status, "Self-test status: Short self-test in progress (12% completed)");
-    assert.equal(r.inProgress, true);
-    assert.match(r.log, /^Self-test Log \(NVMe Log 0x06\)/);
   });
 
-  it("falls back to placeholder texts when nothing is found", () => {
-    const r = pure.extractSelfTestProgress("");
-    assert.equal(r.status, "Self-test status not available");
-    assert.equal(r.log, "No self-test log available");
-    assert.equal(r.inProgress, false);
-    assert.equal(r.hasFailed, false);
-    assert.equal(r.progress, null);
+  it("says so when no self-tests were logged", () => {
+    assert.match(pure.formatSelfTestStatus({ status: "No self-test in progress", log: [] }), /No self-tests logged/);
   });
 });
 
@@ -617,7 +462,7 @@ describe("invokeSmart", () => {
         installed = true;
         return "C:/Program Files/smartmontools/bin/smartctl.exe";
       }
-      if (!installed) throw "SMARTCTL_MISSING: smartmontools (smartctl) is not installed.";
+      if (!installed) throw { kind: "smartctl_missing" };
       return "smart data";
     });
     m.state.confirm = (() => true);
@@ -630,11 +475,46 @@ describe("invokeSmart", () => {
     const calls = [];
     m.state.invoke = (async (cmd) => {
       calls.push(cmd);
-      throw "SMARTCTL_MISSING: smartmontools (smartctl) is not installed.";
+      throw { kind: "smartctl_missing" };
     });
     m.state.confirm = (() => false);
     await assert.rejects(m.fn.invokeSmart("get_drive_smart", { id: "x" }), /smartmontools is not installed/);
     assert.deepEqual(calls, ["get_drive_smart"]);
+  });
+});
+
+describe("VSD server panel", () => {
+  it("only reflects the autostart setting; the backend starts the server", async () => {
+    const m = loadMain({ invoke: (cmd) => (cmd === "vsd_get_autostart" ? true : undefined) });
+    const checkbox = m.document.add("vsd-autostart");
+    await m.fn.loadAutostart();
+    assert.equal(checkbox.checked, true);
+    assert.equal(m.calls("vsd_start").length, 0);
+  });
+
+  it("shows output the server produced before the window loaded", async () => {
+    const m = loadMain({ invoke: (cmd) => (cmd === "vsd_get_logs" ? ["[Dependencies OK]\n", "Serving on 8765\n"] : undefined) });
+    const content = m.document.add("vsd-log-content");
+    m.document.add("vsd-log");
+    await m.fn.loadVsdLogBacklog();
+    assert.match(content.innerHTML, /\[Dependencies OK\]\nServing on 8765\n/);
+  });
+
+  it("re-checks the real state when starting fails", async () => {
+    const m = loadMain({
+      invoke: (cmd) => {
+        if (cmd === "vsd_start") throw "Could not find VSD server.py";
+        if (cmd === "vsd_is_running") return false;
+      },
+    });
+    const btn = m.document.add("vsd-toggle", { className: "stopped" });
+    m.document.add("vsd-log-content");
+    m.document.add("vsd-log");
+    await m.fn.toggleVsd();
+    await flush();
+    assert.equal(m.calls("vsd_is_running").length, 1);
+    assert.equal(m.run("vsdRunning"), false);
+    assert.equal(btn.disabled, false);
   });
 });
 
@@ -675,12 +555,12 @@ describe("updateVsdUi / wcUpdateToggleUi / wcShowMessage", () => {
   });
 });
 
-describe("wcUpdateModelFromUi", () => {
+describe("settings patches", () => {
   function setupInputs(m, overrides = {}) {
     const values = {
       "wc-interval": "15",
       "wc-max-level": "7",
-      "wc-wallhaven-api-key": "",
+      "wc-wallhaven-api-key": "secret-key",
       "wc-rotation": "Random",
       "wc-scaling": "FitInsideScreen",
       "wc-bg-color": "#112233",
@@ -705,26 +585,14 @@ describe("wcUpdateModelFromUi", () => {
     ]) {
       m.document.add(id, { checked: id === "wc-overlay-enabled" || id === "wc-fade-enabled" });
     }
+    for (const id of ["wc-sources", "wc-remove-source", "wc-move-up", "wc-move-down", "wc-message"]) m.document.add(id);
   }
 
-  it("does nothing while settings are not loaded", () => {
+  it("reads the form into a patch without clamping (the backend validates)", () => {
     const m = loadMain();
-    assert.doesNotThrow(() => m.fn.wcUpdateModelFromUi());
-    assert.equal(m.run("wcSettings"), null);
-  });
-
-  it("copies UI values into the settings model", () => {
-    const m = loadMain();
-    setupInputs(m, { "wc-wallhaven-api-key": "  secret-key  " });
-    m.assign("wcSettings", { source_folders: [], extra: "kept" });
-    m.fn.wcUpdateModelFromUi();
-    assert.deepEqual(plain(m.run("wcSettings")), {
-      source_folders: [],
-      extra: "kept",
-      interval_minutes: 15,
-      maximum_source_level: 7,
+    setupInputs(m, { "wc-interval": "99999", "wc-overlay-offset-x": "abc", "wc-fade-steps": "" });
+    assert.deepEqual(plain(m.fn.wcReadForm()), {
       wallhaven_api_key: "secret-key",
-      use_wallhaven_api_key: true,
       rotation_mode: "Random",
       scaling_mode: "FitInsideScreen",
       background_color_argb: -15654349,
@@ -734,47 +602,77 @@ describe("wcUpdateModelFromUi", () => {
       change_one_monitor_per_interval: false,
       show_picture_name_overlay: true,
       picture_name_overlay_text_mode: "FileName",
-      picture_name_overlay_font_size: 30,
       picture_name_overlay_text_color_argb: -1,
-      picture_name_overlay_offset_x: 10,
-      picture_name_overlay_offset_y: -20,
       picture_name_overlay_use_backdrop: false,
       enable_wallpaper_fade_transition: true,
+      interval_minutes: 99999,
+      maximum_source_level: 7,
+      picture_name_overlay_font_size: 30,
+      picture_name_overlay_offset_y: -20,
       wallpaper_fade_duration_ms: 500,
-      wallpaper_fade_steps: 8,
     });
   });
 
-  it("clamps numbers and applies defaults for invalid input", () => {
+  it("does nothing while settings are not loaded", () => {
     const m = loadMain();
-    setupInputs(m, {
-      "wc-interval": "99999",
-      "wc-max-level": "-4",
-      "wc-overlay-font-size": "",
-      "wc-overlay-offset-x": "abc",
-      "wc-fade-duration": "-50",
-      "wc-fade-steps": "0",
-    });
-    m.assign("wcSettings", {});
-    m.fn.wcUpdateModelFromUi();
-    const s = plain(m.run("wcSettings"));
-    assert.equal(s.interval_minutes, 1440);
-    assert.equal(s.maximum_source_level, 1);
-    assert.equal(s.picture_name_overlay_font_size, 28);
-    assert.equal(s.picture_name_overlay_offset_x, 0);
-    assert.equal(s.wallpaper_fade_duration_ms, 0);
-    assert.equal(s.wallpaper_fade_steps, 12);
-    assert.equal(s.use_wallhaven_api_key, false);
+    m.fn.wcQueuePatch({ interval_minutes: 5 });
+    assert.equal(m.run("wcSettings"), null);
+    assert.equal(m.timers.pending().length, 0);
   });
 
-  it("uses defaults for empty interval and level", () => {
+  it("batches edits into one debounced wc_update_settings call and adopts the normalized result", async () => {
+    const m = loadMain({ invoke: (cmd, args) => (cmd === "wc_update_settings" ? { source_folders: [], ...args.patch, interval_minutes: 1440 } : undefined) });
+    setupInputs(m);
+    m.assign("wcSettings", { source_folders: [], interval_minutes: 30, maximum_source_level: 10 });
+    m.fn.wcQueuePatch({ interval_minutes: 99999 });
+    m.fn.wcQueuePatch({ maximum_source_level: 3 });
+    assert.deepEqual(m.timers.pending().map((t) => t.ms), [300]);
+    assert.equal(m.run("wcSettings").interval_minutes, 99999, "edits show immediately");
+
+    m.timers.runAll();
+    await flush();
+    const updates = m.calls("wc_update_settings");
+    assert.equal(updates.length, 1);
+    assert.deepEqual(plain(updates[0].args.patch), { interval_minutes: 99999, maximum_source_level: 3 });
+    assert.equal(m.run("wcSettings").interval_minutes, 1440, "the backend's normalized value wins");
+    assert.equal(m.document.getElementById("wc-interval").value, 1440, "and is rendered");
+  });
+
+  it("keeps unsent edits when settings arrive from the backend", () => {
     const m = loadMain();
-    setupInputs(m, { "wc-interval": "", "wc-max-level": "" });
-    m.assign("wcSettings", {});
-    m.fn.wcUpdateModelFromUi();
+    setupInputs(m);
+    m.assign("wcSettings", { source_folders: [], interval_minutes: 30, maximum_source_level: 10 });
+    m.fn.wcQueuePatch({ interval_minutes: 45 });
+    // e.g. the tray changed the max level while the interval edit is still pending
+    m.fn.wcApplySettings({ source_folders: [], interval_minutes: 30, maximum_source_level: 2 });
     const s = plain(m.run("wcSettings"));
-    assert.equal(s.interval_minutes, 30);
-    assert.equal(s.maximum_source_level, 10);
+    assert.equal(s.interval_minutes, 45);
+    assert.equal(s.maximum_source_level, 2);
+  });
+
+  it("flushes pending edits before changing the wallpaper", async () => {
+    const m = loadMain({ invoke: (cmd, args) => (cmd === "wc_update_settings" ? { source_folders: [], ...args.patch } : "Applied 1 wallpaper(s): a.jpg") });
+    setupInputs(m);
+    m.assign("wcSettings", { source_folders: [], interval_minutes: 30 });
+    m.fn.wcQueuePatch({ interval_minutes: 5 });
+    await m.fn.wcChangeNow();
+    assert.deepEqual(m.invokeCalls.map((c) => c.cmd), ["wc_update_settings", "wc_change_now"]);
+    assert.equal(m.timers.pending().length, 0);
+  });
+
+  it("reloads the settings when an update is rejected", async () => {
+    const m = loadMain({
+      invoke: (cmd) => {
+        if (cmd === "wc_update_settings") throw "Unknown setting: x";
+        if (cmd === "wc_get_settings") return { source_folders: [], interval_minutes: 30 };
+      },
+    });
+    setupInputs(m);
+    m.assign("wcSettings", { source_folders: [], interval_minutes: 30 });
+    m.fn.wcQueuePatch({ x: 1 });
+    await m.fn.wcFlushPatch();
+    assert.match(m.document.getElementById("wc-message").textContent, /Unknown setting: x/);
+    assert.equal(m.calls("wc_get_settings").length, 1);
   });
 });
 
@@ -791,8 +689,15 @@ describe("wcRenderSources", () => {
     return { m, container, remove, up, down, settings: () => plain(m.run("wcSettings")) };
   }
 
-  const folder = { path: 'C:\\Pics "x" <y> & z', enabled: true, include_subfolders: true, level: 5 };
-  const url = { path: "https://wallhaven.cc/search?q=a&b=1", enabled: false, level: 3, wallhaven_page_limit: 0, wallhaven_purity: "011" };
+  const folder = { path: 'C:\\Pics "x" <y> & z', enabled: true, level: 5, kind: "folder", include_subfolders: true };
+  const url = {
+    path: "https://wallhaven.cc/search?q=a&b=1",
+    enabled: false,
+    level: 3,
+    kind: "wallhaven",
+    page_limit: 0,
+    purity: { sfw: false, sketchy: true, nsfw: true },
+  };
 
   it("renders one row per source with escaped paths", () => {
     const { container } = setup([folder, url]);
@@ -818,16 +723,11 @@ describe("wcRenderSources", () => {
     const row = container.children[0];
     assert.ok(!row.innerHTML.includes("readonly"));
     assert.match(row.innerHTML, /value="0" title="Page limit/);
-    assert.match(row.innerHTML, /data-purity="0" >/);
-    assert.match(row.innerHTML, /data-purity="1" checked/);
-    assert.match(row.innerHTML, /data-purity="2" checked/);
+    assert.match(row.innerHTML, /data-purity="sfw" >/);
+    assert.match(row.innerHTML, /data-purity="sketchy" checked/);
+    assert.match(row.innerHTML, /data-purity="nsfw" checked/);
     assert.match(row.innerHTML, /<input type="checkbox"  title="Enabled">/);
     assert.equal(row.style.gridTemplateColumns, "24px 1fr 60px 80px 180px");
-  });
-
-  it("defaults the page limit to 1 when missing", () => {
-    const { container } = setup([{ ...url, wallhaven_page_limit: undefined }]);
-    assert.match(container.children[0].innerHTML, /value="1" title="Page limit/);
   });
 
   it("marks the selected row and updates the toolbar", () => {
@@ -853,27 +753,21 @@ describe("wcRenderSources", () => {
     assert.ok(container.children[1].classList.contains("selected"));
   });
 
-  it("switching a folder path to a Wallhaven URL sets URL defaults and autosaves", async () => {
-    const { m, container, settings } = setup([{ ...folder }]);
+  it("editing a Wallhaven path sends it as a source_folders patch", async () => {
+    const { m, container, settings } = setup([{ ...url }]);
+    m.state.invoke = () => new Promise(() => {}); // only the request matters here
     const pathInput = container.children[0].querySelectorAll('input[type="text"], input[type="number"]')[0];
     pathInput.value = "  https://wallhaven.cc/latest  ";
     pathInput.dispatch("change");
-    const s = settings().source_folders[0];
-    assert.equal(s.path, "https://wallhaven.cc/latest");
-    assert.equal(s.include_subfolders, false);
-    assert.equal(s.wallhaven_page_limit, 1);
-    assert.equal(s.wallhaven_purity, "110");
-    // Re-rendered as a URL row.
-    assert.equal(container.children.length, 1);
-    assert.match(container.children[0].innerHTML, /wallchanger-purity/);
+    assert.equal(settings().source_folders[0].path, "https://wallhaven.cc/latest");
+    assert.equal(settings().source_folders[0].kind, "wallhaven");
 
-    // Debounced save.
     assert.deepEqual(m.timers.pending().map((t) => t.ms), [300]);
     m.timers.runAll();
     await flush();
-    const saves = m.calls("wc_save_settings");
-    assert.equal(saves.length, 1);
-    assert.equal(saves[0].args.settings.source_folders[0].path, "https://wallhaven.cc/latest");
+    const updates = m.calls("wc_update_settings");
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].args.patch.source_folders[0].path, "https://wallhaven.cc/latest");
   });
 
   it("debounces autosave to a single pending timer", () => {
@@ -887,35 +781,28 @@ describe("wcRenderSources", () => {
     assert.equal(plain(m.run("wcSettings")).source_folders[0].enabled, true);
   });
 
-  it("clamps the level to 1..10", () => {
-    const { container, settings } = setup([{ ...folder }]);
-    const levelInput = container.children[0].querySelectorAll('input[type="text"], input[type="number"]')[1];
-    for (const [input, expected] of [["99", 10], ["0", 1], ["-3", 1], ["abc", 1], ["7", 7]]) {
+  it("sends numeric edits as entered and ignores non-numbers (the backend clamps)", () => {
+    const { container, settings } = setup([{ ...url }]);
+    const [, levelInput, pageInput] = container.children[0].querySelectorAll('input[type="text"], input[type="number"]');
+    for (const [input, expected] of [["99", 99], ["abc", 99], ["7", 7]]) {
       levelInput.value = input;
       levelInput.dispatch("change");
       assert.equal(settings().source_folders[0].level, expected, input);
     }
-  });
-
-  it("parses the page limit (0 = unlimited, negatives clamp to 0, invalid = 1)", () => {
-    const { container, settings } = setup([{ ...url }]);
-    const pageInput = container.children[0].querySelectorAll('input[type="text"], input[type="number"]')[2];
-    for (const [input, expected] of [["5", 5], ["0", 0], ["-2", 0], ["abc", 1]]) {
+    for (const [input, expected] of [["5", 5], ["-2", -2], ["abc", -2]]) {
       pageInput.value = input;
       pageInput.dispatch("change");
-      assert.equal(settings().source_folders[0].wallhaven_page_limit, expected, input);
+      assert.equal(settings().source_folders[0].page_limit, expected, input);
     }
   });
 
-  it("rebuilds the purity string from the checkboxes", () => {
+  it("stores the purity checkboxes as an object", () => {
     const { container, settings } = setup([{ ...url }]);
     const purity = container.children[0].querySelectorAll('.wallchanger-purity input[type="checkbox"]');
+    ["sfw", "sketchy", "nsfw"].forEach((name, i) => (purity[i].dataset.purity = name));
     [true, false, true].forEach((v, i) => (purity[i].checked = v));
     purity[0].dispatch("change");
-    assert.equal(settings().source_folders[0].wallhaven_purity, "101");
-    [false, false, false].forEach((v, i) => (purity[i].checked = v));
-    purity[2].dispatch("change");
-    assert.equal(settings().source_folders[0].wallhaven_purity, "100");
+    assert.deepEqual(settings().source_folders[0].purity, { sfw: true, sketchy: false, nsfw: true });
   });
 
   it("toggles include_subfolders for folder rows", () => {
@@ -931,7 +818,7 @@ describe("wcRemoveSource / wcMoveSource", () => {
   function setup(paths, selected) {
     const m = loadMain();
     for (const id of ["wc-sources", "wc-remove-source", "wc-move-up", "wc-move-down"]) m.document.add(id);
-    m.assign("wcSettings", { source_folders: paths.map((path) => ({ path, enabled: true, level: 5 })) });
+    m.assign("wcSettings", { source_folders: paths.map((path) => ({ path, enabled: true, level: 5, kind: "folder", include_subfolders: true })) });
     m.assign("wcSelectedSourceIndex", selected);
     return {
       m,
@@ -1014,10 +901,10 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
       {
         path: "https://wallhaven.cc/search?q=cats",
         enabled: true,
-        include_subfolders: false,
         level: 5,
-        wallhaven_page_limit: 1,
-        wallhaven_purity: "110",
+        kind: "wallhaven",
+        page_limit: 1,
+        purity: { sfw: true, sketchy: true, nsfw: false },
       },
     ]);
   });
@@ -1027,6 +914,7 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
     await m.fn.wcAddFolder();
     const [s] = plain(m.run("wcSettings")).source_folders;
     assert.equal(s.path, "D:\\Wallpapers");
+    assert.equal(s.kind, "folder");
     assert.equal(s.include_subfolders, true);
     assert.equal(s.level, 5);
   });
@@ -1166,15 +1054,45 @@ describe("Drive Test", () => {
     assert.equal(m.run("formatTimer"), null);
   });
 
+  it("offers the admin retry only when smartctl needs elevation", async () => {
+    const { m, el } = setup([DRIVE], "PD1", {
+      invoke: (cmd, args) => {
+        if (cmd === "get_drive_smart" && !args.elevated) throw { kind: "needs_elevation", message: "Open failed: Access denied" };
+        if (cmd === "get_drive_smart") return "SMART overall-health: PASSED";
+      },
+    });
+    m.document.add("smart-status");
+    el["smart-admin"].classList.add("hidden");
+    await m.fn.loadSmartData("PD1", false);
+    assert.equal(el["smart-data"].textContent, "Error: Open failed: Access denied");
+    assert.ok(!el["smart-admin"].classList.contains("hidden"));
+
+    await m.fn.onSmartRetryAdmin();
+    assert.deepEqual(plain(m.calls("get_drive_smart").map((c) => c.args)), [
+      { id: "PD1", elevated: false },
+      { id: "PD1", elevated: true },
+    ]);
+    assert.equal(el["smart-data"].textContent, "SMART overall-health: PASSED");
+    assert.ok(el["smart-admin"].classList.contains("hidden"));
+  });
+
+  it("other SMART errors don't offer the admin retry", async () => {
+    const { m, el } = setup([DRIVE], "PD1", { invoke: () => { throw { kind: "other", message: "boom" }; } });
+    m.document.add("smart-status");
+    el["smart-admin"].classList.add("hidden");
+    await m.fn.loadSmartData("PD1", false);
+    assert.ok(el["smart-admin"].classList.contains("hidden"));
+  });
+
   it("pollTestStatus stops when the selected drive changed", async () => {
     const { m } = setup([DRIVE], "PD2");
     await m.fn.pollTestStatus("PD1");
-    assert.equal(m.calls("get_drive_smart_elevated").length, 0);
+    assert.equal(m.calls("get_drive_self_test_status").length, 0);
   });
 
   it("pollTestStatus shows progress while a test runs", async () => {
     const { m, el } = setup([DRIVE], "PD1", {
-      invoke: () => "Self-test status: Extended self-test in progress, 40% remaining\n",
+      invoke: () => ({ in_progress: true, percent_remaining: 40, status: "Extended self-test in progress", failed: false, log: [] }),
     });
     await m.fn.pollTestStatus("PD1");
     assert.match(el["smart-test-status"].textContent, /^Monitoring self-test progress\.\.\. \(40% remaining, updates every 10s\)/);
@@ -1183,7 +1101,7 @@ describe("Drive Test", () => {
 
   it("pollTestStatus marks success after two polls without a running test", async () => {
     const { m, el } = setup([DRIVE], "PD1", {
-      invoke: () => "Self-test status: No self-test in progress\n",
+      invoke: () => ({ in_progress: false, percent_remaining: null, status: "No self-test in progress", failed: false, log: [] }),
     });
     await m.fn.pollTestStatus("PD1");
     assert.match(el["smart-test-status"].textContent, /^Self-test finished/);
@@ -1195,7 +1113,7 @@ describe("Drive Test", () => {
 
   it("pollTestStatus reports failed tests as errors", async () => {
     const { m, el } = setup([DRIVE], "PD1", {
-      invoke: () => "Self-test status: Short self-test failed\n",
+      invoke: () => ({ in_progress: false, percent_remaining: null, status: "completed: read failure", failed: true, log: [] }),
     });
     await m.fn.pollTestStatus("PD1");
     assert.match(el["smart-test-status"].textContent, /^Self-test failed/);
@@ -1207,14 +1125,14 @@ describe("Drive Test", () => {
     await m.fn.onRunDriveTest();
     assert.equal(el["smart-test-status"].textContent, "Select at least one test type to run");
     assert.equal(el["smart-test-status"].className, "smart-test-status error");
-    assert.equal(m.calls("run_drive_test_elevated").length, 0);
+    assert.equal(m.calls("run_drive_test").length, 0);
   });
 
   it("onRunDriveTest runs each selected test and flags failures", async () => {
     const { m, el } = setup([DRIVE], "PD1", {
       invoke: (cmd, args) => {
-        if (cmd === "run_drive_test_elevated") {
-          if (args.testType === "long") return "Testing failed: device busy";
+        if (cmd === "run_drive_test") {
+          if (args.testType === "long") throw { kind: "other", message: "Device busy" };
           return "Testing has begun.";
         }
       },
@@ -1222,11 +1140,11 @@ describe("Drive Test", () => {
     m.document.setQueryAll('input[name="smart-test-type"]:checked', [{ value: "short" }, { value: "long" }]);
     await m.fn.onRunDriveTest();
     assert.deepEqual(
-      m.calls("run_drive_test_elevated").map((c) => c.args.testType),
+      m.calls("run_drive_test").map((c) => c.args.testType),
       ["short", "long"]
     );
     assert.match(el["smart-test-status"].textContent, /short: started\n {2}Testing has begun\./);
-    assert.match(el["smart-test-status"].textContent, /long: failed/);
+    assert.match(el["smart-test-status"].textContent, /long: error - Device busy/);
     assert.equal(el["smart-test-status"].className, "smart-test-status error");
     assert.equal(el["smart-run-test"].disabled, false);
   });

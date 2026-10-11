@@ -5,7 +5,7 @@
 - **Path:** `C:\Users\olda9\CascadeProjects\MULA`
 - **Remote:** `https://github.com/Athenas-B/MULA.git`
 - **Branch:** `master`
-- **Last reviewed:** 2026-10-11 (security / robustness pass, see "Architecture notes" below)
+- **Last reviewed:** 2026-10-12 (architecture pass, see "Architecture notes" below)
 - **Platform focus:** Windows 11 (Tauri app with Windows COM wallpaper APIs)
 
 ## Tech Stack
@@ -24,40 +24,59 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
 
 ## Architecture notes (read before changing these areas)
 
-- **Wall Changer settings vs. runtime state.** `settings.json` holds only user configuration and is
-  the only thing the UI reads/writes (`wc_get_settings` / `wc_save_settings`). Runtime state
-  (`queue_states`, `image_cache_entries`, `image_show_stats`, `next_monitor_change_index`,
-  `change_service_running`) lives in `state.json`, written only by `service::apply`
-  (`settings::save_apply_state`) and `service::set_running`. These fields are
-  `#[serde(skip_serializing)]` on `Settings`, so a UI save can never roll back service progress.
-  Old combined `settings.json` files are migrated on first `settings::load()`. Both files are
-  written atomically (temp file + rename).
-- **Threading.** All `wc_*` commands are `async` + `spawn_blocking` (sync Tauri commands run on
-  the UI thread). `service::apply` is serialized by `APPLY_LOCK`; tray actions spawn blocking
-  tasks. The interval worker is a plain thread guarded by a generation counter.
-- **Events to the UI.** `wc-service-changed` (bool) and `wc-wallpaper-changed` (message) are
-  emitted from the backend via `wallchanger::emit`, so the tab stays in sync with tray/service.
-- **Wallhaven.** Results are cached per source in `manifest.json` for 6 h (`RESULTS_TTL`);
-  `NetworkPolicy::CacheOnly` is used by previews. Failed refreshes fall back to cached images,
-  and one failing source no longer fails `load_images`. Downloads go through `.part` files.
-  Cache folders are named with FNV-1a (`fnv<hash>`); legacy `DefaultHasher` folders are migrated.
-  API keys are redacted from errors/logs (`wallhaven::redact`).
+- **Wall Changer data model (`wallchanger/settings.rs`).** Two separate types and files:
+  `Settings` (user configuration, `settings.json`) and `RuntimeState` (queues, image cache, show
+  stats, next monitor, service on/off — `state.json`, written only by `service::apply` via
+  `save_state` and by `set_service_running`). Sources are typed: `Source { path, enabled, level,
+  kind }` with `SourceKind::Folder { include_subfolders }` / `SourceKind::Wallhaven { page_limit,
+  purity: Purity { sfw, sketchy, nsfw } }` (serialized with a `"kind"` tag). Unreadable files
+  are moved aside to `*.bak` and defaults are used. All JSON files are written atomically.
+- **Backend-owned settings.** The UI sends partial updates (`wc_update_settings(patch)` → normalized
+  `Settings`) and renders from the result or the `wc-settings-changed` event, which every change
+  (UI or tray) emits via `wallchanger::on_settings_changed`. Unknown keys are rejected. The UI
+  keeps not-yet-sent edits when settings arrive (`wcApplySettings`) and does no clamping itself.
+- **Threading.** Commands do blocking work through `util::blocking` / `logged_blocking` (sync
+  Tauri commands run on the UI thread). `service::apply` is serialized by `APPLY_LOCK`; tray
+  actions spawn blocking tasks. The interval worker is a plain thread guarded by a generation
+  counter; every apply records `LAST_APPLY`, so a manual change restarts the interval.
+- **Events to the UI.** `wc-service-changed`, `wc-wallpaper-changed`, `wc-settings-changed`,
+  `vsd-log`, `vsd-state-changed`, `autostart-changed`. No polling for logs or state.
+- **Wallhaven.** Results are cached per source in `manifest.json` for 6 h. Stale results are
+  refreshed on a background thread (`refresh_in_background`) while cached images keep being used;
+  only a source with nothing cached is fetched synchronously. Images download with 4 workers
+  through `.part` files. The API key is sent as an `X-API-Key` header, never in URLs.
+- **Typed command errors (`error.rs`).** Commands that the UI must react to return
+  `CommandError` (`{ kind: "smartctl_missing" | "needs_elevation" | "elevation_declined" | "other",
+  message? }`). The frontend switches on `err.kind` (`errorText`, `invokeSmart`); no text matching.
+- **SMART (`smart.rs`).** smartctl runs with `--json=o` (structured data plus the usual text).
+  Exit-status bit 1 (device open failed) becomes `NeedsElevation` when not elevated; bits 3–7 are
+  disk health, not errors. Self-test progress/log is parsed in Rust (`SelfTestStatus`, ATA and
+  NVMe) and polled with `-c -l selftest`. smartmontools is never installed silently: a missing
+  smartctl yields `SmartctlMissing`, the UI asks, then calls `install_smartmontools`. Each drive's
+  resolved smartctl device is cached.
 - **Elevation (`elevated_helper.rs`).** The long-lived smartctl helper is started via an inline
   `-EncodedCommand` stub that verifies the SHA-256 of the script before running it; it only runs
   the smartctl path fixed at launch (must be outside the user profile) with an allowlist of
-  argument shapes, requires a per-session token, names its own response files, and exits when
-  MULA's PID disappears. Formatting uses `run_elevated_script` (separate UAC prompt) and refuses
-  system/boot disks both in Rust (`DriveInfo::is_system`) and in the PowerShell script.
+  argument shapes (optionally prefixed by `--json=o`), requires a per-session token, names its
+  own response files, and exits when MULA's PID disappears. Script inputs are always passed as
+  PowerShell variables declared as single-quoted literals (`ps_script`) — no text placeholders.
+  Formatting uses `run_elevated_script` (separate UAC prompt; a declined prompt is detected by
+  ERROR_CANCELLED) and refuses system/boot disks in Rust and in the script.
   Residual risk: a same-user process can still ask the helper for SMART reads / self-tests.
-- **smartctl lookup.** smartmontools is never installed silently: when smartctl is missing,
-  commands fail with an error containing `SMARTCTL_MISSING`; the frontend's `invokeSmart` asks
-  the user and only then calls `install_smartmontools` (winget). Each drive's resolved smartctl
-  device is cached (`SMART_DEVICES`) so self-test polling doesn't re-enumerate all disks.
-- **Interval timing.** `service::apply` records `LAST_APPLY` for every trigger, so a manual
-  change restarts the service interval.
-- **VSD server.** Rejects any `Origin` other than browser-extension origins, rejects non-loopback
-  `Host` headers (DNS rebinding), `/open` only opens files VSD produced or inside the download
-  dir, `/download` only accepts http(s), and only MULA (no Origin) may change the download dir.
+- **VSD (`vsd.rs` + `modules/vsd/server.py`).** Config lives in `vsd.json` (`download_dir`,
+  `autostart`, `port`). MULA starts the server with `VSD_DOWNLOAD_DIR`, `VSD_PORT` and a
+  per-launch `VSD_ADMIN_TOKEN`; config changes on the running server are sent with the
+  `X-VSD-Admin-Token` header. Autostart happens in the backend at launch. pip runs only when the
+  interpreter or `requirements.txt` changed (fingerprint in `vsd-requirements.sha256`; a server
+  that exits with an error clears it). The server rejects non-extension `Origin`s and
+  non-loopback `Host`s, only opens files it produced, only fetches http(s) (redirects included),
+  and downloads segments in parallel (`VSD_SEGMENT_WORKERS`, default 6) with connection reuse.
+- **Browser extension (`modules/vsd/extension/src`).** Shared `config.js` (server URL helpers).
+  The background owns the job lifecycle: jobs live on the stream records in storage (`stream.job`),
+  one poll loop updates them and resumes when the service worker starts; every storage
+  read-modify-write goes through `updateStore`. The popup renders from `storage.onChanged`
+  (no timers). Detected playlists are verified once and cached; the content script uses a
+  MutationObserver and sends metadata only when it changes.
 
 ## Wall Changer Port Status
 
@@ -102,7 +121,10 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 
 ## Important Source Files
 
-- `src-tauri/src/lib.rs` — Tauri command registration and tray setup.
+- `src-tauri/src/lib.rs` — App setup, tray, command registration, drive listing and format.
+- `src-tauri/src/smart.rs` — smartctl discovery/install, device mapping, JSON parsing, SMART commands.
+- `src-tauri/src/vsd.rs` — VSD server config, process, output events, extension build.
+- `src-tauri/src/error.rs` — `CommandError`, the typed error returned to the UI.
 - `src-tauri/src/wallchanger/mod.rs` — Tauri commands for the Wall Changer tab.
 - `src-tauri/src/wallchanger/settings.rs` — Settings model, load/save/normalize.
 - `src-tauri/src/wallchanger/images.rs` — Local image scanning + Wallhaven cache inclusion.
@@ -111,7 +133,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - `src-tauri/src/wallchanger/service.rs` — Background timer service.
 - `src-tauri/src/wallchanger/monitors/windows.rs` / `linux.rs` — Monitor + wallpaper COM API wrappers (selected via `#[path]`).
 - `src-tauri/src/elevated_helper.rs` — Admin-rights execution (see Architecture notes).
-- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`, `blocking`/`logged_blocking` (run command work off the UI thread), `write_atomic`.
+- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`, `blocking`/`logged_blocking`, `read_json_or_default`/`write_json`/`write_atomic`, `safe_file_name`, `stable_hash` (FNV-1a for cache names).
 - `src-tauri/src/wallchanger/overlay.rs` — Picture-name overlay rendering.
 - `src-tauri/src/wallchanger/transition.rs` — Fade transition frame generation.
 - `src-tauri/src/wallchanger/preview.rs` — Monitor-fit preview rendering; `fit_to_canvas` is shared with the fade transition.
@@ -125,6 +147,8 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - Fade transition frames: `%APPDATA%\mula\wallchanger\rendered\transitions`
 - Wallhaven download cache: `%APPDATA%\mula\wallchanger\wallhaven\fnv<hash>\` (+ `manifest.json`)
 - Elevated helper / one-shot script dirs: `%TEMP%\mula_smartd_*`, `%TEMP%\mula_elevated_*`
+- VSD config: `%APPDATA%\mula\vsd.json`; pip fingerprint: `%APPDATA%\mula\vsd-requirements.sha256`
+- SMART snapshots: `%APPDATA%\mula\snapshots\<drive>\`
 - Startup registry: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `MULA`
 
 ## Build & Test Commands
@@ -167,10 +191,10 @@ cache-only test creates and removes an empty folder).
 ## Common Issues / Notes
 
 - **Line-ending warnings:** Git warns about LF → CRLF replacement on Windows; this is harmless.
-- **COM initialization:** Wallpaper COM calls run on a dedicated blocking thread; `CoInitializeEx`/`CoUninitialize` are managed in `monitors.rs`.
-- **Wallhaven API key:** Required for NSFW purity. Stored in `wallhaven_api_key`; `use_wallhaven_api_key` is auto-managed by normalization.
+- **COM initialization:** Wallpaper COM calls run on blocking threads; `monitors/windows.rs` (`desktop_wallpaper`) initializes COM on the calling thread before each use.
+- **Wallhaven API key:** Required for NSFW purity. Stored in `wallhaven_api_key`; it is used whenever it is non-empty.
 - **Wallhaven page limit:** `0` now means unlimited pages (use with caution; the API still paginates and respects rate limits).
-- **Wallhaven URL validation:** Only URLs containing `wallhaven.cc` are treated as Wallhaven sources; anything else is treated as a local folder path.
+- **Source kinds:** A source's kind is chosen when it is added ("Add folder" vs "Add Wallhaven URL"); nothing is inferred from the path.
 - **Tray menu state:** `MaxLevelMenuState` and `AutostartMenuState` are managed in `lib.rs` setup so tray items stay in sync with the UI.
 
 ## Next Logical Tasks
@@ -181,5 +205,6 @@ cache-only test creates and removes an empty folder).
 4. **Image show history UI** — expose `image_show_stats` in the Wall Changer tab.
 5. **Wallhaven cache management UI** — add a “Clear Wallhaven cache” / “Re-download” button.
 6. **Manual verification still needed** (cannot be covered by unit tests): the real UAC flow of
-   the smartctl helper and of Format (on a spare drive), and the first-run migration of an
-   existing `settings.json` into `state.json`.
+   the smartctl helper and of Format (on a spare drive), smartctl's JSON on real ATA/NVMe drives,
+   and the browser extension loaded in Chrome/Firefox (its tests run the scripts in `node:vm`).
+   Settings files from before the typed source format are moved aside to `*.bak`.

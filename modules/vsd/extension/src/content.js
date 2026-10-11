@@ -50,27 +50,68 @@ function extractMetadata() {
   };
 }
 
-// ── Context Validation ──────────────────────────────────────────────────────
+// ── State ───────────────────────────────────────────────────────────────────
 
-let metadataInterval = null;
-let scanInterval = null;
+const SCAN_THROTTLE_MS = 1000;
+// A port that disconnects sooner than this after connecting is treated as a dead context.
+const MIN_PORT_LIFETIME_MS = 1000;
+
+const reportedUrls = new Set();
+let lastMetadataKey = '';
+let observer = null;
+let scanTimer = null;
 let contextValid = true;
 
-try {
-  const port = chrome.runtime.connect({ name: 'content' });
-  port.onDisconnect.addListener(() => {
-    contextValid = false;
-    if (metadataInterval) clearInterval(metadataInterval);
-    if (scanInterval) clearInterval(scanInterval);
-  });
-} catch (e) {
+// ── Context Validation ──────────────────────────────────────────────────────
+
+function stopAll() {
   contextValid = false;
+  if (observer) {
+    try { observer.disconnect(); } catch (e) {}
+    observer = null;
+  }
+  if (scanTimer !== null) {
+    clearTimeout(scanTimer);
+    scanTimer = null;
+  }
 }
+
+function runtimeAlive() {
+  try { return !!chrome.runtime.id; }
+  catch (e) { return false; }
+}
+
+// The open port lets the background notice this tab; its disconnect tells us the
+// extension context went away (extension reloaded/removed). If the runtime is still
+// alive, only the background worker restarted: reconnect and re-send everything,
+// since the new worker has lost its in-memory page metadata.
+function connectPort() {
+  const connectedAt = Date.now();
+  try {
+    const port = chrome.runtime.connect({ name: 'content' });
+    port.onDisconnect.addListener(() => {
+      try { void chrome.runtime.lastError; } catch (e) {}
+      if (contextValid && runtimeAlive() && Date.now() - connectedAt >= MIN_PORT_LIFETIME_MS) {
+        lastMetadataKey = '';
+        reportedUrls.clear();
+        connectPort();
+        scheduleScan();
+      } else {
+        stopAll();
+      }
+    });
+  } catch (e) {
+    stopAll();
+  }
+}
+
+connectPort();
 
 function extensionContextValid() {
   if (!contextValid) return false;
-  try { return !!chrome.runtime.id; }
-  catch (e) { contextValid = false; return false; }
+  if (runtimeAlive()) return true;
+  stopAll();
+  return false;
 }
 
 function sendMessageSafe(msg) {
@@ -85,23 +126,32 @@ function sendMessageSafe(msg) {
       } catch (e) {}
     });
   } catch (e) {
-    contextValid = false;
+    stopAll();
   }
 }
 
-// ── Periodic Tasks ──────────────────────────────────────────────────────────
+// ── Detection ───────────────────────────────────────────────────────────────
 
+/** Send page metadata, but only when it (or the page URL) changed since the last send. */
 function sendMetadata() {
   if (!extensionContextValid()) return;
-  sendMessageSafe({ type: 'metadata', pageUrl: location.href, metadata: extractMetadata() });
+  const metadata = extractMetadata();
+  const key = JSON.stringify([location.href, metadata]);
+  if (key === lastMetadataKey) return;
+  lastMetadataKey = key;
+  sendMessageSafe({ type: 'metadata', pageUrl: location.href, metadata });
 }
 
+/** Report HLS <video> sources that were not reported yet. */
 function scan() {
   if (!extensionContextValid()) return;
+  sendMetadata();
   const streams = [];
   document.querySelectorAll('video').forEach(v => {
-    if (v.src && /\.m3u8?(\?|$)/i.test(v.src)) {
-      streams.push({ url: v.src, type: 'hls' });
+    const src = v.src;
+    if (src && /\.m3u8?(\?|$)/i.test(src) && !reportedUrls.has(src)) {
+      reportedUrls.add(src);
+      streams.push({ url: src, type: 'hls' });
     }
   });
   if (streams.length) {
@@ -109,9 +159,33 @@ function scan() {
   }
 }
 
-sendMetadata();
-setTimeout(sendMetadata, 2000);
-metadataInterval = setInterval(sendMetadata, 5000);
+/** Throttled scan, triggered by DOM mutations. */
+function scheduleScan() {
+  if (!contextValid || scanTimer !== null) return;
+  scanTimer = setTimeout(() => {
+    scanTimer = null;
+    scan();
+  }, SCAN_THROTTLE_MS);
+}
+
+// Re-report everything when detection is switched back on (reports made while it
+// was off were ignored by the background).
+try {
+  chrome.storage.onChanged.addListener((changes) => {
+    if (changes.detectionEnabled && changes.detectionEnabled.newValue && contextValid) {
+      reportedUrls.clear();
+      scheduleScan();
+    }
+  });
+} catch (e) {}
+
+// ── Init ────────────────────────────────────────────────────────────────────
 
 scan();
-scanInterval = setInterval(scan, 3000);
+
+if (contextValid && typeof MutationObserver === 'function' && document.documentElement) {
+  observer = new MutationObserver(scheduleScan);
+  observer.observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['src']
+  });
+}

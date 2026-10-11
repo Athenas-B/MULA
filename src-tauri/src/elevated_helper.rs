@@ -21,6 +21,7 @@
 //!   with `CreateNew`, and stops if its directory has been replaced by a reparse point;
 //! - the helper exits by itself once the MULA process that started it has gone away.
 
+use crate::error::CommandError;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,19 +55,15 @@ struct HelperResponse {
     error: String,
 }
 
-/// The long-lived helper. `__DIR__`, `__EXE__`, `__TOKEN__` and `__PARENT_PID__` are substituted
-/// before the script is written to disk; its hash is then pinned in the elevation stub.
+/// The long-lived helper. `$Dir`, `$Exe`, `$Token` and `$ParentPid` are defined by
+/// [`ps_script`] before the script is written to disk; its hash is then pinned in the stub.
 const HELPER_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Continue'
-$Dir = '__DIR__'
-$Exe = '__EXE__'
-$Token = '__TOKEN__'
-$ParentPid = __PARENT_PID__
 $utf8 = New-Object System.Text.UTF8Encoding $false
 $idRe = '^[0-9A-Za-z_]{1,64}$'
 $typeRe = '^[A-Za-z0-9,+_-]{1,32}$'
 $deviceRe = '^/dev/[A-Za-z0-9,]{1,16}$'
-$allowedHeads = @('-i', '-a', '-t short', '-t long', '-t conveyance', '-t offline', '-l selftest')
+$allowedHeads = @('-i', '-a', '-t short', '-t long', '-t conveyance', '-t offline', '-l selftest', '-c -l selftest')
 
 function Test-DirIsSafe {
     $item = Get-Item -LiteralPath $Dir -Force -ErrorAction SilentlyContinue
@@ -74,6 +71,8 @@ function Test-DirIsSafe {
 }
 
 function Test-Args([string[]]$a) {
+    # JSON output (with the usual text included) may be requested in front of any command.
+    if ($a.Count -gt 0 -and $a[0] -ceq '--json=o') { $a = @($a | Select-Object -Skip 1) }
     $n = $a.Count
     if ($n -eq 1) { return $a[0] -ceq '--scan' }
     if ($n -lt 4) { return $false }
@@ -151,14 +150,17 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Escapes a value for use inside a PowerShell single-quoted string literal.
-pub fn ps_escape(value: &str) -> String {
-    value.replace('\'', "''")
+/// Quotes a value as a PowerShell single-quoted string literal (never interpolated).
+pub fn ps_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Quotes a value as a PowerShell single-quoted string literal.
-pub fn ps_quote(value: &str) -> String {
-    format!("'{}'", ps_escape(value))
+/// Builds a script from `template`, defining each `(name, value)` as a PowerShell variable
+/// ahead of it. Values are single-quoted literals, so they can never run as code.
+pub fn ps_script(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut script: String = vars.iter().map(|(name, value)| format!("${name} = {}\n", ps_quote(value))).collect();
+    script.push_str(template);
+    script
 }
 
 /// Encodes a script for `powershell -EncodedCommand` (base64 of UTF-16LE).
@@ -199,7 +201,7 @@ const EXIT_UAC_DECLINED: i32 = 9002;
 
 /// Starts `stub` in a new PowerShell process, elevated through UAC when `elevate` is set.
 /// With `wait`, blocks until it finishes and returns its exit code.
-fn launch_stub(stub: &str, elevate: bool, wait: bool) -> Result<i32, String> {
+fn launch_stub(stub: &str, elevate: bool, wait: bool) -> Result<i32, CommandError> {
     let verb = if elevate { "-Verb RunAs " } else { "" };
     let wait_flags = if wait { "-Wait -PassThru " } else { "" };
     let launcher = [
@@ -229,11 +231,12 @@ fn launch_stub(stub: &str, elevate: bool, wait: bool) -> Result<i32, String> {
         .map_err(|e| format!("Failed to start PowerShell: {e}"))?;
 
     match output.status.code().unwrap_or(-1) {
-        EXIT_UAC_DECLINED => Err("Administrator rights were declined".to_string()),
+        EXIT_UAC_DECLINED => Err(CommandError::ElevationDeclined),
         EXIT_START_FAILED => Err(format!(
             "Failed to start elevated process: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        )),
+        )
+        .into()),
         code => Ok(code),
     }
 }
@@ -258,16 +261,20 @@ fn check_exe_is_protected(exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, String> {
+fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, CommandError> {
     check_exe_is_protected(exe)?;
 
     let cmd_dir = new_private_dir("mula_smartd")?;
     let token = random_token();
-    let script = HELPER_SCRIPT
-        .replace("__DIR__", &ps_escape(&cmd_dir.to_string_lossy()))
-        .replace("__EXE__", &ps_escape(&exe.to_string_lossy()))
-        .replace("__TOKEN__", &token)
-        .replace("__PARENT_PID__", &std::process::id().to_string());
+    let script = ps_script(
+        HELPER_SCRIPT,
+        &[
+            ("Dir", &cmd_dir.to_string_lossy()),
+            ("Exe", &exe.to_string_lossy()),
+            ("Token", &token),
+            ("ParentPid", &std::process::id().to_string()),
+        ],
+    );
     let stub = write_script_with_stub(&cmd_dir, &script)?;
 
     log::info!("Starting elevated smartctl helper in {}", cmd_dir.display());
@@ -278,7 +285,7 @@ fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, String> {
     while !ready_file.exists() {
         if Instant::now() >= deadline {
             let _ = std::fs::remove_dir_all(&cmd_dir);
-            return Err("Elevated helper did not become ready (was the UAC prompt declined?)".to_string());
+            return Err("Elevated helper did not become ready".into());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -328,7 +335,7 @@ pub fn stop_helper() {
     }
 }
 
-fn run_smartctl_with_helper(exe: &Path, args: &[&str], elevate: bool) -> Result<String, String> {
+fn run_smartctl_with_helper(exe: &Path, args: &[&str], elevate: bool) -> Result<String, CommandError> {
     let mut guard = ELEVATED_HELPER.lock().map_err(|_| "Elevated helper lock poisoned")?;
 
     // A helper is bound to one executable; restart it if smartctl moved, or if it died.
@@ -348,38 +355,43 @@ fn run_smartctl_with_helper(exe: &Path, args: &[&str], elevate: bool) -> Result<
             if let Some(old) = guard.take() {
                 let _ = std::fs::remove_dir_all(&old.cmd_dir);
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
 
     if !response.ok {
-        return Err(format!("Elevated helper refused the command: {}", response.error));
+        return Err(format!("Elevated helper refused the command: {}", response.error).into());
     }
     if response.output.trim().is_empty() {
-        return Err("command returned no output".to_string());
+        return Err("command returned no output".into());
     }
     Ok(response.output)
 }
 
 /// Runs smartctl with administrator rights through the long-lived helper.
-pub fn run_smartctl_elevated(exe: &Path, args: &[&str]) -> Result<String, String> {
+pub fn run_smartctl_elevated(exe: &Path, args: &[&str]) -> Result<String, CommandError> {
     run_smartctl_with_helper(exe, args, true)
 }
 
-/// Runs `script` once in its own elevated PowerShell (one UAC prompt), waiting for it to finish.
-///
-/// The script receives the path of a result file via the `__RESULT_PATH__` placeholder, should
-/// write a human-readable message to it, and should exit 0 on success. Returns that message.
-pub fn run_elevated_script(script: &str) -> Result<String, String> {
-    run_script(script, true)
+/// Runs `template` once in its own elevated PowerShell (one UAC prompt), waiting for it to
+/// finish. `vars` become PowerShell variables (see [`ps_script`]); `$ResultPath` names a file
+/// the script should write a human-readable message to. It should exit 0 on success. Returns
+/// that message.
+pub fn run_elevated_script(template: &str, vars: &[(&str, &str)]) -> Result<String, CommandError> {
+    run_script(template, vars, true)
 }
 
-fn run_script(script: &str, elevate: bool) -> Result<String, String> {
+fn run_script(template: &str, vars: &[(&str, &str)], elevate: bool) -> Result<String, CommandError> {
     let dir = new_private_dir("mula_elevated")?;
     let result_path = dir.join("result.txt");
-    let script = script.replace("__RESULT_PATH__", &ps_escape(&result_path.to_string_lossy()));
+    let result_path_text = result_path.to_string_lossy();
+    let mut all_vars = vec![("ResultPath", result_path_text.as_ref())];
+    all_vars.extend_from_slice(vars);
+    let script = ps_script(template, &all_vars);
 
-    let outcome = write_script_with_stub(&dir, &script).and_then(|stub| launch_stub(&stub, elevate, true));
+    let outcome = write_script_with_stub(&dir, &script)
+        .map_err(CommandError::from)
+        .and_then(|stub| launch_stub(&stub, elevate, true));
     let message = std::fs::read(&result_path)
         .map(|b| String::from_utf8_lossy(&b).trim().to_string())
         .unwrap_or_default();
@@ -387,9 +399,9 @@ fn run_script(script: &str, elevate: bool) -> Result<String, String> {
 
     match outcome? {
         0 => Ok(message),
-        87 => Err("Elevated script failed its integrity check and was not run".to_string()),
-        code if message.is_empty() => Err(format!("Elevated script failed (exit code {code})")),
-        _ => Err(message),
+        87 => Err("Elevated script failed its integrity check and was not run".into()),
+        code if message.is_empty() => Err(format!("Elevated script failed (exit code {code})").into()),
+        _ => Err(message.into()),
     }
 }
 
@@ -414,12 +426,19 @@ mod tests {
         assert!(allowed.ok, "allowlisted command should run: {}", allowed.error);
         assert!(!allowed.output.is_empty());
 
+        for args in [&["--json=o", "-a", "-d", "sat", "/dev/sda"][..], &["--json=o", "-c", "-l", "selftest", "-d", "nvme", "/dev/pd0"]] {
+            let res = send_command(&helper, args, false, Duration::from_secs(30)).unwrap();
+            assert!(res.ok, "{args:?} should be allowed: {}", res.error);
+        }
+
         let shapes: &[&[&str]] = &[
             &["/c", "calc.exe"],
             &["-a", "-d", "sat", r"C:\Windows\notepad.exe"],
             &["-a", "-d", "sat & calc", "/dev/sda"],
             &["-s", "on", "-d", "sat", "/dev/sda"],
             &["-d", "sat", "/dev/sda"],
+            &["--json=o"],
+            &["--json=o", "--json=o", "-a", "-d", "sat", "/dev/sda"],
         ];
         for args in shapes {
             let res = send_command(&helper, args, false, Duration::from_secs(30)).unwrap();
@@ -446,14 +465,18 @@ mod tests {
 
     #[test]
     fn one_shot_script_reports_message_and_exit_code() {
-        let ok = run_script(
-            "[IO.File]::WriteAllText('__RESULT_PATH__', 'it''s done'); exit 0",
-            false,
-        );
+        let ok = run_script("[IO.File]::WriteAllText($ResultPath, 'it''s done'); exit 0", &[], false);
         assert_eq!(ok.unwrap(), "it's done");
 
-        let failed = run_script("[IO.File]::WriteAllText('__RESULT_PATH__', 'boom'); exit 1", false);
-        assert_eq!(failed.unwrap_err(), "boom");
+        let failed = run_script("[IO.File]::WriteAllText($ResultPath, 'boom'); exit 1", &[], false);
+        assert_eq!(failed.unwrap_err(), CommandError::from("boom"));
+    }
+
+    #[test]
+    fn script_variables_are_passed_literally() {
+        let value = "O'Brien $env:USERNAME; Remove-Item C:\\x";
+        let echoed = run_script("[IO.File]::WriteAllText($ResultPath, $Value); exit 0", &[("Value", value)], false);
+        assert_eq!(echoed.unwrap(), value);
     }
 
     #[test]
@@ -475,9 +498,11 @@ mod encoding_tests {
     use super::*;
 
     #[test]
-    fn powershell_values_are_escaped_for_single_quoted_literals() {
-        assert_eq!(ps_escape(r"C:\O'Brien\x"), r"C:\O''Brien\x");
-        assert_eq!(ps_quote("a'b"), format!("'{}'", ps_escape("a'b")));
+    fn scripts_get_their_variables_declared_first() {
+        assert_eq!(
+            ps_script("Write-Output $A", &[("A", r"C:\O'Brien"), ("B", "1")]),
+            "$A = 'C:\\O''Brien'\n$B = '1'\nWrite-Output $A"
+        );
     }
 
     #[test]

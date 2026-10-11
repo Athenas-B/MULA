@@ -19,10 +19,15 @@ const popoutBtn = document.getElementById('popout');
 const protectActive = document.getElementById('protectActive');
 const detectionToggle = document.getElementById('detectionEnabled');
 
-const DEFAULT_SERVER = 'http://127.0.0.1:8765';
-const activeJobs = new Map();
-const jobProgress = new Map();
-let cachedStreams = [];
+// ── State ───────────────────────────────────────────────────────────────────
+// Everything persistent (streams and their jobs) lives in chrome.storage.local and is
+// owned by the background; the popup only renders it and re-renders on changes.
+
+let streams = [];
+let detectionEnabled = true;
+const rows = new Map();              // stream URL -> rendered row
+const pendingDownloads = new Set();  // URLs with a 'download' request in flight
+const startErrors = new Map();       // URL -> error from a failed download start
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -49,21 +54,27 @@ function buildTooltip(s) {
   return lines.length ? 'Metadata saved in file:\n' + lines.join('\n') : '';
 }
 
-function isJobActive(jobId) {
-  const p = jobProgress.get(jobId);
-  return !p || p.status === 'running';
+/** [label, disabled] of a stream's download button. */
+function downloadButtonState(s) {
+  const job = s.job;
+  if (pendingDownloads.has(s.url)) return ['Starting...', true];
+  if (job) return [formatProgress(job), true];
+  if (startErrors.has(s.url)) return ['Error: ' + startErrors.get(s.url), false];
+  return ['Download via ffmpeg', false];
 }
 
-// Same setting background.js uses, so /open and /logs reach the configured server.
-async function getServerUrl() {
-  const result = await new Promise(r => chrome.storage.local.get({ serverUrl: DEFAULT_SERVER }, r));
-  return result.serverUrl || DEFAULT_SERVER;
-}
-
-function fetchWithTimeout(url, ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+function sendMessage(message) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendMessage(message, (res) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(res);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
 }
 
 async function copyToClipboard(text) {
@@ -84,204 +95,152 @@ async function copyToClipboard(text) {
   }
 }
 
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function setChildren(parent, children) {
+  parent.replaceChildren(...children);
+}
+
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-function render(streams) {
-  streamsList.innerHTML = '';
-  if (!streams?.length) {
-    statusDiv.textContent = 'No HLS streams detected yet.';
-    return;
-  }
-  statusDiv.textContent = `${streams.length} stream(s) detected`;
+function createElement(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text) el.textContent = text;
+  return el;
+}
 
+function createRow() {
+  const row = {
+    li: createElement('li', 'stream-item'),
+    titleDiv: createElement('div', 'stream-title'),
+    urlDiv: createElement('div', 'stream-url'),
+    actions: createElement('div', 'stream-actions'),
+    dlBtn: createElement('button'),
+    openBtn: createElement('button', 'open-btn', 'Open page'),
+    openFileBtn: createElement('button', 'open-file-btn', 'Open file'),
+    removeBtn: createElement('button', 'remove-btn', 'Remove'),
+    hasTitle: null,
+    stream: null,
+  };
+  row.actions.append(row.dlBtn, row.openBtn, row.openFileBtn, row.removeBtn);
+  row.dlBtn.onclick = () => startDownload(row.stream.url);
+  row.openBtn.onclick = () => openPage(row.stream);
+  row.openFileBtn.onclick = () => openFile(row.stream);
+  row.removeBtn.onclick = () => removeStream(row.stream.url);
+  return row;
+}
+
+function updateRow(row, s) {
+  row.stream = s;
+  const tooltip = buildTooltip(s);
+  if (row.li.title !== tooltip) row.li.title = tooltip;
+
+  const hasTitle = !!s.title;
+  setText(row.titleDiv, s.title || '');
+  setText(row.urlDiv, s.url);
+  if (row.hasTitle !== hasTitle) {
+    row.hasTitle = hasTitle;
+    setChildren(row.li, hasTitle ? [row.titleDiv, row.urlDiv, row.actions] : [row.urlDiv, row.actions]);
+  }
+
+  const [label, disabled] = downloadButtonState(s);
+  setText(row.dlBtn, label);
+  row.dlBtn.disabled = disabled;
+  row.openFileBtn.disabled = !(s.job?.status === 'done' && s.job.output);
+}
+
+function updateStatus() {
+  const n = streams.length;
+  if (!n) {
+    statusDiv.textContent = detectionEnabled ? 'No HLS streams detected yet.' : 'Detection paused';
+  } else {
+    statusDiv.textContent = `${n} stream(s) detected` + (detectionEnabled ? '' : ' (detection paused)');
+  }
+}
+
+/** Render `streams`, reusing the existing row of each URL and only reordering when needed. */
+function render() {
+  updateStatus();
+  const seen = new Set();
+  const ordered = [];
   for (const s of streams) {
-    const li = document.createElement('li');
-    li.className = 'stream-item';
-    li.title = buildTooltip(s);
-
-    if (s.title) {
-      const titleDiv = document.createElement('div');
-      titleDiv.className = 'stream-title';
-      titleDiv.textContent = s.title;
-      li.appendChild(titleDiv);
+    if (!s || !s.url || seen.has(s.url)) continue;
+    seen.add(s.url);
+    let row = rows.get(s.url);
+    if (!row) {
+      row = createRow();
+      rows.set(s.url, row);
     }
-
-    const urlDiv = document.createElement('div');
-    urlDiv.className = 'stream-url';
-    urlDiv.textContent = s.url;
-
-    const jobId = activeJobs.get(s.url);
-    const p = jobId ? jobProgress.get(jobId) : null;
-
-    const dlBtn = document.createElement('button');
-    if (s.saved && !jobId) {
-      dlBtn.textContent = 'Saved';
-      dlBtn.disabled = true;
-    } else if (jobId && p && (p.status === 'done' || p.status === 'error')) {
-      dlBtn.textContent = p.status === 'done' ? 'Saved' : ('Error: ' + (p.error || 'failed'));
-      dlBtn.disabled = true;
-    } else if (jobId) {
-      dlBtn.textContent = formatProgress(p);
-      dlBtn.disabled = true;
-    } else {
-      dlBtn.textContent = 'Download via ffmpeg';
-      dlBtn.disabled = false;
-    }
-    dlBtn.onclick = () => startDownload(s.url, dlBtn);
-
-    const openBtn = document.createElement('button');
-    openBtn.textContent = 'Open page';
-    openBtn.className = 'open-btn';
-    openBtn.onclick = () => {
-      if (s.pageUrl && s.pageUrl !== 'unknown') chrome.tabs.create({ url: s.pageUrl });
-    };
-
-    const openFileBtn = document.createElement('button');
-    openFileBtn.textContent = 'Open file';
-    openFileBtn.className = 'open-file-btn';
-    openFileBtn.disabled = !(p?.status === 'done' && p.output) && !s.saved;
-    openFileBtn.onclick = async () => {
-      if (p?.output) {
-        fetch(`${await getServerUrl()}/open`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: p.output })
-        }).catch(err => console.error('Open file failed:', err));
-      }
-    };
-
-    const removeBtn = document.createElement('button');
-    removeBtn.textContent = 'Remove';
-    removeBtn.className = 'remove-btn';
-    removeBtn.onclick = () => {
-      chrome.runtime.sendMessage({ type: 'remove', url: s.url }, () => {
-        if (!chrome.runtime.lastError) { activeJobs.delete(s.url); load(); }
-      });
-    };
-
-    const actions = document.createElement('div');
-    actions.className = 'stream-actions';
-    actions.append(dlBtn, openBtn, openFileBtn, removeBtn);
-    li.append(urlDiv, actions);
-    streamsList.appendChild(li);
+    updateRow(row, s);
+    ordered.push(row.li);
+  }
+  for (const url of [...rows.keys()]) {
+    if (!seen.has(url)) rows.delete(url);
+  }
+  for (const url of [...startErrors.keys()]) {
+    if (!seen.has(url)) startErrors.delete(url);
+  }
+  const current = streamsList.children;
+  if (current.length !== ordered.length || ordered.some((li, i) => current[i] !== li)) {
+    setChildren(streamsList, ordered);
   }
 }
 
-function renderFromCache() { render(cachedStreams); }
-
-// ── Download & Progress ─────────────────────────────────────────────────────
-
-function startDownload(url, btn) {
-  if (btn.disabled) return;
-  btn.disabled = true;
-  btn.textContent = 'Starting...';
-
-  chrome.runtime.sendMessage({ type: 'download', url }, (res) => {
-    if (chrome.runtime.lastError) {
-      btn.textContent = 'Error: ' + chrome.runtime.lastError.message;
-      btn.disabled = false;
-      return;
-    }
-    if (res?.error) {
-      btn.textContent = 'Error: ' + res.error;
-      btn.disabled = false;
-      return;
-    }
-    if (res?.job_id) startProgressPolling(url, res.job_id);
-  });
+function setStreams(value) {
+  streams = Array.isArray(value) ? value : [];
+  render();
 }
 
-function startProgressPolling(url, jobId) {
-  activeJobs.set(url, jobId);
-  jobProgress.set(jobId, { status: 'running', stage: 'starting', current: 0, total: 0 });
-  renderFromCache();
+// ── Actions ─────────────────────────────────────────────────────────────────
 
-  const interval = setInterval(() => {
-    chrome.runtime.sendMessage({ type: 'progress', job_id: jobId }, (res) => {
-      if (chrome.runtime.lastError) return;
-      jobProgress.set(jobId, res);
-      if (res.status === 'done' || res.status === 'error') {
-        clearInterval(interval);
-        if (res.status === 'done') {
-          const doneUrl = [...activeJobs.entries()].find(([, jid]) => jid === jobId)?.[0];
-          if (doneUrl) chrome.runtime.sendMessage({ type: 'clearJob', url: doneUrl }, () => {});
-        } else {
-          const errUrl = [...activeJobs.entries()].find(([, jid]) => jid === jobId)?.[0];
-          if (errUrl && !cachedStreams.some(s => s.url === errUrl)) {
-            chrome.runtime.sendMessage({ type: 'removeUrls', urls: [errUrl] }, () => {});
-            activeJobs.delete(errUrl);
-            jobProgress.delete(jobId);
-          }
-        }
-      }
-      renderFromCache();
-    });
-  }, 1000);
+async function startDownload(url) {
+  const s = streams.find(x => x.url === url);
+  if (pendingDownloads.has(url) || s?.job) return;
+  pendingDownloads.add(url);
+  startErrors.delete(url);
+  render();
+  try {
+    const res = await sendMessage({ type: 'download', url });
+    if (res?.error) startErrors.set(url, res.error);
+    else if (!res?.job_id) startErrors.set(url, 'no response');
+  } catch (e) {
+    startErrors.set(url, e.message);
+  } finally {
+    pendingDownloads.delete(url);
+    render();
+  }
 }
 
-// ── Data Loading ────────────────────────────────────────────────────────────
+function openPage(s) {
+  if (s?.pageUrl && s.pageUrl !== 'unknown') chrome.tabs.create({ url: s.pageUrl });
+}
 
-function load() {
-  chrome.runtime.sendMessage({ type: 'getActiveJobs' }, (storedJobs) => {
-    if (!chrome.runtime.lastError) {
-      for (const [url, jobId] of Object.entries(storedJobs || {})) {
-        if (!activeJobs.has(url)) startProgressPolling(url, jobId);
-      }
-    }
-    chrome.runtime.sendMessage({ type: 'getStreams' }, (streams) => {
-      if (chrome.runtime.lastError) return;
-      cachedStreams = streams || [];
-      render(cachedStreams);
-    });
-  });
+function openFile(s) {
+  const output = s?.job?.status === 'done' ? s.job.output : null;
+  if (!output) return Promise.resolve();
+  return vsdServerJson('/open', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: output })
+  }).catch(err => console.error('Open file failed:', err));
+}
+
+function removeStream(url) {
+  return sendMessage({ type: 'remove', url }).catch(() => {});
 }
 
 // ── Button Handlers ─────────────────────────────────────────────────────────
 
-clearBtn.onclick = () => {
-  const keepUrls = new Set();
+clearBtn.onclick = () => sendMessage({ type: 'clear', protectActive: protectActive.checked }).catch(() => {});
 
-  for (const [url, jobId] of activeJobs.entries()) {
-    const p = jobProgress.get(jobId);
-    if (protectActive.checked && isJobActive(jobId)) keepUrls.add(url);
-    if (p?.status === 'done' || p?.status === 'error') keepUrls.add(url);
-  }
-
-  for (const s of cachedStreams) {
-    if (s.saved) keepUrls.add(s.url);
-  }
-
-  const keep = Array.from(keepUrls);
-  chrome.runtime.sendMessage({ type: 'clear', keepUrls: keep }, () => {
-    if (chrome.runtime.lastError) return;
-    for (const [url, jobId] of activeJobs.entries()) {
-      if (!keep.includes(url)) { activeJobs.delete(url); jobProgress.delete(jobId); }
-    }
-    load();
-  });
-};
-
-clearSavedBtn.onclick = () => {
-  chrome.runtime.sendMessage({ type: 'clearSaved', jobProgress: Object.fromEntries(jobProgress) }, () => {
-    if (chrome.runtime.lastError) return;
-    for (const [url, jobId] of activeJobs.entries()) {
-      if (jobProgress.get(jobId)?.status === 'done') { activeJobs.delete(url); jobProgress.delete(jobId); }
-    }
-    for (const s of cachedStreams) {
-      if (s.saved) { const jid = activeJobs.get(s.url); activeJobs.delete(s.url); if (jid) jobProgress.delete(jid); }
-    }
-    load();
-  });
-};
+clearSavedBtn.onclick = () => sendMessage({ type: 'clearSaved' }).catch(() => {});
 
 clearLogsBtn.onclick = () => {
-  chrome.runtime.sendMessage({ type: 'clearAllData' }, () => {
-    if (chrome.runtime.lastError) return;
-    activeJobs.clear();
-    jobProgress.clear();
-    cachedStreams = [];
-    load();
-  });
+  startErrors.clear();
+  return sendMessage({ type: 'clearAllData' }).catch(() => {});
 };
 
 copyLogsBtn.onclick = async () => {
@@ -300,16 +259,16 @@ copyLogsBtn.onclick = async () => {
     let serverLog = '';
     let serverAvailable = true;
     try {
-      const res = await fetchWithTimeout(`${await getServerUrl()}/logs?lines=200`, 1500);
-      if (res.ok) { serverLog = (await res.json()).log || ''; }
-      else serverAvailable = false;
-    } catch (e) { serverAvailable = false; }
+      serverLog = (await vsdServerJson('/logs?lines=200', {}, 1500)).log || '';
+    } catch (e) {
+      serverAvailable = false;
+    }
 
     const report = [
       '=== VSD Diagnostics ===',
       `Generated: ${new Date().toISOString()}`,
+      `Server: ${await vsdGetServerUrl()}`,
       '', '--- Extension Storage ---', JSON.stringify(storageDump, null, 2),
-      '', '--- Job Progress ---', JSON.stringify(Object.fromEntries(jobProgress), null, 2),
       '', '--- Error Log ---', errorLogText,
       '', serverAvailable ? '--- Server Log ---' : '--- Server ---',
       serverAvailable ? serverLog : 'Server unavailable.',
@@ -335,33 +294,37 @@ popoutBtn.onclick = () => {
   });
 };
 
-// ── Detection Toggle ────────────────────────────────────────────────────────
-
-chrome.storage.local.get({ detectionEnabled: true }, (result) => {
-  detectionToggle.checked = result.detectionEnabled;
-  statusDiv.textContent = result.detectionEnabled ? 'Scanning...' : 'Detection paused';
-});
+// ── Toggles ─────────────────────────────────────────────────────────────────
 
 detectionToggle.onchange = () => {
-  const enabled = detectionToggle.checked;
-  chrome.storage.local.set({ detectionEnabled: enabled });
-  statusDiv.textContent = enabled ? 'Scanning...' : 'Detection paused';
+  detectionEnabled = detectionToggle.checked;
+  chrome.storage.local.set({ detectionEnabled });
+  updateStatus();
 };
 
-chrome.storage.local.get({ protectActiveDownloads: true }, (result) => {
-  protectActive.checked = result.protectActiveDownloads;
-});
 protectActive.onchange = () => chrome.storage.local.set({ protectActiveDownloads: protectActive.checked });
 
-chrome.storage.onChanged.addListener((changes) => {
+// ── Storage Sync ────────────────────────────────────────────────────────────
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area && area !== 'local') return;
   if (changes.detectionEnabled) {
-    detectionToggle.checked = changes.detectionEnabled.newValue;
-    statusDiv.textContent = changes.detectionEnabled.newValue ? 'Scanning...' : 'Detection paused';
+    detectionEnabled = changes.detectionEnabled.newValue !== false;
+    detectionToggle.checked = detectionEnabled;
+    if (!changes.streams) updateStatus();
   }
-  if (changes.protectActiveDownloads) protectActive.checked = changes.protectActiveDownloads.newValue;
+  if (changes.protectActiveDownloads) protectActive.checked = changes.protectActiveDownloads.newValue !== false;
+  if (changes.streams) setStreams(changes.streams.newValue);
 });
 
 // ── Init ────────────────────────────────────────────────────────────────────
 
-load();
-setInterval(load, 2000);
+chrome.storage.local.get({ streams: [], detectionEnabled: true, protectActiveDownloads: true }, (result) => {
+  detectionEnabled = result.detectionEnabled !== false;
+  detectionToggle.checked = detectionEnabled;
+  protectActive.checked = result.protectActiveDownloads !== false;
+  setStreams(result.streams);
+});
+
+// Wake the background so it resumes job polling and fills missing titles.
+sendMessage({ type: 'refresh' }).catch(() => {});

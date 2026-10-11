@@ -50,7 +50,7 @@ fn run_fade(monitor: &Monitor, new_wallpaper_path: &str, settings: &Settings) ->
     let step_duration = total_duration / steps as u32;
 
     let dir = transition_dir()?;
-    let monitor_key = sanitize_for_filename(&monitor.id);
+    let monitor_key = crate::util::safe_file_name(&monitor.id, "");
 
     // Render every frame before showing any, so encoding time doesn't stretch the fade.
     let mut frames = Vec::with_capacity(steps as usize);
@@ -76,13 +76,6 @@ fn run_fade(monitor: &Monitor, new_wallpaper_path: &str, settings: &Settings) ->
     let _ = std::fs::remove_dir_all(&dir);
 
     Ok(())
-}
-
-fn sanitize_for_filename(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 /// Loads an image and renders it at the monitor's size using the configured Fill/Fit mode, so
@@ -136,16 +129,5 @@ mod tests {
 
         let end = blend(&from, &to, 1.0);
         assert_eq!(end.get_pixel(0, 0).0, [200, 200, 200]);
-    }
-}
-
-#[cfg(test)]
-mod name_tests {
-    use super::*;
-
-    #[test]
-    fn monitor_ids_become_safe_file_name_parts() {
-        assert_eq!(sanitize_for_filename(r"\\?\DISPLAY#GSM5B7F#5&1a2b"), "____DISPLAY_GSM5B7F_5_1a2b");
-        assert_eq!(sanitize_for_filename("abc123"), "abc123");
     }
 }
