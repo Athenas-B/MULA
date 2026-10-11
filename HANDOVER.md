@@ -218,6 +218,26 @@ cache-only test creates and removes an empty folder).
 - **Source kinds:** A source's kind is chosen when it is added ("Add folder" vs "Add Wallhaven URL"); nothing is inferred from the path.
 - **Tray menu state:** `MaxLevelMenuState` and `AutostartMenuState` are managed in `lib.rs` setup so tray items stay in sync with the UI.
 
+## Decisions (considered and not pursued)
+
+Recorded so they aren't re-investigated without new facts.
+
+- **Image index / file watchers for folder sources (dropped 2026-10-12).** Idea: keep an index
+  of each folder source, updated by file-system watchers (`notify` crate), instead of walking
+  the folders in `images::load_images` on every wallpaper change and queue preview.
+  Measured with a release build on a synthetic tree of 10,000 files in 250 folders (local NTFS
+  SSD): the first pass, which reads every image's dimensions, took ~500 ms; every later
+  `load_images` took **~19 ms**, of which the folder walk itself was ~14 ms. It is cheap
+  because the walk uses the metadata the directory listing already returns (no per-file open
+  or stat on Windows) and dimensions are cached by size + mtime in `state.json` (unreadable
+  files too, as 0×0). The scan runs at most once per wallpaper change (interval ≥ 1 min,
+  30 min by default) and when the queue preview loads, so an index would save ~15–20 ms per
+  change. The cost would be a new dependency, watchers created/dropped whenever sources
+  change, recovery from dropped events (watcher buffer overflow), and a full-scan fallback
+  anyway. The one slow case, large collections on network shares, is also where watchers are
+  least reliable. Revisit only if real usage shows slow scans; a cheaper first step would be
+  reusing a folder's listing while its directory mtime is unchanged.
+
 ## Next Logical Tasks
 
 1. **Wallpaper-change notifications** — wire `show_wallpaper_change_notifications` to a Windows toast / Tauri notification.
