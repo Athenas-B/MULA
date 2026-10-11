@@ -53,6 +53,19 @@ mod imp {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn startup_command_quotes_the_exe_and_requests_minimized_start() {
+            let command = current_exe_command().unwrap();
+            assert!(command.starts_with('"'), "{command}");
+            assert!(command.ends_with(&format!("\" {AUTOSTART_ARG}")), "{command}");
+            assert!(command.contains(".exe"), "{command}");
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

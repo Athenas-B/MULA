@@ -331,7 +331,8 @@ const ANSI_COLORS = {
 function ansiToHtml(text) {
   let html = "";
   let i = 0;
-  let openSpan = false;
+  // A sequence like ESC[1;31m opens one span per code, so track how many are open.
+  let openSpans = 0;
 
   while (i < text.length) {
     if (text[i] === "\x1b" && text[i + 1] === "[") {
@@ -341,20 +342,18 @@ function ansiToHtml(text) {
       const codes = text.slice(i + 2, j).split(";").map(Number);
       i = j + 1;
 
-      if (openSpan) {
-        html += "</span>";
-        openSpan = false;
-      }
+      html += "</span>".repeat(openSpans);
+      openSpans = 0;
 
       for (const code of codes) {
         if (code === 0) {
           // Reset
         } else if (code === 1) {
           html += '<span style="font-weight:bold">';
-          openSpan = true;
+          openSpans++;
         } else if (ANSI_COLORS[code]) {
           html += `<span style="color:${ANSI_COLORS[code]}">`;
-          openSpan = true;
+          openSpans++;
         }
       }
     } else if (text[i] === "<") {
@@ -372,7 +371,7 @@ function ansiToHtml(text) {
     }
   }
 
-  if (openSpan) html += "</span>";
+  html += "</span>".repeat(openSpans);
   return html;
 }
 
@@ -678,7 +677,7 @@ function extractSelfTestProgress(full) {
     !lowerStatus.includes("no self-test in progress") &&
     !lowerStatus.includes("no selftest in progress");
   const hasFailed = lowerStatus.includes("failed");
-  const progressMatch = status.match(/(\d+)%\s*(?:remaining|left)/i);
+  const progressMatch = status.match(/(\d+)%\s*(?:of\s+test\s+)?(?:remaining|left)/i);
   const progress = progressMatch ? `${progressMatch[1]}% remaining` : null;
   return { status, log, text: `${status}\n\n${log}`, inProgress, hasFailed, progress };
 }
@@ -1393,7 +1392,7 @@ function wcRenderQueueCard(q) {
         img.last_resort ? `<span class="wallchanger-badge last-resort">Last resort</span>` : "",
       ].join("");
       return `<li class="wallchanger-queue-item${img.is_next ? " next" : ""}${img.last_resort ? " last-resort" : ""}">
-        <span class="wallchanger-queue-filename" title="${img.path}">${img.file_name}</span>
+        <span class="wallchanger-queue-filename" title="${escapeHtml(img.path)}">${escapeHtml(img.file_name)}</span>
         ${badges}
       </li>`;
     })
@@ -1404,7 +1403,7 @@ function wcRenderQueueCard(q) {
 
   return `<div class="wallchanger-queue-card">
     <div class="wallchanger-queue-title">
-      <strong>${q.label}</strong>
+      <strong>${escapeHtml(q.label)}</strong>
       <span class="wallchanger-queue-meta">${q.image_count} image(s) &middot; ${q.rotation_mode}${nextHint ? " &middot; " + nextHint : ""}</span>
     </div>
     <ul class="wallchanger-queue-list">${rows}${more}</ul>
@@ -1440,8 +1439,8 @@ function wcRenderMonitorPreview(p) {
       <img src="${p.preview_data_url}" alt="Monitor ${p.monitor_index} preview">
     </div>
     <div class="wallchanger-monitor-preview-meta">
-      <span title="${p.fit}">${p.fit}</span>
-      <span title="${p.wallpaper_path}">Image: ${imageDims}</span>
+      <span title="${escapeHtml(p.fit)}">${escapeHtml(p.fit)}</span>
+      <span title="${escapeHtml(p.wallpaper_path)}">Image: ${imageDims}</span>
     </div>
   </div>`;
 }

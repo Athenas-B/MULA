@@ -128,6 +128,14 @@ cd src-tauri
 cargo check
 cargo test --lib   # includes helper protocol tests that run PowerShell unelevated (no UAC)
 
+# Frontend + browser extension (Node built-in test runner, no npm deps)
+cd ..
+npm test
+
+# VSD server + extension builder (stdlib unittest)
+cd modules/vsd
+$env:PYTHONDONTWRITEBYTECODE=1; python -m unittest discover -s tests -v
+
 # Full debug bundle (MSI + NSIS installer)
 cd ..
 npm run tauri build -- --debug
@@ -136,6 +144,18 @@ npm run tauri build -- --debug
 Debug bundle outputs:
 - `src-tauri/target/debug/bundle/msi/MULA_2.0.0_x64_en-US.msi`
 - `src-tauri/target/debug/bundle/nsis/MULA_2.0.0_x64-setup.exe`
+
+## Tests
+
+| Suite | Location | Notes |
+|---|---|---|
+| Rust | `#[cfg(test)]` modules in `src-tauri/src/**` | Shared helpers in `src-tauri/src/test_support.rs` (`TempDir`, `write_png`). Document a known bug as `#[ignore = "bug: ..."]`. |
+| JavaScript | `tests/js/*.test.js` | Loads the unmodified browser scripts in `node:vm` with stubs (`tests/js/helpers/vm-loader.js`). Document a known bug as `{ todo }`. |
+| Python | `modules/vsd/tests/` | Points `VSD_DOWNLOAD_DIR`/`VSD_LOG_DIR` at temp dirs before importing `server`. Document a known bug as `@unittest.expectedFailure`. |
+
+Unit tests never call the real wallpaper COM API, the network, ffmpeg or UAC. Two Rust tests touch
+`%APPDATA%\mula\wallchanger` (the overlay render test writes one cached image; the Wallhaven
+cache-only test creates and removes an empty folder).
 
 ## Common Issues / Notes
 

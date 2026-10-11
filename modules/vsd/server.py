@@ -74,6 +74,20 @@ def _is_loopback_bind() -> bool:
     return SERVER_HOST in ("127.0.0.1", "localhost", "::1")
 
 
+def _host_without_port(host: str) -> str:
+    host = host.lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[:end + 1] if end != -1 else host
+    return host.rsplit(":", 1)[0]
+
+
+def _json_object() -> dict | None:
+    """The request body as a JSON object, or None if it is missing, invalid or not an object."""
+    data = request.get_json(force=True, silent=True)
+    return data if isinstance(data, dict) else None
+
+
 @app.before_request
 def _reject_untrusted_callers():
     origin = request.headers.get("Origin")
@@ -84,7 +98,7 @@ def _reject_untrusted_callers():
     # Guard against DNS rebinding: a loopback-only server should only ever be
     # addressed by a loopback host name.
     if _is_loopback_bind():
-        host = (request.host or "").rsplit(":", 1)[0].lower()
+        host = _host_without_port(request.host or "")
         if host not in _LOOPBACK_HOSTS:
             logger.warning(f"Rejected request with Host {request.host!r} to {request.path}")
             return jsonify({"error": "Forbidden host"}), 403
@@ -156,6 +170,7 @@ def _fetch(url: str, headers: dict | None = None, retries: int = MAX_RETRIES) ->
         raise ValueError(f"Refusing to fetch non-HTTP URL: {url[:80]}")
     req_headers = {"User-Agent": _DEFAULT_UA, **_clean_headers(headers)}
     req = urllib.request.Request(url, headers=req_headers)
+    retries = max(1, retries)
 
     last_err = None
     for attempt in range(1, retries + 1):
@@ -185,8 +200,10 @@ def _sanitize_filename(title: str, max_len: int = 80) -> str:
     if not title:
         return ""
     name = re.sub(r'[<>:"/\\|?*]', "_", title)
+    # Whitespace (incl. tabs/newlines) separates words; \x1c-\x1f also count as
+    # whitespace in Python but are control characters, so they are dropped instead.
+    name = re.sub(r"[^\S\x1c-\x1f]+", "_", name)
     name = re.sub(r"[\x00-\x1f]", "", name)
-    name = re.sub(r"\s+", "_", name)
     name = name.strip(" ._")
     if len(name) > max_len:
         name = name[:max_len].rsplit("_", 1)[0]
@@ -313,6 +330,7 @@ def _run_download(job_id: str, url: str, title: str, headers: dict | None, raw_m
     safe_title = _sanitize_filename(title)
     logger.info(f"Job {job_id}: starting download — {safe_title or url[:80]}")
 
+    tmpdir = None
     try:
         tmpdir = Path(tempfile.mkdtemp(prefix=f"vsd_{job_id}_"))
 
@@ -338,9 +356,6 @@ def _run_download(job_id: str, url: str, title: str, headers: dict | None, raw_m
         metadata = _build_metadata(title, raw_metadata)
         _mux_with_ffmpeg(seg_files, output_path, metadata)
 
-        # Cleanup temp
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
         # Auto-open if configured
         if AUTO_OPEN:
             _open_file(output_path)
@@ -358,6 +373,9 @@ def _run_download(job_id: str, url: str, title: str, headers: dict | None, raw_m
     except Exception as e:
         logger.error(f"Job {job_id}: failed — {e}")
         _set_job(job_id, status="error", stage="error", error=str(e), finished_at=time())
+    finally:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
@@ -373,7 +391,9 @@ def health():
 
 @app.route("/download", methods=["POST"])
 def download():
-    data = request.get_json(force=True)
+    data = _json_object()
+    if data is None:
+        return jsonify({"error": "Expected a JSON object"}), 400
     url = data.get("url")
     if not url:
         return jsonify({"error": "Missing 'url' field"}), 400
@@ -429,7 +449,9 @@ def get_logs():
 
 @app.route("/open", methods=["POST"])
 def open_file_endpoint():
-    data = request.get_json(force=True)
+    data = _json_object()
+    if data is None:
+        return jsonify({"error": "Expected a JSON object"}), 400
     file_path = data.get("path")
     if not file_path:
         return jsonify({"error": "Missing 'path' field"}), 400
@@ -465,7 +487,9 @@ def config_download_dir():
     if request.headers.get("Origin") is not None:
         return jsonify({"error": "The download directory can only be changed from MULA"}), 403
 
-    data = request.get_json(force=True)
+    data = _json_object()
+    if data is None:
+        return jsonify({"error": "Expected a JSON object"}), 400
     new_dir = data.get("path")
     if not new_dir:
         return jsonify({"error": "Missing 'path' field"}), 400

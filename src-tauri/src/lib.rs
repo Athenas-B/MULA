@@ -259,52 +259,42 @@ fn vsd_get_logs() -> Vec<String> {
 
 /// Read a key from vsd.conf
 fn read_vsd_config_value(key: &str) -> Option<String> {
-    let config_path = get_config_dir().join("vsd.conf");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            let prefix = format!("{key}=");
-            for line in content.lines() {
-                if let Some(val) = line.strip_prefix(&prefix) {
-                    return Some(val.trim().to_string());
-                }
-            }
-        }
-    }
-    None
+    read_config_value_at(&get_config_dir().join("vsd.conf"), key)
 }
 
 /// Write a key=value to vsd.conf (update if exists, append if not)
 fn write_vsd_config_value(key: &str, value: &str) -> Result<(), String> {
-    let config_path = get_config_dir().join("vsd.conf");
-    let config_dir = config_path.parent().unwrap();
-    std::fs::create_dir_all(config_dir)
-        .map_err(|e| format!("Failed to create config dir: {e}"))?;
+    write_config_value_at(&get_config_dir().join("vsd.conf"), key, value)
+}
 
-    let mut lines: Vec<String> = if config_path.exists() {
-        std::fs::read_to_string(&config_path)
-            .unwrap_or_default()
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        vec![]
-    };
+fn read_config_value_at(config_path: &Path, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let prefix = format!("{key}=");
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(|val| val.trim().to_string()))
+}
+
+fn write_config_value_at(config_path: &Path, key: &str, value: &str) -> Result<(), String> {
+    if let Some(config_dir) = config_path.parent() {
+        std::fs::create_dir_all(config_dir)
+            .map_err(|e| format!("Failed to create config dir: {e}"))?;
+    }
+
+    let mut lines: Vec<String> = std::fs::read_to_string(config_path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
 
     let new_line = format!("{key}={value}");
     let prefix = format!("{key}=");
-    let mut found = false;
-    for line in lines.iter_mut() {
-        if line.starts_with(&prefix) {
-            *line = new_line.clone();
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        lines.push(new_line);
+    match lines.iter_mut().find(|line| line.starts_with(&prefix)) {
+        Some(line) => *line = new_line,
+        None => lines.push(new_line),
     }
 
-    std::fs::write(&config_path, lines.join("\n") + "\n")
+    std::fs::write(config_path, lines.join("\n") + "\n")
         .map_err(|e| format!("Failed to write config: {e}"))?;
     Ok(())
 }
@@ -475,6 +465,10 @@ pub struct DriveInfo {
     is_system: bool,
 }
 
+fn holds_system_drive(drive_letters: &[String], system_letter: &str) -> bool {
+    drive_letters.iter().any(|l| l.eq_ignore_ascii_case(system_letter))
+}
+
 /// The drive letter Windows is running from, e.g. "C:".
 fn system_drive_letter() -> String {
     std::env::var("SystemDrive")
@@ -576,7 +570,24 @@ fn guess_vendor_from_model(model: &str) -> Option<String> {
         "WDS" => "Western Digital",
         "T253" => "Team",
         "NM" | "NQ" | "NS" => "Lexar",
-        _ => return None,
+        _ => {
+            // Some vendor prefixes are followed directly by more letters ("SA400S37240G",
+            // "MTFDDAK256TBN"), so the leading letter run never equals them: match by prefix.
+            const LONG_PREFIXES: &[(&str, &str)] = &[
+                ("SA400", "Kingston"),
+                ("MTFD", "Micron"),
+                ("SDSS", "SanDisk"),
+                ("THNS", "Toshiba"),
+                ("SSDPE", "Intel"),
+                ("CSSD", "Corsair"),
+                ("T253", "Team"),
+                ("SKHYNIX", "SK hynix"),
+            ];
+            return LONG_PREFIXES
+                .iter()
+                .find(|(prefix, _)| first_token.starts_with(prefix))
+                .map(|(_, vendor)| vendor.to_string());
+        }
     };
     Some(vendor.to_string())
 }
@@ -849,8 +860,7 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
         }
 
         let drive_letters = value_to_strings(d.drive_letters);
-        let system_letter = system_drive_letter();
-        let is_system = drive_letters.iter().any(|l| l.eq_ignore_ascii_case(&system_letter));
+        let is_system = holds_system_drive(&drive_letters, &system_drive_letter());
 
         result.push(DriveInfo {
             id: d.device_id.clone(),
@@ -1054,7 +1064,12 @@ fn parse_smartctl_scan(smartctl: &std::path::Path) -> Result<Vec<(u32, String, S
         return Err(format!("smartctl --scan failed: {}", stderr.trim()));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_smartctl_scan_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parses `smartctl --scan` lines such as `/dev/sda -d ata # /dev/sda, ATA device` into
+/// (physical drive number, device, device type).
+fn parse_smartctl_scan_output(stdout: &str) -> Vec<(u32, String, String)> {
     let mut devices = Vec::new();
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1067,7 +1082,7 @@ fn parse_smartctl_scan(smartctl: &std::path::Path) -> Result<Vec<(u32, String, S
             devices.push((number, device, dtype));
         }
     }
-    Ok(devices)
+    devices
 }
 
 fn run_smartctl(smartctl: &std::path::Path, args: &[&str]) -> Result<(String, String, i32), String> {
@@ -1090,7 +1105,8 @@ fn parse_smartctl_serial(stdout: &str) -> Option<String> {
         if let Some(idx) = lower.find("serial number") {
             let after = &line[idx + "serial number".len()..];
             let after = after.trim_start_matches(':').trim();
-            if !after.is_empty() && after != "[no information found]" && after != "unknown" {
+            let placeholder = after.eq_ignore_ascii_case("[no information found]") || after.eq_ignore_ascii_case("unknown");
+            if !after.is_empty() && !placeholder {
                 return Some(after.to_string());
             }
         }
@@ -1362,6 +1378,10 @@ try {
 }
 "#;
 
+fn format_script_for(device_id: &str) -> String {
+    FORMAT_SCRIPT.replace("__DEVICE_ID__", &device_id.replace('\'', "''"))
+}
+
 #[tauri::command]
 async fn format_drive(id: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -1377,8 +1397,7 @@ async fn format_drive(id: String) -> Result<String, String> {
             ));
         }
 
-        let script = FORMAT_SCRIPT.replace("__DEVICE_ID__", &drive.device_id.replace('\'', "''"));
-        let result = elevated_helper::run_elevated_script(&script);
+        let result = elevated_helper::run_elevated_script(&format_script_for(&drive.device_id));
         match &result {
             Ok(msg) => log::info!("format_drive {}: {msg}", drive.device_id),
             Err(e) => log::error!("format_drive {} failed: {e}", drive.device_id),
@@ -1600,4 +1619,248 @@ pub fn run() {
             shutdown();
         }
     });
+}
+
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn vendor_is_parsed_from_pnp_device_ids() {
+        assert_eq!(
+            parse_vendor_from_pnp(r"SCSI\DISK&VEN_WDC&PROD_WD3003FZEX-00Z4S\4&1A2B&0&000000").as_deref(),
+            Some("WDC")
+        );
+        assert_eq!(parse_vendor_from_pnp(r"SCSI\DISK&VEN_SAMSUNG\X").as_deref(), Some("SAMSUNG"));
+        assert_eq!(parse_vendor_from_pnp(r"SCSI\DISK&VEN_&PROD_X"), None);
+        assert_eq!(parse_vendor_from_pnp(r"USBSTOR\DISK&PROD_X"), None);
+        assert_eq!(parse_vendor_from_pnp(""), None);
+    }
+
+    #[test]
+    fn bus_and_controller_names_are_not_vendors() {
+        for not_vendor in ["NVMe", "scsi", " USB ", "Microsoft", "VMware", "", "   "] {
+            assert!(!is_real_vendor(not_vendor), "{not_vendor:?} should not count as a vendor");
+        }
+        for vendor in ["WDC", "Samsung", "Kingston"] {
+            assert!(is_real_vendor(vendor), "{vendor:?} should count as a vendor");
+        }
+    }
+
+    #[test]
+    fn vendor_is_guessed_from_common_model_strings() {
+        let cases = [
+            ("Samsung SSD 970 EVO Plus 1TB", Some("Samsung")),
+            ("INTEL SSDPEKNW512G8", Some("Intel")),
+            ("KINGSTON SA400S37240G", Some("Kingston")),
+            ("ST2000DM008-2FR102", Some("Seagate")),
+            ("WDC WD3003FZEX-00Z4SA0", Some("Western Digital")),
+            ("WDS500G2B0A-00SM50", Some("Western Digital")),
+            ("CT1000MX500SSD1", Some("Crucial")),
+            ("HFS512GD9TNG-L2A0A", Some("SK hynix")),
+            ("TS256GSSD230S", Some("Transcend")),
+            ("HUS724040ALE640", Some("HGST")),
+            ("PNY CS900 240GB", Some("PNY")),
+            ("Generic Flash Disk", None),
+            ("", None),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(guess_vendor_from_model(model).as_deref(), expected, "model {model:?}");
+        }
+    }
+
+    #[test]
+    fn vendor_is_guessed_from_model_prefixes_followed_by_more_letters() {
+        assert_eq!(guess_vendor_from_model("SA400S37240G").as_deref(), Some("Kingston"));
+        assert_eq!(guess_vendor_from_model("MTFDDAK256TBN").as_deref(), Some("Micron"));
+        assert_eq!(guess_vendor_from_model("SDSSDA-240G").as_deref(), Some("SanDisk"));
+        assert_eq!(guess_vendor_from_model("THNSN5256GPUK").as_deref(), Some("Toshiba"));
+    }
+
+    #[test]
+    fn byte_sizes_are_formatted_with_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023.00 B");
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(500 * 1024 * 1024 * 1024), "500.00 GB");
+        assert_eq!(format_bytes(1_500_000_000_000), "1.36 TB");
+        assert_eq!(format_bytes(u64::MAX), "16384.00 PB");
+    }
+
+    #[test]
+    fn bitrates_are_formatted_with_decimal_units() {
+        assert_eq!(format_bitrate(0), "Unknown");
+        assert_eq!(format_bitrate(999), "999.00 bps");
+        assert_eq!(format_bitrate(6_000_000_000), "6.00 Gbps");
+        assert_eq!(format_bitrate(1_500_000), "1.50 Mbps");
+    }
+
+    #[test]
+    fn connection_speed_is_inferred_from_bus_or_interface() {
+        assert_eq!(infer_connection_speed("NVMe", "SCSI"), "PCIe (varies by generation)");
+        assert_eq!(infer_connection_speed("SATA", ""), "Up to 6 Gbps (SATA 6 Gb/s)");
+        assert_eq!(infer_connection_speed("SAS", ""), "Up to 12 Gbps (SAS 12 Gb/s)");
+        assert_eq!(infer_connection_speed("Unknown", "USB"), "USB (varies by port)");
+        assert_eq!(infer_connection_speed("", "IDE"), "Up to 133 MB/s (PATA)");
+        assert_eq!(infer_connection_speed("", "SCSI"), "SCSI (varies by generation)");
+        assert_eq!(infer_connection_speed("", ""), "Unknown");
+    }
+
+    #[test]
+    fn physical_drive_numbers_are_extracted_from_device_ids() {
+        assert_eq!(extract_physical_drive_number(r"\\.\PHYSICALDRIVE2"), Ok(2));
+        assert_eq!(extract_physical_drive_number(r"\\.\physicaldrive13"), Ok(13));
+        assert_eq!(extract_physical_drive_number("PHYSICALDRIVE0"), Ok(0));
+        assert!(extract_physical_drive_number("C:").is_err());
+        assert!(extract_physical_drive_number(r"\\.\PHYSICALDRIVEX").is_err());
+        assert!(extract_physical_drive_number(r"\\.\PHYSICALDRIVE").is_err());
+    }
+
+    #[test]
+    fn smartctl_device_names_map_to_physical_drive_numbers() {
+        assert_eq!(sd_letter_to_number("a"), 0);
+        assert_eq!(sd_letter_to_number("z"), 25);
+        assert_eq!(sd_letter_to_number("aa"), 26);
+
+        assert_eq!(physical_number_from_device("/dev/sda"), Some(0));
+        assert_eq!(physical_number_from_device("/dev/sdc"), Some(2));
+        assert_eq!(physical_number_from_device("/dev/hdb"), Some(1));
+        assert_eq!(physical_number_from_device("/dev/pd3"), Some(3));
+        assert_eq!(physical_number_from_device("pd7"), Some(7));
+        assert_eq!(physical_number_from_device(r"\\.\PhysicalDrive4"), Some(4));
+        assert_eq!(physical_number_from_device("/dev/nvme0"), None);
+        assert_eq!(physical_number_from_device("/dev/csmi0,1"), None);
+    }
+
+    #[test]
+    fn smartctl_scan_output_is_parsed() {
+        let output = "\
+/dev/sda -d ata # /dev/sda, ATA device
+/dev/nvme0 -d nvme # /dev/nvme0, NVMe device
+/dev/sdb -d sat # /dev/sdb [SAT], ATA device
+/dev/sdc -d scsi
+garbage line
+";
+        assert_eq!(
+            parse_smartctl_scan_output(output),
+            vec![
+                (0, "/dev/sda".to_string(), "ata".to_string()),
+                (1, "/dev/sdb".to_string(), "sat".to_string()),
+            ]
+        );
+        assert!(parse_smartctl_scan_output("").is_empty());
+    }
+
+    #[test]
+    fn serial_numbers_are_read_from_smartctl_info() {
+        let ata = "Device Model:     WDC WD3003FZEX\nSerial Number:    WD-WCC4N1234567\nFirmware Version: 01.01A01\n";
+        assert_eq!(parse_smartctl_serial(ata).as_deref(), Some("WD-WCC4N1234567"));
+
+        let nvme = "Model Number:                       Samsung SSD 970\nSerial Number:                      S4EWNX0N123456\n";
+        assert_eq!(parse_smartctl_serial(nvme).as_deref(), Some("S4EWNX0N123456"));
+
+        assert_eq!(parse_smartctl_serial("Model: X\n"), None);
+        assert_eq!(parse_smartctl_serial("Serial Number:\n"), None);
+    }
+
+    #[test]
+    fn smartctl_placeholder_serial_is_ignored() {
+        assert_eq!(parse_smartctl_serial("Serial Number:    [No Information Found]\n"), None);
+    }
+
+    #[test]
+    fn serials_are_normalized_for_comparison() {
+        assert_eq!(normalize_serial("  WD-ABC 123. "), "wd-abc123");
+        assert_eq!(normalize_serial("S4EWNX0N123456"), normalize_serial("s4ewnx0n123456"));
+    }
+
+    #[test]
+    fn drive_ids_are_made_safe_for_folder_names() {
+        assert_eq!(sanitize_for_path(r"\\.\PHYSICALDRIVE0"), "____PHYSICALDRIVE0");
+        assert_eq!(sanitize_for_path("abc-1_2"), "abc-1_2");
+    }
+
+    #[test]
+    fn only_known_self_test_types_are_accepted() {
+        for t in ["short", "long", "conveyance", "offline"] {
+            assert!(validate_test_type(t).is_ok(), "{t}");
+        }
+        for t in ["", "SHORT", "short; rm", "select,0-10", "-a"] {
+            assert!(validate_test_type(t).is_err(), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn system_disk_is_detected_from_its_drive_letters() {
+        let letters = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(holds_system_drive(&letters(&["D:", "C:"]), "C:"));
+        assert!(holds_system_drive(&letters(&["c:"]), "C:"));
+        assert!(!holds_system_drive(&letters(&["D:"]), "C:"));
+        assert!(!holds_system_drive(&[], "C:"));
+    }
+
+    #[test]
+    fn system_drive_letter_has_no_trailing_backslash() {
+        let letter = system_drive_letter();
+        assert!(letter.ends_with(':'), "{letter}");
+        assert_eq!(letter, letter.to_uppercase());
+    }
+
+    #[test]
+    fn config_values_are_read_and_written() {
+        let dir = TempDir::new("vsdconf");
+        let path = dir.join("nested").join("vsd.conf");
+
+        assert_eq!(read_config_value_at(&path, "VSD_AUTOSTART"), None);
+
+        write_config_value_at(&path, "VSD_DOWNLOAD_DIR", r"D:\Videos").unwrap();
+        write_config_value_at(&path, "VSD_AUTOSTART", "true").unwrap();
+        assert_eq!(read_config_value_at(&path, "VSD_DOWNLOAD_DIR").as_deref(), Some(r"D:\Videos"));
+        assert_eq!(read_config_value_at(&path, "VSD_AUTOSTART").as_deref(), Some("true"));
+
+        // Updating a key rewrites it in place and keeps the other lines.
+        write_config_value_at(&path, "VSD_AUTOSTART", "false").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "VSD_DOWNLOAD_DIR=D:\\Videos\nVSD_AUTOSTART=false\n"
+        );
+    }
+
+    #[test]
+    fn config_keys_do_not_match_by_prefix_and_values_may_contain_equals() {
+        let dir = TempDir::new("vsdconf2");
+        let path = dir.join("vsd.conf");
+        std::fs::write(&path, "VSD_DOWNLOAD_DIR_OLD=x\nURL=http://a/?b=c \n").unwrap();
+
+        assert_eq!(read_config_value_at(&path, "VSD_DOWNLOAD_DIR"), None);
+        assert_eq!(read_config_value_at(&path, "URL").as_deref(), Some("http://a/?b=c"));
+    }
+
+    #[test]
+    fn python_from_a_local_venv_is_preferred() {
+        let dir = TempDir::new("venv");
+        let system = get_python_command(dir.path());
+        assert!(system == Path::new("python") || system == Path::new("python3"));
+
+        let venv_python = if cfg!(target_os = "windows") {
+            dir.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            dir.join(".venv").join("bin").join("python")
+        };
+        std::fs::create_dir_all(venv_python.parent().unwrap()).unwrap();
+        std::fs::write(&venv_python, b"").unwrap();
+        assert_eq!(get_python_command(dir.path()), venv_python);
+    }
+
+    #[test]
+    fn format_script_targets_only_the_requested_disk_and_guards_the_system_disk() {
+        assert!(FORMAT_SCRIPT.contains("$disk.IsSystem -or $disk.IsBoot"));
+        assert!(FORMAT_SCRIPT.contains("Initialize-Disk"), "Clear-Disk leaves the disk RAW");
+        let script = format_script_for(r"\\.\PHYSICALDRIVE1'; Remove-Item C:\");
+        assert!(script.contains(r"$deviceId = '\\.\PHYSICALDRIVE1''; Remove-Item C:\'"));
+    }
 }

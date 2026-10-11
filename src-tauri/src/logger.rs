@@ -133,3 +133,45 @@ pub fn log_message(level: &str, message: &str) {
     };
     log::log!(level, "{}", message);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_are_formatted_with_timestamp_level_and_message() {
+        let line = format_record(&Record::builder().args(format_args!("disk {} ok", 3)).level(Level::Warn).build());
+        assert!(line.ends_with("] [WARN] disk 3 ok"), "{line}");
+        assert!(line.starts_with('['));
+        // [YYYY-MM-DD HH:MM:SS.mmm]
+        assert_eq!(line.find(']'), Some(24));
+    }
+
+    #[test]
+    fn log_lines_are_written_one_per_line_creating_folders() {
+        let dir = crate::test_support::TempDir::new("logger");
+        let path = dir.join("logs").join("mula.log");
+        let lines: VecDeque<String> = ["first".to_string(), "second".to_string()].into();
+        write_log_lines(&path, &lines).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+
+        // Rewrites replace the file instead of appending.
+        write_log_lines(&path, &VecDeque::from(["only".to_string()])).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "only\n");
+    }
+
+    #[test]
+    fn only_info_and_more_severe_records_are_enabled() {
+        let logger = AppLogger { sender: Mutex::new(None) };
+        let meta = |level| Metadata::builder().level(level).build();
+        assert!(logger.enabled(&meta(Level::Error)));
+        assert!(logger.enabled(&meta(Level::Info)));
+        assert!(!logger.enabled(&meta(Level::Debug)));
+    }
+
+    #[test]
+    fn log_file_lives_in_the_mula_logs_folder() {
+        let path = log_path();
+        assert!(path.ends_with(Path::new("mula").join("logs").join("mula.log")));
+    }
+}

@@ -27,3 +27,6 @@ dist-ssr
 modules/vsd/.env
 modules/vsd/logs/
 modules/vsd/extension/dist/
+
+# Python
+__pycache__/

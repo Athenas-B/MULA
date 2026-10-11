@@ -468,3 +468,162 @@ mod tests {
         assert_eq!(combined.queue_states[0].next_index, 12);
     }
 }
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn defaults() -> Settings {
+        serde_json::from_str("{}").unwrap()
+    }
+
+    fn source(path: &str) -> Source {
+        serde_json::from_value(serde_json::json!({ "path": path })).unwrap()
+    }
+
+    #[test]
+    fn an_empty_file_yields_the_documented_defaults() {
+        let s = defaults();
+        assert_eq!(s.interval_minutes, 30);
+        assert_eq!(s.maximum_source_level, 10);
+        assert_eq!(s.picture_name_overlay_font_size, 28);
+        assert_eq!(s.wallpaper_fade_duration_ms, 600);
+        assert_eq!(s.wallpaper_fade_steps, 12);
+        assert_eq!(s.background_color_argb as u32, 0xFF00_0000);
+        assert_eq!(s.picture_name_overlay_text_color_argb as u32, 0xFFFF_FFFF);
+        assert!(s.use_separate_monitor_queues);
+        assert!(s.include_subfolders);
+        assert!(s.enable_wallpaper_fade_transition);
+        assert!(s.disable_windows_slideshow_when_running);
+        assert!(!s.change_service_running);
+        assert!(matches!(s.rotation_mode, RotationMode::Random));
+        assert!(matches!(s.scaling_mode, ScalingMode::Fill));
+    }
+
+    #[test]
+    fn new_sources_default_to_enabled_level_5_with_subfolders() {
+        let s = source("C:/Pics");
+        assert!(s.enabled && s.include_subfolders);
+        assert_eq!(s.level, 5);
+        assert_eq!(s.wallhaven_page_limit, 1);
+    }
+
+    #[test]
+    fn enums_use_the_pascal_case_names_the_ui_sends() {
+        let s: Settings = serde_json::from_str(
+            r#"{"rotation_mode": "Sequence", "scaling_mode": "FitInsideScreen",
+                "too_small_picture_handling": "UseOnlyAsLastResort",
+                "picture_name_overlay_text_mode": "FolderAndFileName"}"#,
+        )
+        .unwrap();
+        assert!(matches!(s.rotation_mode, RotationMode::Sequence));
+        assert!(matches!(s.too_small_picture_handling, PictureSizeHandling::UseOnlyAsLastResort));
+
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["scaling_mode"], "FitInsideScreen");
+        assert_eq!(json["picture_name_overlay_text_mode"], "FolderAndFileName");
+        assert!(serde_json::from_str::<Settings>(r#"{"rotation_mode": "sequence"}"#).is_err());
+    }
+
+    #[test]
+    fn numeric_settings_are_clamped_into_range() {
+        let mut s = defaults();
+        s.interval_minutes = 0;
+        s.maximum_source_level = 42;
+        s.picture_name_overlay_font_size = -3;
+        s.wallpaper_fade_duration_ms = -1;
+        s.wallpaper_fade_steps = 0;
+        s.sequence_offset = -2;
+        s.next_monitor_change_index = -7;
+        normalize(&mut s);
+        assert_eq!(s.interval_minutes, 1);
+        assert_eq!(s.maximum_source_level, 10);
+        assert_eq!(s.picture_name_overlay_font_size, 1);
+        assert_eq!(s.wallpaper_fade_duration_ms, 0);
+        assert_eq!(s.wallpaper_fade_steps, 1);
+        assert_eq!(s.sequence_offset, 0);
+        assert_eq!(s.next_monitor_change_index, 0);
+
+        s.interval_minutes = 99_999;
+        s.maximum_source_level = 0;
+        normalize(&mut s);
+        assert_eq!(s.interval_minutes, 1440);
+        assert_eq!(s.maximum_source_level, 1);
+    }
+
+    #[test]
+    fn sources_are_trimmed_clamped_and_empty_ones_dropped() {
+        let mut s = defaults();
+        let mut a = source("  C:/Pics  ");
+        a.level = 99;
+        a.wallhaven_page_limit = -4;
+        s.source_folders = vec![a, source("   "), source("")];
+        normalize(&mut s);
+
+        assert_eq!(s.source_folders.len(), 1);
+        let a = &s.source_folders[0];
+        assert_eq!(a.path, "C:/Pics");
+        assert_eq!(a.level, 10);
+        assert_eq!(a.wallhaven_page_limit, 0, "negative page limits become 0 (unlimited)");
+    }
+
+    #[test]
+    fn wallhaven_purity_is_normalized_to_three_flags() {
+        for (input, expected) in [("100", "100"), ("011", "011"), ("111", "111"), ("000", "100"), ("", "110"), ("abc", "110"), ("1100", "110"), (" 010 ", "010")] {
+            let mut s = defaults();
+            let mut src = source("https://wallhaven.cc/search?q=x");
+            src.wallhaven_purity = input.into();
+            s.source_folders = vec![src];
+            normalize(&mut s);
+            assert_eq!(s.source_folders[0].wallhaven_purity, expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn api_key_is_trimmed_and_disabled_when_empty() {
+        let mut s = defaults();
+        s.wallhaven_api_key = "  KEY  ".into();
+        s.use_wallhaven_api_key = true;
+        normalize(&mut s);
+        assert_eq!(s.wallhaven_api_key, "KEY");
+        assert!(s.use_wallhaven_api_key);
+
+        s.wallhaven_api_key = "   ".into();
+        normalize(&mut s);
+        assert!(!s.use_wallhaven_api_key);
+    }
+
+    #[test]
+    fn queue_state_is_sanitized() {
+        let mut s = defaults();
+        s.queue_states = vec![QueueState { next_index: -3, ordered_image_paths: vec!["a.jpg".into(), String::new()], ..Default::default() }];
+        normalize(&mut s);
+        assert_eq!(s.queue_states[0].next_index, 0);
+        assert_eq!(s.queue_states[0].ordered_image_paths, ["a.jpg"]);
+    }
+
+    #[test]
+    fn runtime_state_round_trips_through_settings() {
+        let mut s = defaults();
+        s.change_service_running = true;
+        s.next_monitor_change_index = 2;
+        s.image_cache_entries = vec![ImageCacheEntry { path: "a.jpg".into(), width: 10, height: 5, ..Default::default() }];
+
+        let mut restored = defaults();
+        RuntimeState::from_settings(&s).apply_to(&mut restored);
+        assert!(restored.change_service_running);
+        assert_eq!(restored.next_monitor_change_index, 2);
+        assert_eq!(restored.image_cache_entries[0].width, 10);
+    }
+
+    #[test]
+    fn atomic_writes_replace_existing_files_and_leave_no_temp_file() {
+        let dir = TempDir::new("atomic");
+        let path = dir.join("sub").join("settings.json");
+        write_atomic(&path, "{\"a\":1}").unwrap();
+        write_atomic(&path, "{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+}

@@ -228,3 +228,50 @@ mod tests {
         assert_eq!(*out.get_pixel(50, 95), BG, "bottom band is letterbox");
     }
 }
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn previews_keep_the_monitor_aspect_within_the_size_limit() {
+        assert_eq!(preview_dimensions(1920, 1080), (420, 236));
+        assert_eq!(preview_dimensions(3440, 1440), (420, 176));
+        assert_eq!(preview_dimensions(1080, 1920), (158, 280));
+        assert_eq!(preview_dimensions(1500, 1000), (420, 280));
+    }
+
+    #[test]
+    fn small_or_degenerate_monitors_are_never_upscaled_or_zero_sized() {
+        assert_eq!(preview_dimensions(100, 50), (100, 50));
+        assert_eq!(preview_dimensions(0, 0), (1, 1));
+        assert_eq!(preview_dimensions(-5, 10), (1, 10));
+    }
+
+    #[test]
+    fn placeholders_use_the_background_color() {
+        let img = render_placeholder(1920, 1080, 0xFF10_2030u32 as i32);
+        assert_eq!(img.dimensions(), (420, 236));
+        assert_eq!(*img.get_pixel(0, 0), Rgba([0x10, 0x20, 0x30, 0xFF]));
+    }
+
+    #[test]
+    fn previews_are_encoded_as_png_data_urls() {
+        let url = png_data_url(&RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255]))).unwrap();
+        let b64 = url.strip_prefix("data:image/png;base64,").expect("png data url prefix");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn wallpaper_previews_report_the_image_size_and_fit() {
+        let dir = crate::test_support::TempDir::new("preview");
+        let file = crate::test_support::write_png(&dir.join("w.png"), 800, 200);
+        let (w, h, fit, img) =
+            render_wallpaper_preview(&file.to_string_lossy(), 1920, 1080, &ScalingMode::FitInsideScreen, 0xFF00_0000u32 as i32).unwrap();
+        assert_eq!((w, h), (800, 200));
+        assert!(fit.starts_with("Fit"));
+        assert_eq!(img.dimensions(), (420, 236));
+        assert!(render_wallpaper_preview("missing.png", 10, 10, &ScalingMode::Fill, 0).is_err());
+    }
+}

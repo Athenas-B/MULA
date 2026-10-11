@@ -313,23 +313,30 @@ fn build_api_url(input: &str, api_key: Option<&str>, page: u32, purity: &str) ->
 }
 
 fn set_or_append_param(url: &mut String, key: &str, value: &str) {
-    if url.contains(&format!("{key}=")) {
-        let prefix = format!("{key}=");
-        if let Some(start) = url.find(&prefix) {
-            let rest = &url[start + prefix.len()..];
-            let end = rest.find('&').map(|i| start + prefix.len() + i).unwrap_or(url.len());
-            url.replace_range(start + prefix.len()..end, value);
-            return;
-        }
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base.to_string(), query.to_string()),
+        None => (url.clone(), String::new()),
+    };
+
+    let mut found = false;
+    let mut params: Vec<String> = query
+        .split('&')
+        .filter(|param| !param.is_empty())
+        .map(|param| {
+            let name = param.split('=').next().unwrap_or_default();
+            if !found && name == key {
+                found = true;
+                format!("{key}={value}")
+            } else {
+                param.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        params.push(format!("{key}={value}"));
     }
-    if url.contains('?') {
-        url.push('&');
-    } else {
-        url.push('?');
-    }
-    url.push_str(key);
-    url.push('=');
-    url.push_str(value);
+
+    *url = format!("{base}?{}", params.join("&"));
 }
 
 /// Downloads `url` into `dir` unless a valid copy is already there. Downloads go to a `.part`
@@ -439,5 +446,152 @@ mod tests {
         // Without a manifest, partial downloads are never picked up.
         assert_eq!(cached_files(&dir, None), vec![dir.join("a.jpg")]);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    fn source(path: &str) -> Source {
+        serde_json::from_value(serde_json::json!({ "path": path })).unwrap()
+    }
+
+    fn settings() -> Settings {
+        serde_json::from_str("{}").unwrap()
+    }
+
+    #[test]
+    fn only_http_urls_on_wallhaven_count_as_wallhaven_sources() {
+        assert!(is_wallhaven_url("https://wallhaven.cc/search?q=forest"));
+        assert!(is_wallhaven_url("  HTTP://WALLHAVEN.CC/api/v1/search  "));
+        assert!(!is_wallhaven_url(r"C:\Pictures\wallhaven.cc"));
+        assert!(!is_wallhaven_url("https://example.com/search?q=x"));
+        assert!(!is_wallhaven_url(""));
+    }
+
+    #[test]
+    fn query_parameters_are_replaced_or_appended() {
+        let mut url = "https://w/api?q=a&page=1".to_string();
+        set_or_append_param(&mut url, "page", "2");
+        assert_eq!(url, "https://w/api?q=a&page=2");
+
+        let mut url = "https://w/api?page=1&q=a".to_string();
+        set_or_append_param(&mut url, "page", "3");
+        assert_eq!(url, "https://w/api?page=3&q=a");
+
+        let mut url = "https://w/api?q=a".to_string();
+        set_or_append_param(&mut url, "purity", "100");
+        assert_eq!(url, "https://w/api?q=a&purity=100");
+
+        let mut url = "https://w/api".to_string();
+        set_or_append_param(&mut url, "page", "1");
+        assert_eq!(url, "https://w/api?page=1");
+    }
+
+    #[test]
+    fn query_parameters_match_whole_names_only() {
+        let mut url = "https://w/api?per_page=24".to_string();
+        set_or_append_param(&mut url, "page", "2");
+        assert_eq!(url, "https://w/api?per_page=24&page=2");
+    }
+
+    #[test]
+    fn api_urls_are_completed_with_scheme_purity_page_and_key() {
+        assert_eq!(
+            build_api_url("wallhaven.cc/api/v1/search?q=a", None, 1, "100").unwrap(),
+            "https://wallhaven.cc/api/v1/search?q=a&purity=100&page=1"
+        );
+        assert_eq!(
+            build_api_url("https://wallhaven.cc/search?", None, 2, "110").unwrap(),
+            "https://wallhaven.cc/api/v1/search?purity=110&page=2"
+        );
+        assert_eq!(
+            build_api_url("https://wallhaven.cc/api/v1/search?apikey=old&page=9", Some("new"), 1, "111").unwrap(),
+            "https://wallhaven.cc/api/v1/search?apikey=new&page=1&purity=111"
+        );
+    }
+
+    #[test]
+    fn downloaded_file_names_are_sanitized() {
+        assert_eq!(sanitize_filename("wallhaven-abc123.jpg"), "wallhaven-abc123.jpg");
+        assert_eq!(sanitize_filename("a b?c/..\\d.png"), "a_b_c_.._d.png");
+        assert_eq!(sanitize_filename(""), "image.jpg");
+    }
+
+    #[test]
+    fn the_query_signature_changes_with_everything_that_affects_results() {
+        let s = settings();
+        let base = source("https://wallhaven.cc/search?q=x");
+        let sig = query_signature(&base, &s);
+        assert_eq!(sig, query_signature(&source("  https://wallhaven.cc/search?q=x  "), &s), "whitespace is ignored");
+
+        let mut purity = base.clone();
+        purity.wallhaven_purity = "111".into();
+        let mut pages = base.clone();
+        pages.wallhaven_page_limit = 0;
+        let mut keyed = s.clone();
+        keyed.use_wallhaven_api_key = true;
+        keyed.wallhaven_api_key = "k".into();
+
+        assert_ne!(query_signature(&purity, &s), sig);
+        assert_ne!(query_signature(&pages, &s), sig);
+        assert_ne!(query_signature(&base, &keyed), sig);
+        assert!(!query_signature(&base, &keyed).contains("=k|") && !query_signature(&base, &keyed).ends_with("=k"),
+            "the API key itself must not be stored in the manifest");
+    }
+
+    #[test]
+    fn empty_purity_falls_back_to_sfw_and_sketchy() {
+        assert_eq!(effective_purity(&source("x")), "110");
+        let mut s = source("x");
+        s.wallhaven_purity = "100".into();
+        assert_eq!(effective_purity(&s), "100");
+    }
+
+    #[test]
+    fn legacy_folder_names_are_sixteen_hex_digits() {
+        let name = legacy_cache_folder_name("https://wallhaven.cc/search?q=x");
+        assert_eq!(name.len(), 16);
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(name, cache_folder_name("https://wallhaven.cc/search?q=x"));
+    }
+
+    #[test]
+    fn redact_handles_multiple_keys_and_non_ascii_text() {
+        assert_eq!(redact("a apikey=1&b apikey=2"), "a apikey=***&b apikey=***");
+        assert_eq!(redact("žluťoučký apikey=abc \"x\""), "žluťoučký apikey=*** \"x\"");
+        assert_eq!(redact("apikey="), "apikey=***");
+    }
+
+    #[test]
+    fn cache_only_never_touches_the_network() {
+        // An unreachable host would make a refresh fail; CacheOnly must not even try.
+        let src = source("https://wallhaven.cc/search?q=mula-unit-test-cache-only");
+        let files = images_for_source(&src, &settings(), NetworkPolicy::CacheOnly).unwrap();
+        assert!(files.is_empty());
+        let dir = super::super::settings::config_dir().unwrap().join("wallhaven").join(cache_folder_name(src.path.trim()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manifests_round_trip() {
+        let dir = crate::test_support::TempDir::new("manifest");
+        assert!(read_manifest(dir.path()).is_none());
+        let manifest = Manifest { query: "q".into(), fetched_at: 42, files: vec!["a.jpg".into()] };
+        write_manifest(dir.path(), &manifest).unwrap();
+        let back = read_manifest(dir.path()).unwrap();
+        assert_eq!((back.query.as_str(), back.fetched_at, back.files), ("q", 42, vec!["a.jpg".to_string()]));
+        assert!(!dir.join("manifest.json.tmp").exists());
+    }
+
+    #[test]
+    fn only_decodable_files_count_as_valid_images() {
+        let dir = crate::test_support::TempDir::new("valid_image");
+        let good = crate::test_support::write_png(&dir.join("good.png"), 3, 2);
+        std::fs::write(dir.join("bad.jpg"), b"<html>rate limited</html>").unwrap();
+        assert!(is_valid_image(&good));
+        assert!(!is_valid_image(&dir.join("bad.jpg")));
+        assert!(!is_valid_image(&dir.join("missing.jpg")));
     }
 }

@@ -186,3 +186,22 @@ pub fn try_disable_windows_slideshow() -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argb_is_converted_to_a_bgr_colorref_without_alpha() {
+        assert_eq!(argb_to_colorref(0xFF11_2233u32 as i32), 0x0033_2211);
+        assert_eq!(argb_to_colorref(0x00FF_0000), 0x0000_00FF);
+        assert_eq!(argb_to_colorref(0xFF00_0000u32 as i32), 0);
+    }
+
+    #[test]
+    fn aspect_ratio_handles_zero_height() {
+        let m = Monitor { width: 2560, height: 1440, ..Default::default() };
+        assert!((m.aspect_ratio() - 16.0 / 9.0).abs() < 1e-9);
+        assert_eq!(Monitor::default().aspect_ratio(), 1.0);
+    }
+}

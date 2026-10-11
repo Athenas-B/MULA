@@ -448,3 +448,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn powershell_literals_escape_single_quotes() {
+        assert_eq!(ps_quote("plain"), "'plain'");
+        assert_eq!(ps_quote("it's"), "'it''s'");
+        assert_eq!(ps_quote("''"), "''''''");
+    }
+
+    #[test]
+    fn encoded_commands_are_base64_utf16le() {
+        assert_eq!(encode_ps("ab"), "YQBiAA==");
+        let decoded = base64::engine::general_purpose::STANDARD.decode(encode_ps("Ž1")).unwrap();
+        assert_eq!(decoded, [0x7D, 0x01, 0x31, 0x00]);
+    }
+
+    #[test]
+    fn hashes_are_uppercase_hex_sha256() {
+        assert_eq!(sha256_hex(b"abc"), "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD");
+    }
+
+    #[test]
+    fn tokens_are_random_hex() {
+        let (a, b) = (random_token(), random_token());
+        assert_eq!(a.len(), 48);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn executables_in_protected_locations_are_accepted() {
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        assert!(check_exe_is_protected(&Path::new(&windir).join("System32").join("where.exe")).is_ok());
+        if let Some(home) = dirs::home_dir() {
+            assert!(check_exe_is_protected(&home.join("scoop").join("smartctl.exe")).is_err());
+        }
+    }
+}

@@ -146,3 +146,14 @@ mod tests {
         assert_eq!(end.get_pixel(0, 0).0, [200, 200, 200]);
     }
 }
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_ids_become_safe_file_name_parts() {
+        assert_eq!(sanitize_for_filename(r"\\?\DISPLAY#GSM5B7F#5&1a2b"), "____DISPLAY_GSM5B7F_5_1a2b");
+        assert_eq!(sanitize_for_filename("abc123"), "abc123");
+    }
+}

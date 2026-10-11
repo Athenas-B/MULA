@@ -262,3 +262,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    fn sample_path() -> String {
+        Path::new("Pics").join("Trips").join("beach.jpg").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn overlay_text_follows_the_selected_mode() {
+        let path = sample_path();
+        assert_eq!(overlay_text(&path, PictureNameOverlayTextMode::FileNameWithoutExtension), "beach");
+        assert_eq!(overlay_text(&path, PictureNameOverlayTextMode::FileName), "beach.jpg");
+        assert_eq!(overlay_text(&path, PictureNameOverlayTextMode::FolderAndFileName), "Trips\\beach.jpg");
+        assert_eq!(overlay_text(&path, PictureNameOverlayTextMode::FullPath), path);
+        assert_eq!(overlay_text("beach.jpg", PictureNameOverlayTextMode::FolderAndFileName), "beach.jpg");
+    }
+
+    #[test]
+    fn argb_colors_convert_to_rgba() {
+        assert_eq!(argb_to_rgba(0x8011_2233u32 as i32), Rgba([0x11, 0x22, 0x33, 0x80]));
+        assert_eq!(argb_to_rgba(0xFFFF_FFFFu32 as i32), Rgba([255, 255, 255, 255]));
+        assert_eq!(argb_to_rgba(0), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn render_cache_key_changes_with_every_overlay_setting() {
+        let base: Settings = serde_json::from_str("{}").unwrap();
+        let key = cache_key("a.jpg", &base);
+        assert_eq!(key, cache_key("a.jpg", &base), "keys are deterministic");
+        assert_ne!(key, cache_key("b.jpg", &base));
+
+        let variants: Vec<Box<dyn Fn(&mut Settings)>> = vec![
+            Box::new(|s| s.picture_name_overlay_font_size += 1),
+            Box::new(|s| s.picture_name_overlay_text_color_argb = 0x00FF_0000),
+            Box::new(|s| s.picture_name_overlay_offset_x = 5),
+            Box::new(|s| s.picture_name_overlay_offset_y = 5),
+            Box::new(|s| s.picture_name_overlay_use_backdrop = !s.picture_name_overlay_use_backdrop),
+            Box::new(|s| s.picture_name_overlay_text_mode = PictureNameOverlayTextMode::FullPath),
+        ];
+        for change in variants {
+            let mut s = base.clone();
+            change(&mut s);
+            assert_ne!(cache_key("a.jpg", &s), key);
+        }
+    }
+
+    #[test]
+    fn no_overlay_means_the_original_file_is_used() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.show_picture_name_overlay);
+        assert_eq!(resolve_wallpaper_path("C:/x/a.jpg", &s), "C:/x/a.jpg");
+    }
+
+    #[test]
+    fn failed_rendering_falls_back_to_the_original_file() {
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        s.show_picture_name_overlay = true;
+        let missing = std::env::temp_dir().join("mula_definitely_missing_image.jpg");
+        let missing = missing.to_string_lossy().to_string();
+        assert_eq!(resolve_wallpaper_path(&missing, &s), missing);
+    }
+}

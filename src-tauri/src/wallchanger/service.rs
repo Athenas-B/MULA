@@ -210,3 +210,70 @@ fn record_image_shown(settings: &mut Settings, path: &str) {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallchanger::monitors::Monitor;
+
+    fn monitors(n: usize) -> Vec<Monitor> {
+        (0..n).map(|i| Monitor { id: format!("M{i}"), width: 1920, height: 1080, ..Default::default() }).collect()
+    }
+
+    fn ids(targets: &[&Monitor]) -> Vec<String> {
+        targets.iter().map(|m| m.id.clone()).collect()
+    }
+
+    #[test]
+    fn all_monitors_change_unless_one_per_interval_is_requested() {
+        let ms = monitors(3);
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        let (targets, next) = select_target_monitors(&ms, &s, false);
+        assert_eq!(ids(&targets), ["M0", "M1", "M2"]);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn one_monitor_per_interval_rotates_through_the_monitors() {
+        let ms = monitors(3);
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (targets, next) = select_target_monitors(&ms, &s, true);
+            seen.extend(ids(&targets));
+            s.next_monitor_change_index = next.unwrap();
+        }
+        assert_eq!(seen, ["M0", "M1", "M2", "M0"]);
+    }
+
+    #[test]
+    fn a_stale_monitor_index_wraps_around() {
+        let ms = monitors(2);
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        s.next_monitor_change_index = 7; // e.g. a monitor was unplugged
+        let (targets, next) = select_target_monitors(&ms, &s, true);
+        assert_eq!(ids(&targets), ["M1"]);
+        assert_eq!(next, Some(0));
+    }
+
+    #[test]
+    fn a_single_monitor_ignores_one_per_interval() {
+        let ms = monitors(1);
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        let (targets, next) = select_target_monitors(&ms, &s, true);
+        assert_eq!(ids(&targets), ["M0"]);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn show_counts_are_recorded_per_image() {
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        record_image_shown(&mut s, "a.jpg");
+        record_image_shown(&mut s, "b.jpg");
+        record_image_shown(&mut s, "a.jpg");
+        let count = |p: &str| s.image_show_stats.iter().find(|x| x.path == p).map(|x| x.shown_count);
+        assert_eq!(count("a.jpg"), Some(2));
+        assert_eq!(count("b.jpg"), Some(1));
+        assert_eq!(s.image_show_stats.len(), 2);
+    }
+}

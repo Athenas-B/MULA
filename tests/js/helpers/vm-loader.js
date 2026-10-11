@@ -1,0 +1,381 @@
+// Shared helpers for loading the plain browser scripts (not ES modules) of MULA into a
+// node:vm context with minimal stubs, so their top-level functions can be unit-tested
+// without modifying the production sources or pulling in a fake-DOM library.
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import vm from "node:vm";
+
+export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+export const MAIN_JS = path.join(REPO_ROOT, "src", "main.js");
+export const EXT_SRC = path.join(REPO_ROOT, "modules", "vsd", "extension", "src");
+
+/**
+ * Objects created inside a vm context belong to another realm, so
+ * assert.deepStrictEqual rejects them (different prototypes). Normalize via JSON.
+ */
+export function plain(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+/** Let pending promise callbacks (including ones queued inside the vm context) run. */
+export async function flush(times = 3) {
+  for (let i = 0; i < times; i++) await new Promise((r) => setImmediate(r));
+}
+
+/**
+ * Create a vm context from `globals` (which also serves as `window`/`self`) and run
+ * the given script files in it, in order. Returns the context plus helpers.
+ */
+export function loadScripts(files, globals) {
+  globals.window ??= globals;
+  globals.self ??= globals;
+  const ctx = vm.createContext(globals);
+  for (const file of files) {
+    vm.runInContext(readFileSync(file, "utf8"), ctx, { filename: file });
+  }
+  return {
+    ctx,
+    /** Evaluate an expression in the context (useful for top-level const/let bindings). */
+    run: (code) => vm.runInContext(code, ctx),
+    /** Assign a top-level `let` binding (or any lvalue) from the test realm. */
+    assign: (lvalue, value) => {
+      ctx.__testValue = value;
+      vm.runInContext(`${lvalue} = __testValue`, ctx);
+      delete ctx.__testValue;
+    },
+  };
+}
+
+// ── Timers ──────────────────────────────────────────────────────────────────
+
+/** Fake timers: nothing runs unless the test calls runAll(), so no handles leak. */
+export function createFakeTimers() {
+  let nextId = 1;
+  const timers = new Map();
+  const api = {
+    setTimeout(fn, ms = 0) {
+      const id = nextId++;
+      timers.set(id, { fn, ms, repeat: false });
+      return id;
+    },
+    setInterval(fn, ms = 0) {
+      const id = nextId++;
+      timers.set(id, { fn, ms, repeat: true });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+    clearInterval(id) {
+      timers.delete(id);
+    },
+    /** Pending timers as [{ id, ms, repeat }]. */
+    pending() {
+      return [...timers.entries()].map(([id, t]) => ({ id, ms: t.ms, repeat: t.repeat }));
+    },
+    /** Fire every currently pending timer once (timeouts are removed, intervals kept). */
+    runAll() {
+      for (const [id, t] of [...timers.entries()]) {
+        if (!t.repeat) timers.delete(id);
+        t.fn();
+      }
+    },
+  };
+  return api;
+}
+
+export function createFakeConsole() {
+  const calls = [];
+  const make = (level) => (...args) => calls.push({ level, args });
+  return { calls, log: make("log"), info: make("info"), warn: make("warn"), error: make("error"), debug: make("debug") };
+}
+
+// ── Minimal DOM ─────────────────────────────────────────────────────────────
+
+class FakeClassList {
+  constructor() {
+    this.set = new Set();
+  }
+  add(...names) {
+    names.forEach((n) => this.set.add(n));
+  }
+  remove(...names) {
+    names.forEach((n) => this.set.delete(n));
+  }
+  contains(name) {
+    return this.set.has(name);
+  }
+  toggle(name, force) {
+    const on = force === undefined ? !this.set.has(name) : !!force;
+    if (on) this.set.add(name);
+    else this.set.delete(name);
+    return on;
+  }
+}
+
+/**
+ * A tiny element stand-in. querySelector / querySelectorAll return lazily created (3 for querySelectorAll),
+ * stable stub elements per selector (unless configured with setQuery / setQueryAll),
+ * which is enough for code that wires listeners onto freshly rendered rows.
+ */
+export class FakeElement {
+  constructor(props = {}) {
+    this.tagName = "DIV";
+    this.id = "";
+    this.value = "";
+    this.checked = false;
+    this.disabled = false;
+    this.textContent = "";
+    this._innerHTML = "";
+    this.title = "";
+    this.style = {};
+    this.dataset = {};
+    this.attributes = {};
+    this.children = [];
+    this.listeners = {};
+    this.classList = new FakeClassList();
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
+    this._query = new Map();
+    this._queryAll = new Map();
+    Object.assign(this, props);
+    if (props.tagName) this.tagName = String(props.tagName).toUpperCase();
+  }
+  get innerHTML() {
+    return this._innerHTML;
+  }
+  /** Setting innerHTML to "" also drops appended children, like a real element. */
+  set innerHTML(value) {
+    this._innerHTML = String(value);
+    if (this._innerHTML === "") this.children = [];
+  }
+  get className() {
+    return [...this.classList.set].join(" ");
+  }
+  set className(value) {
+    this.classList.set = new Set(String(value).split(/\s+/).filter(Boolean));
+  }
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+  getAttribute(name) {
+    return name in this.attributes ? this.attributes[name] : null;
+  }
+  addEventListener(type, fn) {
+    (this.listeners[type] ||= []).push(fn);
+  }
+  /** Invoke registered listeners; returns their results (e.g. promises). */
+  dispatch(type, event = {}) {
+    return (this.listeners[type] || []).map((fn) => fn({ target: this, ...event }));
+  }
+  appendChild(child) {
+    this.children.push(child);
+    return child;
+  }
+  append(...children) {
+    this.children.push(...children);
+  }
+  removeChild(child) {
+    this.children = this.children.filter((c) => c !== child);
+    return child;
+  }
+  select() {}
+  setQuery(selector, el) {
+    this._query.set(selector, el);
+    return el;
+  }
+  setQueryAll(selector, list) {
+    this._queryAll.set(selector, list);
+    return list;
+  }
+  querySelector(selector) {
+    if (!this._query.has(selector)) this._query.set(selector, new FakeElement());
+    return this._query.get(selector);
+  }
+  querySelectorAll(selector) {
+    if (!this._queryAll.has(selector)) {
+      this._queryAll.set(selector, [new FakeElement(), new FakeElement(), new FakeElement()]);
+    }
+    return this._queryAll.get(selector);
+  }
+}
+
+/**
+ * A fake `document`. getElementById returns only elements registered with add(),
+ * querySelector/querySelectorAll return only what was registered (null / []).
+ */
+export function createFakeDocument() {
+  const byId = new Map();
+  const query = new Map();
+  const queryAll = new Map();
+  const listeners = {};
+  const doc = {
+    title: "",
+    documentElement: new FakeElement({ tagName: "html" }),
+    body: new FakeElement({ tagName: "body" }),
+    listeners,
+    add(id, props = {}) {
+      const el = props instanceof FakeElement ? props : new FakeElement({ id, ...props });
+      byId.set(id, el);
+      return el;
+    },
+    setQuery(selector, el) {
+      query.set(selector, el);
+      return el;
+    },
+    setQueryAll(selector, list) {
+      queryAll.set(selector, list);
+      return list;
+    },
+    getElementById: (id) => byId.get(id) ?? null,
+    querySelector: (selector) => query.get(selector) ?? null,
+    querySelectorAll: (selector) => queryAll.get(selector) ?? [],
+    createElement: (tagName) => new FakeElement({ tagName }),
+    addEventListener(type, fn) {
+      (listeners[type] ||= []).push(fn);
+    },
+    execCommand: () => false,
+  };
+  return doc;
+}
+
+export function createFakeLocalStorage(initial = {}, { throwOnAccess = false } = {}) {
+  const map = new Map(Object.entries(initial));
+  const guard = () => {
+    if (throwOnAccess) throw new Error("SecurityError: storage disabled");
+  };
+  return {
+    map,
+    getItem(key) {
+      guard();
+      return map.has(key) ? map.get(key) : null;
+    },
+    setItem(key, value) {
+      guard();
+      map.set(key, String(value));
+    },
+    removeItem(key) {
+      guard();
+      map.delete(key);
+    },
+  };
+}
+
+// ── chrome.* ────────────────────────────────────────────────────────────────
+
+function fakeEvent() {
+  const listeners = [];
+  const calls = [];
+  return {
+    listeners,
+    calls,
+    addListener(fn, ...rest) {
+      listeners.push(fn);
+      calls.push(rest);
+    },
+    removeListener(fn) {
+      const i = listeners.indexOf(fn);
+      if (i >= 0) listeners.splice(i, 1);
+    },
+    fire(...args) {
+      return listeners.map((fn) => fn(...args));
+    },
+  };
+}
+
+const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+
+/**
+ * Fake `chrome` API with an in-memory, synchronous storage.local, recorded
+ * sendMessage calls (answered by `onSend`), tabs and webRequest events.
+ */
+export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undefined } = {}) {
+  const store = clone(storage);
+  const sent = [];
+  const icons = [];
+  const created = [];
+  const port = { name: "content", onDisconnect: fakeEvent() };
+
+  const chrome = {
+    store,
+    sent,
+    icons,
+    created,
+    port,
+    tabsList: tabs,
+    onSend,
+    runtime: {
+      id: "test-extension-id",
+      lastError: undefined,
+      getURL: (p) => `chrome-extension://test-extension-id/${p}`,
+      onMessage: fakeEvent(),
+      onConnect: fakeEvent(),
+      connect: (info) => {
+        port.name = info?.name;
+        return port;
+      },
+      sendMessage(msg, cb) {
+        sent.push(clone(msg));
+        const res = chrome.onSend(msg);
+        cb?.(res);
+      },
+    },
+    storage: {
+      onChanged: fakeEvent(),
+      local: {
+        get(keys, cb) {
+          let result;
+          if (keys === null || keys === undefined) result = clone(store);
+          else if (typeof keys === "string") result = keys in store ? { [keys]: clone(store[keys]) } : {};
+          else if (Array.isArray(keys)) result = Object.fromEntries(keys.filter((k) => k in store).map((k) => [k, clone(store[k])]));
+          else result = Object.fromEntries(Object.entries(keys).map(([k, d]) => [k, k in store ? clone(store[k]) : clone(d)]));
+          cb(result);
+        },
+        set(obj, cb) {
+          const changes = {};
+          for (const [k, v] of Object.entries(obj)) {
+            changes[k] = { oldValue: clone(store[k]), newValue: clone(v) };
+            store[k] = clone(v);
+          }
+          chrome.storage.onChanged.fire(changes, "local");
+          cb?.();
+        },
+      },
+    },
+    tabs: {
+      query(_q, cb) {
+        cb(clone(chrome.tabsList));
+      },
+      get(id, cb) {
+        const tab = chrome.tabsList.find((t) => t.id === id);
+        if (!tab) {
+          chrome.runtime.lastError = { message: `No tab with id: ${id}.` };
+          cb(undefined);
+          chrome.runtime.lastError = undefined;
+          return;
+        }
+        cb(clone(tab));
+      },
+      create(info) {
+        created.push(info);
+      },
+    },
+    webRequest: {
+      onBeforeRequest: fakeEvent(),
+      onBeforeSendHeaders: fakeEvent(),
+    },
+    action: {
+      setIcon(arg) {
+        icons.push(arg);
+      },
+    },
+    windows: {
+      create(info) {
+        created.push(info);
+      },
+    },
+  };
+  return chrome;
+}
