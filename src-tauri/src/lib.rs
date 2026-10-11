@@ -331,7 +331,7 @@ fn vsd_set_download_dir(path: String) -> Result<(), String> {
 
     // If server is running, update it live via API
     if vsd_is_running_sync() {
-        let body = format!(r#"{{"path":"{}"}}"#, path.replace('\\', "\\\\").replace('"', "\\\""));
+        let body = serde_json::json!({ "path": path }).to_string();
         let _ = std::thread::spawn(move || {
             let req = urllib_post("http://127.0.0.1:8765/config/download_dir", &body);
             if let Err(e) = req {
@@ -380,19 +380,10 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 fn urllib_post(url: &str, body: &str) -> Result<(), String> {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-
-    let addr = "127.0.0.1:8765";
-    let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
-    let request = format!(
-        "POST /config/download_dir HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(), body
-    );
-    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).map_err(|e| e.to_string())?;
-    let _ = url; // used in format above
+    ureq::post(url)
+        .set("Content-Type", "application/json")
+        .send_string(body)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -480,6 +471,16 @@ pub struct DriveInfo {
     connection_speed: String,
     smart_capable: String,
     trim_capable: String,
+    /// True when the disk holds the running Windows installation (it must never be formatted).
+    is_system: bool,
+}
+
+/// The drive letter Windows is running from, e.g. "C:".
+fn system_drive_letter() -> String {
+    std::env::var("SystemDrive")
+        .unwrap_or_else(|_| "C:".to_string())
+        .trim_end_matches('\\')
+        .to_uppercase()
 }
 
 fn parse_vendor_from_pnp(pnp: &str) -> Option<String> {
@@ -847,6 +848,10 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             }
         }
 
+        let drive_letters = value_to_strings(d.drive_letters);
+        let system_letter = system_drive_letter();
+        let is_system = drive_letters.iter().any(|l| l.eq_ignore_ascii_case(&system_letter));
+
         result.push(DriveInfo {
             id: d.device_id.clone(),
             device_id: d.device_id,
@@ -863,12 +868,13 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
             status: d.status.as_deref().unwrap_or("Unknown").to_string(),
             firmware: d.firmware_revision.as_deref().unwrap_or("").to_string(),
             pnp_device_id: pnp.to_string(),
-            drive_letters: value_to_strings(d.drive_letters),
+            drive_letters,
             mount_points: value_to_strings(d.mount_points),
             health_status: d.health_status.unwrap_or_default(),
             connection_speed: connection_speed_text,
             smart_capable: d.smart_capable.as_deref().unwrap_or("Unknown").to_string(),
             trim_capable: d.trim_capable.as_deref().unwrap_or("Unknown").to_string(),
+            is_system,
         });
     }
 
@@ -927,7 +933,16 @@ fn find_smartctl() -> Option<std::path::PathBuf> {
             return Some(path);
         }
     }
-    // Try PATH
+    // Try PATH, resolving to an absolute path (the elevated helper requires one).
+    if let Ok(output) = Command::new("where").arg("smartctl").output() {
+        let out = String::from_utf8_lossy(&output.stdout);
+        if let Some(first) = out.lines().map(str::trim).find(|l| !l.is_empty()) {
+            let path = std::path::PathBuf::from(first);
+            if path.is_absolute() && path.exists() {
+                return Some(path);
+            }
+        }
+    }
     if Command::new("smartctl").arg("--version").output().is_ok() {
         return Some(std::path::PathBuf::from("smartctl"));
     }
@@ -1088,7 +1103,17 @@ fn normalize_serial(s: &str) -> String {
 }
 
 fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    elevated_helper::run_elevated(smartctl, args)
+    elevated_helper::run_smartctl_elevated(smartctl, args)
+}
+
+const SELF_TEST_TYPES: &[&str] = &["short", "long", "conveyance", "offline"];
+
+fn validate_test_type(test_type: &str) -> Result<(), String> {
+    if SELF_TEST_TYPES.contains(&test_type) {
+        Ok(())
+    } else {
+        Err(format!("Unsupported self-test type: {test_type}"))
+    }
 }
 
 fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Result<String, String> {
@@ -1203,6 +1228,7 @@ async fn get_drive_smart_elevated(id: String) -> Result<String, String> {
 #[tauri::command]
 async fn run_drive_test(id: String, test_type: String) -> Result<String, String> {
     let res = tauri::async_runtime::spawn_blocking(move || {
+        validate_test_type(&test_type)?;
         run_smartctl_on_drive(id, false, &["-t", &test_type])
     })
     .await
@@ -1216,6 +1242,7 @@ async fn run_drive_test(id: String, test_type: String) -> Result<String, String>
 #[tauri::command]
 async fn run_drive_test_elevated(id: String, test_type: String) -> Result<String, String> {
     let res = tauri::async_runtime::spawn_blocking(move || {
+        validate_test_type(&test_type)?;
         run_smartctl_on_drive(id, true, &["-t", &test_type])
     })
     .await
@@ -1290,29 +1317,76 @@ async fn save_smart_snapshot(id: String, label: String) -> Result<String, String
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Erases a drive and creates one NTFS partition (full format). Runs in its own elevated
+/// PowerShell with a dedicated UAC prompt, and refuses the disk Windows is running from.
+const FORMAT_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$ResultPath = '__RESULT_PATH__'
+$deviceId = '__DEVICE_ID__'
+function Write-Result([string]$text) {
+    [IO.File]::WriteAllText($ResultPath, $text, (New-Object System.Text.UTF8Encoding $false))
+}
+try {
+    $wmiDisk = Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.DeviceID -eq $deviceId } | Select-Object -First 1
+    if (-not $wmiDisk) { throw "Disk not found for device '$deviceId'" }
+    $number = [int]$wmiDisk.Index
+    $disk = Get-Disk -Number $number
+    if ($disk.IsSystem -or $disk.IsBoot) {
+        throw "Refusing to format disk ${number}: it holds the running Windows installation."
+    }
+    $systemPart = Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':')) -ErrorAction SilentlyContinue
+    if ($systemPart -and $systemPart.DiskNumber -eq $number) {
+        throw "Refusing to format disk ${number}: it holds the system drive $env:SystemDrive."
+    }
+    if ($disk.IsOffline) { Set-Disk -Number $number -IsOffline $false }
+    if ($disk.IsReadOnly) { Set-Disk -Number $number -IsReadOnly $false }
+
+    # Clear-Disk leaves the disk uninitialized (RAW), so it has to be initialized again
+    # before a partition can be created.
+    if ((Get-Disk -Number $number).PartitionStyle -ne 'RAW') {
+        Clear-Disk -Number $number -RemoveData -RemoveOEM -Confirm:$false
+    }
+    Initialize-Disk -Number $number -PartitionStyle GPT
+    $part = New-Partition -DiskNumber $number -UseMaximumSize -AssignDriveLetter
+    $null = Format-Volume -Partition $part -FileSystem NTFS -NewFileSystemLabel 'MULA' -Full -Confirm:$false
+    $letter = (Get-Partition -DiskNumber $number -PartitionNumber $part.PartitionNumber).DriveLetter
+    if ($letter) {
+        Write-Result "Formatted drive ${letter}: as NTFS (full format complete)"
+    } else {
+        Write-Result "Formatted disk $number as NTFS (full format complete)"
+    }
+    exit 0
+} catch {
+    Write-Result $_.Exception.Message
+    exit 1
+}
+"#;
+
 #[tauri::command]
 async fn format_drive(id: String) -> Result<String, String> {
-    let escaped_id = id.replace("'", "''");
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$deviceId = '{}'
-$disks = Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction SilentlyContinue | Where-Object {{ $_.DeviceID -eq $deviceId }}
-if (-not $disks) {{ throw "Disk not found for device '$deviceId'" }}
-$diskNumber = $disks[0].Index
-$disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
-if (-not $disk) {{ throw "Disk $diskNumber not found" }}
-Clear-Disk -Number $diskNumber -RemoveData -RemoveOEM -Confirm:$false
-$part = New-Partition -DiskNumber $diskNumber -UseMaximumSize -AssignDriveLetter
-Format-Volume -DriveLetter $part.DriveLetter -FileSystem NTFS -NewFileSystemLabel 'MULA' -Confirm:$false -Full
-"Formatted drive " + $part.DriveLetter + ": as NTFS (full format complete)""#,
-        escaped_id
-    );
-
     tauri::async_runtime::spawn_blocking(move || {
-        elevated_helper::run_elevated_with_timeout(Path::new("powershell"), &["-Command", &script, "-ExecutionPolicy", "Bypass"], None)
+        let drive = list_physical_drives_impl()?
+            .into_iter()
+            .find(|d| d.id == id || d.device_id == id)
+            .ok_or_else(|| format!("Drive not found: {id}"))?;
+        if drive.is_system {
+            return Err(format!(
+                "Refusing to format {}: it holds the running Windows installation ({}).",
+                drive.model,
+                system_drive_letter()
+            ));
+        }
+
+        let script = FORMAT_SCRIPT.replace("__DEVICE_ID__", &drive.device_id.replace('\'', "''"));
+        let result = elevated_helper::run_elevated_script(&script);
+        match &result {
+            Ok(msg) => log::info!("format_drive {}: {msg}", drive.device_id),
+            Err(e) => log::error!("format_drive {} failed: {e}", drive.device_id),
+        }
+        result
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))? 
+    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1322,13 +1396,33 @@ async fn log_message(level: String, message: String) {
 
 
 
+/// Stops everything MULA started that would otherwise outlive it.
+fn shutdown() {
+    elevated_helper::stop_helper();
+    if let Ok(mut guard) = VSD_PROCESS.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Runs a blocking tray action off the UI thread and logs failures.
+fn spawn_tray_action(name: &'static str, action: impl FnOnce() -> Result<(), String> + Send + 'static) {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(e) = action() {
+            log::error!("Tray action '{name}' failed: {e}");
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = logger::init();
 
     log::info!("MULA starting");
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -1369,9 +1463,14 @@ pub fn run() {
             get_autostart,
             set_autostart,
         ])
-        .on_window_event(|_window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                elevated_helper::stop_helper();
+        .on_window_event(|window, event| {
+            // Closing the main window only hides it: MULA keeps running in the tray (the
+            // wallpaper service, VSD server, ...). Use the tray's "Exit" to quit.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .setup(|app| {
@@ -1379,13 +1478,15 @@ pub fn run() {
             use tauri::tray::TrayIconBuilder;
             use tauri::Manager;
 
+            wallchanger::set_app_handle(app.handle().clone());
+
             let show = MenuItem::with_id(app, "show", "Show MULA", true, None::<&str>)?;
 
             let change = MenuItem::with_id(app, "change", "Change wallpaper", true, None::<&str>)?;
             let start = MenuItem::with_id(app, "start", "Start", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
 
-            let current_max_level = wallchanger::settings::load()
+            let current_max_level = wallchanger::settings::load_config()
                 .map(|s| s.maximum_source_level)
                 .unwrap_or(10);
             let mut max_level_items = Vec::new();
@@ -1436,28 +1537,16 @@ pub fn run() {
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
+                            let _ = window.unminimize();
                             let _ = window.set_focus();
                         }
                     }
-                    "change" => {
-                        let _ = wallchanger::settings::load().and_then(|mut s| {
-                            wallchanger::service::apply(&mut s, false)
-                        });
-                    }
-                    "start" => {
-                        let _ = wallchanger::service::start();
-                        let _ = wallchanger::settings::load().and_then(|mut s| {
-                            s.change_service_running = true;
-                            wallchanger::settings::save(&s)
-                        });
-                    }
-                    "stop" => {
-                        let _ = wallchanger::service::stop();
-                        let _ = wallchanger::settings::load().and_then(|mut s| {
-                            s.change_service_running = false;
-                            wallchanger::settings::save(&s)
-                        });
-                    }
+                    // Wallpaper work blocks (disk, network, fades); keep it off the UI thread.
+                    "change" => spawn_tray_action("change wallpaper", || {
+                        wallchanger::service::apply(false).map(|_| ())
+                    }),
+                    "start" => spawn_tray_action("start service", || wallchanger::service::set_running(true)),
+                    "stop" => spawn_tray_action("stop service", || wallchanger::service::set_running(false)),
                     "autostart" => {
                         let enabled = autostart_menu_item.is_checked().unwrap_or(false);
                         if let Err(e) = startup::set_enabled(enabled) {
@@ -1470,12 +1559,9 @@ pub fn run() {
                     }
                     id if id.starts_with("max_level_") => {
                         if let Ok(level) = id.trim_start_matches("max_level_").parse::<i32>() {
-                            let result = wallchanger::settings::load().and_then(|mut s| {
-                                s.maximum_source_level = level;
-                                wallchanger::settings::save(&s)
-                            });
+                            let result = wallchanger::settings::update_config(|s| s.maximum_source_level = level);
                             match result {
-                                Ok(()) => {
+                                Ok(_) => {
                                     wallchanger::sync_max_level_menu(app, level);
                                     use tauri::Emitter;
                                     let _ = app.emit("max-level-changed", level);
@@ -1484,16 +1570,17 @@ pub fn run() {
                             }
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        shutdown();
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .build(app)?;
 
             // Resume the wallpaper service if it was running.
-            if let Ok(settings) = wallchanger::settings::load() {
-                if settings.change_service_running {
-                    let _ = wallchanger::service::start();
-                }
+            if wallchanger::settings::service_running().unwrap_or(false) {
+                let _ = wallchanger::service::start();
             }
 
             // When launched from the Windows startup entry, start hidden in the tray.
@@ -1505,6 +1592,12 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_app, event| {
+        if let tauri::RunEvent::Exit = event {
+            shutdown();
+        }
+    });
 }

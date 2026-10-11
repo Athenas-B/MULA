@@ -1,98 +1,113 @@
-use super::images::{is_eligible_source, load_images};
+use super::images::{is_eligible_source, load_images, NetworkPolicy};
 use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, try_disable_windows_slideshow};
 use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor};
 use super::transition::apply_wallpaper;
-use super::settings::{load, save, Settings};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use super::settings::{self, Settings};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::async_runtime::{spawn_blocking, JoinHandle};
 
-static SERVICE_RUNNING: AtomicBool = AtomicBool::new(false);
-static SERVICE_HANDLE: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+/// Bumped on every start/stop; a worker thread exits as soon as it no longer matches, so a quick
+/// stop + start can never leave two workers running.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static WORKER_ACTIVE: Mutex<bool> = Mutex::new(false);
+/// Wallpaper changes are serialized: the service, the UI and the tray can all trigger one.
+static APPLY_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn start() -> Result<(), String> {
-    if SERVICE_RUNNING.load(Ordering::SeqCst) {
+    let mut active = WORKER_ACTIVE.lock().map_err(|e| e.to_string())?;
+    if *active {
         return Ok(());
     }
+    *active = true;
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
-    SERVICE_RUNNING.store(true, Ordering::SeqCst);
-
-    let handle = spawn_blocking(|| {
-        if let Err(e) = super::monitors::initialize_com() {
-            log::error!("Wallchanger COM init failed: {}", e);
-            SERVICE_RUNNING.store(false, Ordering::SeqCst);
-            return;
-        }
-
-        let mut last_apply = Instant::now();
-        let mut interval: Duration;
-
-        loop {
-            if !SERVICE_RUNNING.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let mut settings = match load() {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Wallchanger failed to load settings: {}", e);
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
-            };
-
-            interval = Duration::from_secs(settings.interval_minutes.max(1) as u64 * 60);
-
-            if settings.change_service_running && last_apply.elapsed() >= interval {
-                let one_monitor = settings.change_one_monitor_per_interval;
-                if let Err(e) = apply(&mut settings, one_monitor) {
-                    log::error!("Wallchanger apply failed: {}", e);
-                } else if let Err(e) = save(&settings) {
-                    log::error!("Wallchanger failed to save settings: {}", e);
-                }
-                last_apply = Instant::now();
-            }
-
-            std::thread::sleep(Duration::from_secs(1));
-        }
-
-        #[cfg(target_os = "windows")]
-        unsafe { windows::Win32::System::Com::CoUninitialize() };
-    });
-
-    let guard = SERVICE_HANDLE.get_or_init(|| Mutex::new(None));
-    if let Ok(mut opt) = guard.lock() {
-        if let Some(old) = opt.take() {
-            old.abort();
-        }
-        *opt = Some(handle);
-    }
-
+    std::thread::Builder::new()
+        .name("wallchanger-service".into())
+        .spawn(move || run_worker(generation))
+        .map_err(|e| {
+            *active = false;
+            format!("Failed to start wallpaper service: {e}")
+        })?;
     Ok(())
 }
 
 pub fn stop() -> Result<(), String> {
-    SERVICE_RUNNING.store(false, Ordering::SeqCst);
-
-    if let Some(guard) = SERVICE_HANDLE.get() {
-        if let Ok(mut opt) = guard.lock() {
-            if let Some(handle) = opt.take() {
-                handle.abort();
-            }
-        }
-    }
-
+    let mut active = WORKER_ACTIVE.lock().map_err(|e| e.to_string())?;
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    *active = false;
     Ok(())
 }
 
-pub fn apply(settings: &mut Settings, change_one_monitor_only: bool) -> Result<String, String> {
+/// Turns the interval service on or off and remembers the choice across restarts.
+pub fn set_running(running: bool) -> Result<(), String> {
+    settings::set_service_running(running)?;
+    if running {
+        start()?;
+    } else {
+        stop()?;
+    }
+    super::emit("wc-service-changed", running);
+    Ok(())
+}
+
+fn run_worker(generation: u64) {
+    if let Err(e) = super::monitors::initialize_com() {
+        log::error!("Wallchanger COM init failed: {}", e);
+        if GENERATION.load(Ordering::SeqCst) == generation {
+            if let Ok(mut active) = WORKER_ACTIVE.lock() {
+                *active = false;
+            }
+        }
+        return;
+    }
+
+    let mut last_apply = Instant::now();
+    while GENERATION.load(Ordering::SeqCst) == generation {
+        match settings::load_config() {
+            Ok(config) => {
+                let interval = Duration::from_secs(config.interval_minutes.max(1) as u64 * 60);
+                if last_apply.elapsed() >= interval {
+                    if let Err(e) = apply(config.change_one_monitor_per_interval) {
+                        log::error!("Wallchanger apply failed: {}", e);
+                    }
+                    last_apply = Instant::now();
+                }
+            }
+            Err(e) => log::error!("Wallchanger failed to load settings: {}", e),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "windows")]
+    unsafe { windows::Win32::System::Com::CoUninitialize() };
+}
+
+/// Picks and sets the next wallpaper(s), then persists the resulting runtime state.
+/// Blocking (image decoding, Wallhaven downloads, fade transitions): never call it on the UI thread.
+pub fn apply(change_one_monitor_only: bool) -> Result<String, String> {
+    let _apply_guard = APPLY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    super::monitors::initialize_com()?;
+
+    let mut settings = settings::load()?;
+    let result = apply_with(&mut settings, change_one_monitor_only)?;
+    settings::save_apply_state(&settings)?;
+
+    if let Err(e) = cleanup_rendered_cache() {
+        log::warn!("Failed to clean up rendered wallpaper cache: {e}");
+    }
+
+    super::emit("wc-wallpaper-changed", &result);
+    Ok(result)
+}
+
+fn apply_with(settings: &mut Settings, change_one_monitor_only: bool) -> Result<String, String> {
     if !settings.source_folders.iter().any(|s| is_eligible_source(s, settings)) {
         return Err("No eligible wallpaper sources found".to_string());
     }
 
-    let images = load_images(settings)?;
+    let images = load_images(settings, NetworkPolicy::RefreshWhenStale)?;
     if images.is_empty() {
         return Err("No wallpaper images found in enabled sources".to_string());
     }
@@ -140,12 +155,6 @@ pub fn apply(settings: &mut Settings, change_one_monitor_only: bool) -> Result<S
         record_image_shown(settings, &selected.image.path);
 
         applied.push(selected.image.path.clone());
-    }
-
-    save(settings)?;
-
-    if let Err(e) = cleanup_rendered_cache() {
-        log::warn!("Failed to clean up rendered wallpaper cache: {e}");
     }
 
     Ok(format!(
@@ -200,16 +209,4 @@ fn record_image_shown(settings: &mut Settings, path: &str) {
             shown_count: 1,
         });
     }
-}
-
-pub fn toggle_service_running() -> Result<bool, String> {
-    let mut settings = load()?;
-    settings.change_service_running = !settings.change_service_running;
-    save(&settings)?;
-
-    if settings.change_service_running {
-        start()?;
-    }
-
-    Ok(settings.change_service_running)
 }

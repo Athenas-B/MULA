@@ -60,12 +60,43 @@ logger = logging.getLogger("vsd")
 # ── Flask App ────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Only the VSD browser extension (and MULA itself, which sends no Origin header) may
+# talk to the server. Without this, any web page open in the browser could drive it,
+# e.g. POST /open to launch a local executable.
+_ALLOWED_ORIGIN_RE = re.compile(r"^(chrome-extension|moz-extension)://[A-Za-z0-9._-]+$")
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+
+CORS(app, resources={r"/*": {"origins": _ALLOWED_ORIGIN_RE}})
+
+
+def _is_loopback_bind() -> bool:
+    return SERVER_HOST in ("127.0.0.1", "localhost", "::1")
+
+
+@app.before_request
+def _reject_untrusted_callers():
+    origin = request.headers.get("Origin")
+    if origin is not None and not _ALLOWED_ORIGIN_RE.match(origin):
+        logger.warning(f"Rejected request from origin {origin!r} to {request.path}")
+        return jsonify({"error": "Forbidden origin"}), 403
+
+    # Guard against DNS rebinding: a loopback-only server should only ever be
+    # addressed by a loopback host name.
+    if _is_loopback_bind():
+        host = (request.host or "").rsplit(":", 1)[0].lower()
+        if host not in _LOOPBACK_HOSTS:
+            logger.warning(f"Rejected request with Host {request.host!r} to {request.path}")
+            return jsonify({"error": "Forbidden host"}), 403
+    return None
 
 # ── Job Tracking ─────────────────────────────────────────────────────────────
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+# Every file this server has produced; /open may open these even after their job
+# has expired or the download directory has changed.
+_produced_outputs: set[str] = set()
 
 
 def _set_job(job_id: str, **kwargs):
@@ -115,8 +146,14 @@ def _clean_headers(headers: dict | None) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in _EXCLUDED_HEADERS}
 
 
+def _is_http_url(url: str) -> bool:
+    return urllib.parse.urlsplit(url).scheme.lower() in ("http", "https")
+
+
 def _fetch(url: str, headers: dict | None = None, retries: int = MAX_RETRIES) -> bytes:
     """Fetch a URL with retry logic."""
+    if not _is_http_url(url):
+        raise ValueError(f"Refusing to fetch non-HTTP URL: {url[:80]}")
     req_headers = {"User-Agent": _DEFAULT_UA, **_clean_headers(headers)}
     req = urllib.request.Request(url, headers=req_headers)
 
@@ -308,6 +345,8 @@ def _run_download(job_id: str, url: str, title: str, headers: dict | None, raw_m
         if AUTO_OPEN:
             _open_file(output_path)
 
+        with _jobs_lock:
+            _produced_outputs.add(os.path.normcase(str(output_path.resolve())))
         logger.info(f"Job {job_id}: completed — {output_path.name}")
         _set_job(
             job_id, status="done", stage="done",
@@ -338,6 +377,8 @@ def download():
     url = data.get("url")
     if not url:
         return jsonify({"error": "Missing 'url' field"}), 400
+    if not isinstance(url, str) or not _is_http_url(url):
+        return jsonify({"error": "Only http(s) URLs are supported"}), 400
 
     title = data.get("title", "")
     headers = data.get("headers")
@@ -393,12 +434,26 @@ def open_file_endpoint():
     if not file_path:
         return jsonify({"error": "Missing 'path' field"}), 400
 
-    path = Path(file_path)
-    if not path.exists():
+    path = Path(file_path).resolve()
+    if not path.is_file():
         return jsonify({"error": "File not found"}), 404
+    if not _may_open(path):
+        logger.warning(f"Refused to open file outside the download directory: {path}")
+        return jsonify({"error": "Only downloaded files can be opened"}), 403
 
     _open_file(path)
     return jsonify({"ok": True})
+
+
+def _may_open(path: Path) -> bool:
+    """Only open files that VSD downloaded: never arbitrary executables."""
+    with _jobs_lock:
+        if os.path.normcase(str(path)) in _produced_outputs:
+            return True
+    try:
+        return path.is_relative_to(DOWNLOAD_DIR.resolve())
+    except OSError:
+        return False
 
 
 @app.route("/config/download_dir", methods=["GET", "POST"])
@@ -406,6 +461,9 @@ def config_download_dir():
     global DOWNLOAD_DIR
     if request.method == "GET":
         return jsonify({"download_dir": str(DOWNLOAD_DIR)})
+
+    if request.headers.get("Origin") is not None:
+        return jsonify({"error": "The download directory can only be changed from MULA"}), 403
 
     data = request.get_json(force=True)
     new_dir = data.get("path")

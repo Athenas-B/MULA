@@ -101,55 +101,55 @@ fn render_wallpaper_preview(
     let (preview_width, preview_height) = preview_dimensions(monitor_width, monitor_height);
     let bg = argb_to_rgba(background_color_argb);
 
-    let mut canvas = RgbaImage::from_pixel(preview_width, preview_height, bg);
+    let canvas = fit_to_canvas(&image, preview_width, preview_height, scaling_mode, bg, FilterType::Lanczos3);
+    let fit = match scaling_mode {
+        ScalingMode::Fill => "Fill (cropped)",
+        ScalingMode::FitInsideScreen => "Fit inside screen (letterbox)",
+    };
+
+    Ok((image_width as i32, image_height as i32, fit.to_string(), canvas))
+}
+
+/// Renders `image` onto a `width` x `height` canvas the way Windows applies `scaling_mode`:
+/// Fill scales to cover and crops the overflow; FitInsideScreen scales to fit and letterboxes
+/// with `background`.
+pub(super) fn fit_to_canvas(
+    image: &RgbaImage,
+    width: u32,
+    height: u32,
+    scaling_mode: &ScalingMode,
+    background: Rgba<u8>,
+    filter: FilterType,
+) -> RgbaImage {
+    let (width, height) = (width.max(1), height.max(1));
+    let mut canvas = RgbaImage::from_pixel(width, height, background);
+    let (image_width, image_height) = (image.width().max(1), image.height().max(1));
+
+    let scale_x = width as f64 / image_width as f64;
+    let scale_y = height as f64 / image_height as f64;
+    let scale = match scaling_mode {
+        ScalingMode::Fill => scale_x.max(scale_y),
+        ScalingMode::FitInsideScreen => scale_x.min(scale_y),
+    }
+    .max(f64::MIN_POSITIVE);
+    let scaled_w = ((image_width as f64 * scale).round() as u32).max(1);
+    let scaled_h = ((image_height as f64 * scale).round() as u32).max(1);
+    let resized = image::imageops::resize(image, scaled_w, scaled_h, filter);
 
     match scaling_mode {
         ScalingMode::Fill => {
-            let scale_x = preview_width as f64 / image_width as f64;
-            let scale_y = preview_height as f64 / image_height as f64;
-            let scale = scale_x.max(scale_y).max(f64::MIN_POSITIVE);
-            let scaled_w = (image_width as f64 * scale).round() as u32;
-            let scaled_h = (image_height as f64 * scale).round() as u32;
-
-            let resized = image::imageops::resize(&image, scaled_w, scaled_h, FilterType::Lanczos3);
-            let x = ((scaled_w as i64 - preview_width as i64) / 2).max(0);
-            let y = ((scaled_h as i64 - preview_height as i64) / 2).max(0);
-            let cropped = image::imageops::crop_imm(
-                &resized,
-                x as u32,
-                y as u32,
-                preview_width,
-                preview_height,
-            );
+            let x = scaled_w.saturating_sub(width) / 2;
+            let y = scaled_h.saturating_sub(height) / 2;
+            let cropped = image::imageops::crop_imm(&resized, x, y, width.min(scaled_w), height.min(scaled_h));
             image::imageops::overlay(&mut canvas, &cropped.to_image(), 0, 0);
-
-            Ok((
-                image_width as i32,
-                image_height as i32,
-                "Fill (cropped)".to_string(),
-                canvas,
-            ))
         }
         ScalingMode::FitInsideScreen => {
-            let scale_x = preview_width as f64 / image_width as f64;
-            let scale_y = preview_height as f64 / image_height as f64;
-            let scale = scale_x.min(scale_y).max(f64::MIN_POSITIVE);
-            let scaled_w = (image_width as f64 * scale).round() as u32;
-            let scaled_h = (image_height as f64 * scale).round() as u32;
-
-            let resized = image::imageops::resize(&image, scaled_w, scaled_h, FilterType::Lanczos3);
-            let x = ((preview_width as i64 - scaled_w as i64) / 2).max(0);
-            let y = ((preview_height as i64 - scaled_h as i64) / 2).max(0);
+            let x = (width.saturating_sub(scaled_w) / 2) as i64;
+            let y = (height.saturating_sub(scaled_h) / 2) as i64;
             image::imageops::overlay(&mut canvas, &resized, x, y);
-
-            Ok((
-                image_width as i32,
-                image_height as i32,
-                "Fit inside screen (letterbox)".to_string(),
-                canvas,
-            ))
         }
     }
+    canvas
 }
 
 fn preview_dimensions(monitor_width: i32, monitor_height: i32) -> (u32, u32) {
@@ -185,7 +185,7 @@ fn render_placeholder(
     )
 }
 
-fn argb_to_rgba(argb: i32) -> Rgba<u8> {
+pub(super) fn argb_to_rgba(argb: i32) -> Rgba<u8> {
     let u = argb as u32;
     let a = ((u >> 24) & 0xFF) as u8;
     let r = ((u >> 16) & 0xFF) as u8;
@@ -201,4 +201,30 @@ fn png_data_url(image: &RgbaImage) -> Result<String, String> {
         .map_err(|e| format!("Failed to encode preview PNG: {e}"))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
     Ok(format!("data:image/png;base64,{encoded}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RED: Rgba<u8> = Rgba([255, 0, 0, 255]);
+    const BG: Rgba<u8> = Rgba([0, 0, 255, 255]);
+
+    #[test]
+    fn fill_covers_the_whole_canvas() {
+        let wide = RgbaImage::from_pixel(400, 100, RED);
+        let out = fit_to_canvas(&wide, 100, 100, &ScalingMode::Fill, BG, FilterType::Triangle);
+        assert_eq!(out.dimensions(), (100, 100));
+        assert!(out.pixels().all(|p| *p == RED), "Fill must not leave background visible");
+    }
+
+    #[test]
+    fn fit_letterboxes_with_the_background_color() {
+        let wide = RgbaImage::from_pixel(400, 100, RED);
+        let out = fit_to_canvas(&wide, 100, 100, &ScalingMode::FitInsideScreen, BG, FilterType::Triangle);
+        assert_eq!(out.dimensions(), (100, 100));
+        assert_eq!(*out.get_pixel(50, 5), BG, "top band is letterbox");
+        assert_eq!(*out.get_pixel(50, 50), RED, "image is centered");
+        assert_eq!(*out.get_pixel(50, 95), BG, "bottom band is letterbox");
+    }
 }

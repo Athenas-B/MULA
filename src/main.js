@@ -411,6 +411,15 @@ window.addEventListener("DOMContentLoaded", () => {
     if (input) input.value = event.payload;
     if (wcSettings) wcSettings.maximum_source_level = event.payload;
   });
+
+  // The service can be started/stopped from the tray, too.
+  listen("wc-service-changed", (event) => wcUpdateToggleUi(event.payload));
+
+  // Emitted after every wallpaper change, whether from this tab, the tray or the interval service.
+  listen("wc-wallpaper-changed", () => {
+    wcLoadMonitorPreview();
+    wcLoadQueuePreview();
+  });
 });
 
 // ── Drive Test ──
@@ -778,12 +787,14 @@ async function onFormatDrive() {
   stopTestProgressPolling();
 
   const drive = cachedDrives.find((d) => d.id === id);
+  if (drive?.is_system) return;
   const driveLabel = drive ? `${drive.vendor || ""} ${drive.model || ""} ${drive.serial || ""}`.trim() || id : id;
 
   const confirmed = window.confirm(
     `WARNING: This will permanently erase ALL data on the selected drive.\n\n` +
       `Drive: ${driveLabel}\n\n` +
       `This action will remove all partitions, create a new single partition, and perform a full format.\n` +
+      `Windows will ask for administrator rights.\n` +
       `It cannot be undone.\n\nDo you want to continue?`
   );
   if (!confirmed) return;
@@ -809,7 +820,7 @@ async function onFormatDrive() {
       formatStatus.className = "drive-format-status error";
     }
   } finally {
-    if (formatBtn) formatBtn.disabled = false;
+    if (formatBtn) formatBtn.disabled = !!cachedDrives.find((d) => d.id === id)?.is_system;
   }
 }
 
@@ -919,7 +930,7 @@ function onDriveSelect() {
   ];
 
   tbody.innerHTML = fields
-    .map(([label, value]) => `<tr><td class="label">${label}</td><td class="value">${value || "N/A"}</td></tr>`)
+    .map(([label, value]) => `<tr><td class="label">${label}</td><td class="value">${escapeHtml(value || "N/A")}</td></tr>`)
     .join("");
 
   if (smartTest) {
@@ -927,7 +938,14 @@ function onDriveSelect() {
   }
   if (formatSection) {
     formatSection.classList.remove("hidden");
-    if (formatStatus) formatStatus.textContent = "";
+    const formatBtn = document.getElementById("drive-format-btn");
+    if (formatBtn) formatBtn.disabled = !!drive.is_system;
+    if (formatStatus) {
+      formatStatus.textContent = drive.is_system
+        ? "This disk holds the running Windows installation and cannot be formatted."
+        : "";
+      formatStatus.className = "drive-format-status";
+    }
   }
   if (runBtn) runBtn.disabled = false;
   if (checkBtn) checkBtn.disabled = false;
@@ -1283,9 +1301,6 @@ async function wcApply() {
     await invoke("wc_save_settings", { settings: wcSettings });
     const result = await invoke("wc_apply");
     wcShowMessage(result, "success");
-    await wcLoadSettings();
-    await wcLoadMonitorPreview();
-    await wcLoadQueuePreview();
   } catch (err) {
     wcShowMessage(`Error applying wallpaper: ${err}`, "error");
   }
@@ -1297,9 +1312,6 @@ async function wcChangeNow() {
     await invoke("wc_save_settings", { settings: wcSettings });
     const result = await invoke("wc_change_now");
     wcShowMessage(result, "success");
-    await wcLoadSettings();
-    await wcLoadMonitorPreview();
-    await wcLoadQueuePreview();
   } catch (err) {
     wcShowMessage(`Error changing wallpaper: ${err}`, "error");
   }

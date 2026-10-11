@@ -27,7 +27,16 @@ impl ImageInfo {
     }
 }
 
-fn is_image_file(path: &Path) -> bool {
+/// Whether Wallhaven sources may hit the network while images are being collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPolicy {
+    /// Re-query Wallhaven when the cached search results are stale (used when changing wallpaper).
+    RefreshWhenStale,
+    /// Only use images that are already downloaded (used by previews).
+    CacheOnly,
+}
+
+pub fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|ext| {
@@ -74,7 +83,9 @@ fn read_image_dimensions(path: &str) -> Option<(i32, i32)> {
     }
 }
 
-pub fn load_images(settings: &mut Settings) -> Result<Vec<ImageInfo>, String> {
+/// Collects every image of the eligible sources. A source that fails (missing folder, Wallhaven
+/// unreachable, ...) is skipped with a warning instead of failing the whole collection.
+pub fn load_images(settings: &mut Settings, network: NetworkPolicy) -> Result<Vec<ImageInfo>, String> {
     let cache: HashMap<String, ImageCacheEntry> = settings
         .image_cache_entries
         .iter()
@@ -83,6 +94,7 @@ pub fn load_images(settings: &mut Settings) -> Result<Vec<ImageInfo>, String> {
 
     let mut images = Vec::new();
     let mut new_cache = Vec::new();
+    let mut errors = Vec::new();
 
     for source in &settings.source_folders {
         if !is_eligible_source(source, settings) {
@@ -90,18 +102,33 @@ pub fn load_images(settings: &mut Settings) -> Result<Vec<ImageInfo>, String> {
         }
 
         if wallhaven::is_wallhaven_url(&source.path) {
-            for image in wallhaven::fetch_and_cache(source, settings)? {
-                let path = PathBuf::from(&image.path);
-                add_image(image.path, path, &cache, &mut new_cache, &mut images);
+            match wallhaven::images_for_source(source, settings, network) {
+                Ok(paths) => {
+                    for path in paths {
+                        let path_str = path.to_string_lossy().to_string();
+                        add_image(path_str, path, &cache, &mut new_cache, &mut images);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Skipping Wallhaven source {}: {e}", wallhaven::redact(&source.path));
+                    errors.push(e);
+                }
             }
             continue;
         }
 
-        let expanded = shellexpand::full(&source.path)
-            .map_err(|e| format!("Failed to expand source path: {e}"))?;
+        let expanded = match shellexpand::full(&source.path) {
+            Ok(expanded) => expanded,
+            Err(e) => {
+                log::warn!("Skipping source {}: failed to expand path: {e}", source.path);
+                errors.push(format!("Failed to expand source path {}: {e}", source.path));
+                continue;
+            }
+        };
         let root = PathBuf::from(expanded.as_ref());
 
         if !root.is_dir() {
+            log::warn!("Skipping source {}: folder not found", source.path);
             continue;
         }
 
@@ -127,6 +154,9 @@ pub fn load_images(settings: &mut Settings) -> Result<Vec<ImageInfo>, String> {
     }
 
     settings.image_cache_entries = new_cache;
+    if images.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
     Ok(images)
 }
 

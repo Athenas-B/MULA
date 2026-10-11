@@ -11,6 +11,7 @@ mod transition;
 mod wallhaven;
 
 use serde::Serialize;
+use std::sync::OnceLock;
 
 pub use monitors::Monitor;
 pub use settings::Settings;
@@ -38,6 +39,20 @@ pub struct QueuePreview {
 /// so they can be kept in sync with the level chosen in the Wall Changer tab.
 pub struct MaxLevelMenuState(pub Vec<(i32, tauri::menu::CheckMenuItem<tauri::Wry>)>);
 
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Lets background code (the interval service, tray actions) notify the UI.
+pub fn set_app_handle(app: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(app);
+}
+
+pub(crate) fn emit<S: Serialize + Clone>(event: &str, payload: S) {
+    use tauri::Emitter;
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.emit(event, payload);
+    }
+}
+
 pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
     use tauri::Manager;
     if let Some(state) = app.try_state::<MaxLevelMenuState>() {
@@ -47,80 +62,105 @@ pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
     }
 }
 
-#[tauri::command]
-pub fn wc_get_settings() -> Result<Settings, String> {
-    settings::load()
+/// Runs blocking work (disk scans, COM calls, image decoding, network) off the UI thread.
+/// Tauri runs synchronous commands on the main thread, which would freeze the window.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn wc_save_settings(app: tauri::AppHandle, mut settings: Settings) -> Result<(), String> {
+pub async fn wc_get_settings() -> Result<Settings, String> {
+    blocking(settings::load_config).await
+}
+
+/// Saves the user-editable configuration only; runtime state (queue positions, statistics,
+/// image cache, service on/off) lives in a separate file the UI never writes.
+#[tauri::command]
+pub async fn wc_save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
     use tauri::Emitter;
 
-    settings::normalize(&mut settings);
-    settings::save(&settings)?;
+    let saved = blocking(move || {
+        let mut settings = settings;
+        settings::normalize(&mut settings);
+        settings::save_config(&settings)?;
+        Ok(settings)
+    })
+    .await?;
 
-    sync_max_level_menu(&app, settings.maximum_source_level);
-    let _ = app.emit("max-level-changed", settings.maximum_source_level);
+    sync_max_level_menu(&app, saved.maximum_source_level);
+    let _ = app.emit("max-level-changed", saved.maximum_source_level);
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn wc_get_monitors() -> Result<Vec<Monitor>, String> {
-    monitors::get_monitors()
+pub async fn wc_get_monitors() -> Result<Vec<Monitor>, String> {
+    blocking(monitors::get_monitors).await
 }
 
 #[tauri::command]
-pub fn wc_apply() -> Result<String, String> {
+pub async fn wc_apply() -> Result<String, String> {
+    blocking(|| service::apply(false)).await
+}
+
+#[tauri::command]
+pub async fn wc_change_now() -> Result<String, String> {
+    blocking(|| service::apply(false)).await
+}
+
+#[tauri::command]
+pub async fn wc_start_service() -> Result<(), String> {
+    blocking(|| service::set_running(true)).await
+}
+
+#[tauri::command]
+pub async fn wc_stop_service() -> Result<(), String> {
+    blocking(|| service::set_running(false)).await
+}
+
+#[tauri::command]
+pub async fn wc_toggle_service() -> Result<bool, String> {
+    blocking(|| {
+        let running = !settings::service_running()?;
+        service::set_running(running)?;
+        Ok(running)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn wc_get_status() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let config = settings::load_config()?;
+        Ok(serde_json::json!({
+            "running": settings::service_running()?,
+            "interval_minutes": config.interval_minutes,
+            "maximum_source_level": config.maximum_source_level,
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn wc_get_queue_preview() -> Result<Vec<QueuePreview>, String> {
+    blocking(build_queue_previews).await
+}
+
+#[tauri::command]
+pub async fn wc_get_monitor_preview() -> Result<Vec<preview::MonitorPreview>, String> {
+    blocking(|| {
+        let settings = settings::load_config()?;
+        preview::build_monitor_previews(&settings)
+    })
+    .await
+}
+
+fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
     let mut settings = settings::load()?;
-    let result = service::apply(&mut settings, false)?;
-    settings::save(&settings)?;
-    Ok(result)
-}
-
-#[tauri::command]
-pub fn wc_change_now() -> Result<String, String> {
-    let mut settings = settings::load()?;
-    let result = service::apply(&mut settings, false)?;
-    settings::save(&settings)?;
-    Ok(result)
-}
-
-#[tauri::command]
-pub fn wc_start_service() -> Result<(), String> {
-    let mut settings = settings::load()?;
-    settings.change_service_running = true;
-    settings::save(&settings)?;
-    service::start()
-}
-
-#[tauri::command]
-pub fn wc_stop_service() -> Result<(), String> {
-    let mut settings = settings::load()?;
-    settings.change_service_running = false;
-    settings::save(&settings)?;
-    service::stop()
-}
-
-#[tauri::command]
-pub fn wc_toggle_service() -> Result<bool, String> {
-    service::toggle_service_running()
-}
-
-#[tauri::command]
-pub fn wc_get_status() -> Result<serde_json::Value, String> {
-    let settings = settings::load()?;
-    Ok(serde_json::json!({
-        "running": settings.change_service_running,
-        "interval_minutes": settings.interval_minutes,
-        "maximum_source_level": settings.maximum_source_level,
-    }))
-}
-
-#[tauri::command]
-pub fn wc_get_queue_preview() -> Result<Vec<QueuePreview>, String> {
-    let mut settings = settings::load()?;
-    let images = images::load_images(&mut settings)?;
+    // The preview must stay cheap: only use Wallhaven images that are already downloaded.
+    let images = images::load_images(&mut settings, images::NetworkPolicy::CacheOnly)?;
     let monitors = monitors::get_monitors().unwrap_or_default();
 
     let queues = queue::build_queues(&images, &monitors, &settings);
@@ -163,12 +203,6 @@ pub fn wc_get_queue_preview() -> Result<Vec<QueuePreview>, String> {
     }
 
     Ok(previews)
-}
-
-#[tauri::command]
-pub fn wc_get_monitor_preview() -> Result<Vec<preview::MonitorPreview>, String> {
-    let settings = settings::load()?;
-    preview::build_monitor_previews(&settings)
 }
 
 fn build_queue_preview(

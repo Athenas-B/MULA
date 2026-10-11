@@ -42,8 +42,8 @@ fn run_fade(monitor: &Monitor, new_wallpaper_path: &str, settings: &Settings) ->
     let width = monitor.width.max(1) as u32;
     let height = monitor.height.max(1) as u32;
 
-    let from = load_and_cover(&previous_path, width, height)?;
-    let to = load_and_cover(new_wallpaper_path, width, height)?;
+    let from = load_fitted(&previous_path, width, height, settings)?;
+    let to = load_fitted(new_wallpaper_path, width, height, settings)?;
 
     let steps = settings.wallpaper_fade_steps.max(1);
     let total_duration = Duration::from_millis(settings.wallpaper_fade_duration_ms.max(0) as u64);
@@ -68,8 +68,8 @@ fn run_fade(monitor: &Monitor, new_wallpaper_path: &str, settings: &Settings) ->
         }
     }
 
-    // Finish on the real (unstretched) image so Windows applies the configured
-    // Fill/Fit scaling mode normally, rather than leaving the last stretched frame set.
+    // Finish on the real image so Windows applies the configured Fill/Fit mode itself
+    // (and keeps doing so if the resolution changes later).
     set_wallpaper_for_monitor(&monitor.id, new_wallpaper_path)?;
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -84,14 +84,16 @@ fn sanitize_for_filename(value: &str) -> String {
         .collect()
 }
 
-/// Loads an image and resizes it to exactly `width` x `height`, cropping to cover the
-/// target area (so the transition frames line up with the final Fill/Fit result).
-fn load_and_cover(path: &str, width: u32, height: u32) -> Result<RgbImage, String> {
+/// Loads an image and renders it at the monitor's size using the configured Fill/Fit mode, so
+/// the transition frames line up with what Windows shows once the real image is applied.
+fn load_fitted(path: &str, width: u32, height: u32, settings: &Settings) -> Result<RgbImage, String> {
     let img = image::open(path)
         .map_err(|e| format!("Failed to open image for transition ({path}): {e}"))?
-        .to_rgb8();
+        .to_rgba8();
 
-    Ok(image::imageops::resize(&img, width, height, FilterType::Triangle))
+    let background = super::preview::argb_to_rgba(settings.background_color_argb);
+    let fitted = super::preview::fit_to_canvas(&img, width, height, &settings.scaling_mode, background, FilterType::Triangle);
+    Ok(image::DynamicImage::ImageRgba8(fitted).to_rgb8())
 }
 
 fn blend(from: &RgbImage, to: &RgbImage, alpha: f32) -> RgbImage {

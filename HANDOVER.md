@@ -5,7 +5,7 @@
 - **Path:** `C:\Users\olda9\CascadeProjects\MULA`
 - **Remote:** `https://github.com/Athenas-B/MULA.git`
 - **Branch:** `master`
-- **Current HEAD:** `d7d9035 Improve Wallhaven purity UI and allow unlimited page limit (0)`
+- **Last reviewed:** 2026-10-11 (security / robustness pass, see "Architecture notes" below)
 - **Platform focus:** Windows 11 (Tauri app with Windows COM wallpaper APIs)
 
 ## Tech Stack
@@ -14,6 +14,44 @@
 - **Frontend:** Plain HTML/CSS/JavaScript (no framework)
 - **Build tooling:** Cargo + npm
 - **Key crates:** `windows 0.58`, `image 0.25`, `imageproc 0.25`, `ab_glyph`, `rand`, `serde`, `chrono`, `ureq 2`, `base64 0.22`, `winreg`
+
+## App Overview
+
+MULA has four tabs: **VSD** (Python Flask HLS downloader + browser extension, `modules/vsd`),
+**Drive Test** (drive inventory, SMART via smartctl, self-tests, full format), **Wall Changer**
+(below) and **System** (start with Windows, theme). Closing the window hides MULA to the tray;
+the tray's *Exit* quits and stops the elevated helper and the VSD server.
+
+## Architecture notes (read before changing these areas)
+
+- **Wall Changer settings vs. runtime state.** `settings.json` holds only user configuration and is
+  the only thing the UI reads/writes (`wc_get_settings` / `wc_save_settings`). Runtime state
+  (`queue_states`, `image_cache_entries`, `image_show_stats`, `next_monitor_change_index`,
+  `change_service_running`) lives in `state.json`, written only by `service::apply`
+  (`settings::save_apply_state`) and `service::set_running`. These fields are
+  `#[serde(skip_serializing)]` on `Settings`, so a UI save can never roll back service progress.
+  Old combined `settings.json` files are migrated on first `settings::load()`. Both files are
+  written atomically (temp file + rename).
+- **Threading.** All `wc_*` commands are `async` + `spawn_blocking` (sync Tauri commands run on
+  the UI thread). `service::apply` is serialized by `APPLY_LOCK`; tray actions spawn blocking
+  tasks. The interval worker is a plain thread guarded by a generation counter.
+- **Events to the UI.** `wc-service-changed` (bool) and `wc-wallpaper-changed` (message) are
+  emitted from the backend via `wallchanger::emit`, so the tab stays in sync with tray/service.
+- **Wallhaven.** Results are cached per source in `manifest.json` for 6 h (`RESULTS_TTL`);
+  `NetworkPolicy::CacheOnly` is used by previews. Failed refreshes fall back to cached images,
+  and one failing source no longer fails `load_images`. Downloads go through `.part` files.
+  Cache folders are named with FNV-1a (`fnv<hash>`); legacy `DefaultHasher` folders are migrated.
+  API keys are redacted from errors/logs (`wallhaven::redact`).
+- **Elevation (`elevated_helper.rs`).** The long-lived smartctl helper is started via an inline
+  `-EncodedCommand` stub that verifies the SHA-256 of the script before running it; it only runs
+  the smartctl path fixed at launch (must be outside the user profile) with an allowlist of
+  argument shapes, requires a per-session token, names its own response files, and exits when
+  MULA's PID disappears. Formatting uses `run_elevated_script` (separate UAC prompt) and refuses
+  system/boot disks both in Rust (`DriveInfo::is_system`) and in the PowerShell script.
+  Residual risk: a same-user process can still ask the helper for SMART reads / self-tests.
+- **VSD server.** Rejects any `Origin` other than browser-extension origins, rejects non-loopback
+  `Host` headers (DNS rebinding), `/open` only opens files VSD produced or inside the download
+  dir, `/download` only accepts http(s), and only MULA (no Origin) may change the download dir.
 
 ## Wall Changer Port Status
 
@@ -65,18 +103,21 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - `src-tauri/src/wallchanger/wallhaven.rs` — Wallhaven API fetch + local cache.
 - `src-tauri/src/wallchanger/queue.rs` — Image ranking, queue building, sequence state.
 - `src-tauri/src/wallchanger/service.rs` — Background timer service.
-- `src-tauri/src/wallchanger/monitors.rs` — Windows monitor COM API wrappers.
+- `src-tauri/src/wallchanger/monitors/windows.rs` / `linux.rs` — Monitor + wallpaper COM API wrappers (selected via `#[path]`).
+- `src-tauri/src/elevated_helper.rs` — Admin-rights execution (see Architecture notes).
 - `src-tauri/src/wallchanger/overlay.rs` — Picture-name overlay rendering.
 - `src-tauri/src/wallchanger/transition.rs` — Fade transition frame generation.
-- `src-tauri/src/wallchanger/preview.rs` — Monitor-fit preview image rendering.
+- `src-tauri/src/wallchanger/preview.rs` — Monitor-fit preview rendering; `fit_to_canvas` is shared with the fade transition.
 - `src/index.html` / `src/main.js` / `src/styles.css` — Frontend.
 
 ## Settings / Cache Paths
 
-- Settings: `%APPDATA%\mula\wallchanger\settings.json`
+- Settings (user configuration only): `%APPDATA%\mula\wallchanger\settings.json`
+- Runtime state (queues, image cache, stats, service on/off): `%APPDATA%\mula\wallchanger\state.json`
 - Rendered overlay cache: `%APPDATA%\mula\wallchanger\rendered`
 - Fade transition frames: `%APPDATA%\mula\wallchanger\rendered\transitions`
-- Wallhaven download cache: `%APPDATA%\mula\wallchanger\wallhaven`
+- Wallhaven download cache: `%APPDATA%\mula\wallchanger\wallhaven\fnv<hash>\` (+ `manifest.json`)
+- Elevated helper / one-shot script dirs: `%TEMP%\mula_smartd_*`, `%TEMP%\mula_elevated_*`
 - Startup registry: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `MULA`
 
 ## Build & Test Commands
@@ -85,7 +126,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 # Quick Rust checks
 cd src-tauri
 cargo check
-cargo test --lib
+cargo test --lib   # includes helper protocol tests that run PowerShell unelevated (no UAC)
 
 # Full debug bundle (MSI + NSIS installer)
 cd ..
@@ -112,4 +153,6 @@ Debug bundle outputs:
 3. **Random source order** — implement `use_random_source_order` when building the image pool.
 4. **Image show history UI** — expose `image_show_stats` in the Wall Changer tab.
 5. **Wallhaven cache management UI** — add a “Clear Wallhaven cache” / “Re-download” button.
-6. **README update** — README still lists the wallpaper changer as “coming soon”.
+6. **Manual verification still needed** (cannot be covered by unit tests): the real UAC flow of
+   the smartctl helper and of Format (on a spare drive), and the first-run migration of an
+   existing `settings.json` into `state.json`.
