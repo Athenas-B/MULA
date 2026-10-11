@@ -177,26 +177,23 @@ async function installExtension(browser) {
   try {
     const extPath = await invoke("vsd_install_extension", { browser });
     btn.querySelector(".btn-text").textContent = "Done";
-    if (browser === "chrome") {
-      const manifestPath = `${extPath}\\chrome\\manifest.json`;
-      appendLog(`Extension built successfully!\n\n`);
-      appendLog(`Folder opened: ${extPath}\n\n`);
-      appendLog(`To install in Chrome:\n`);
-      appendLog(`  1. Open Chrome and go to chrome://extensions\n`);
-      appendLog(`  2. Enable "Developer mode" (toggle in top-right)\n`);
-      appendLog(`  3. Click "Load unpacked"\n`);
-      appendLog(`  4. Select the folder: ${extPath}\\chrome (contains manifest.json)\n`);
-      appendLog(`     Manifest path: ${manifestPath}\n`);
-    } else {
-      const manifestPath = `${extPath}\\firefox\\manifest.json`;
-      appendLog(`Extension built successfully!\n\n`);
-      appendLog(`Folder opened: ${extPath}\n\n`);
-      appendLog(`To install in Firefox:\n`);
-      appendLog(`  1. Open Firefox and go to about:debugging\n`);
-      appendLog(`  2. Click "This Firefox" in the sidebar\n`);
-      appendLog(`  3. Click "Load Temporary Add-on..."\n`);
-      appendLog(`  4. Select the manifest file: ${manifestPath}\n`);
-    }
+    await revealItemInDir(extPath).catch(() => {});
+    const steps =
+      browser === "chrome"
+        ? [
+            "  1. Open Chrome and go to chrome://extensions",
+            '  2. Enable "Developer mode" (toggle in top-right)',
+            '  3. Click "Load unpacked"',
+            `  4. Select the folder: ${extPath} (contains manifest.json)`,
+          ]
+        : [
+            "  1. Open Firefox and go to about:debugging",
+            '  2. Click "This Firefox" in the sidebar',
+            '  3. Click "Load Temporary Add-on..."',
+            `  4. Select the manifest file: ${extPath}\\manifest.json`,
+          ];
+    const name = browser === "chrome" ? "Chrome" : "Firefox";
+    appendLog(`Extension built successfully: ${extPath}\n\nTo install in ${name}:\n${steps.join("\n")}\n`);
   } catch (err) {
     btn.querySelector(".btn-text").textContent = "Error";
     appendLog(`Extension build failed: ${err}\n`);
@@ -470,7 +467,14 @@ async function initDriveTest() {
     formatBtn.addEventListener("click", () => onFormatDrive());
   }
 
-  await loadDrives();
+  // Enumerating drives runs PowerShell for a few seconds; wait until the tab is opened.
+  const driveTab = document.querySelector('.tab[data-tab="drivetest"]');
+  let drivesLoaded = false;
+  driveTab?.addEventListener("click", () => {
+    if (drivesLoaded) return;
+    drivesLoaded = true;
+    loadDrives();
+  });
 }
 
 async function loadDrives() {
@@ -986,7 +990,7 @@ let wcSelectedSourceIndex = -1;
 async function initWallchanger() {
   document.getElementById("wc-toggle")?.addEventListener("click", wcToggleService);
   document.getElementById("wc-change-now")?.addEventListener("click", wcChangeNow);
-  document.getElementById("wc-apply")?.addEventListener("click", wcApply);
+  document.getElementById("wc-apply")?.addEventListener("click", wcChangeNow);
   document.getElementById("wc-add-folder")?.addEventListener("click", wcAddFolder);
   document.getElementById("wc-add-wallhaven")?.addEventListener("click", wcAddWallhavenUrl);
   document.getElementById("wc-remove-source")?.addEventListener("click", wcRemoveSource);
@@ -1011,11 +1015,7 @@ async function initWallchanger() {
   document.getElementById("wc-queue-refresh")?.addEventListener("click", wcLoadQueuePreview);
   document.getElementById("wc-monitor-preview-refresh")?.addEventListener("click", wcLoadMonitorPreview);
 
-  await wcLoadSettings();
-  await wcLoadStatus();
-  await wcLoadMonitors();
-  await wcLoadMonitorPreview();
-  await wcLoadQueuePreview();
+  await Promise.all([wcLoadSettings(), wcLoadStatus(), wcLoadMonitors(), wcLoadMonitorPreview(), wcLoadQueuePreview()]);
 }
 
 async function wcLoadSettings() {
@@ -1320,17 +1320,6 @@ function wcAutoSave() {
   }, 300);
 }
 
-async function wcApply() {
-  try {
-    wcUpdateModelFromUi();
-    await invoke("wc_save_settings", { settings: wcSettings });
-    const result = await invoke("wc_apply");
-    wcShowMessage(result, "success");
-  } catch (err) {
-    wcShowMessage(`Error applying wallpaper: ${err}`, "error");
-  }
-}
-
 async function wcChangeNow() {
   try {
     wcUpdateModelFromUi();
@@ -1410,7 +1399,6 @@ async function wcLoadQueuePreview() {
 
 function wcRenderQueueCard(q) {
   const rows = q.images
-    .slice(0, 30)
     .map((img) => {
       const badges = [
         img.is_next ? `<span class="wallchanger-badge next">Next</span>` : "",
@@ -1424,7 +1412,8 @@ function wcRenderQueueCard(q) {
     })
     .join("");
 
-  const more = q.images.length > 30 ? `<li class="wallchanger-queue-more">+${q.images.length - 30} more</li>` : "";
+  const hidden = q.image_count - q.images.length;
+  const more = hidden > 0 ? `<li class="wallchanger-queue-more">+${hidden} more</li>` : "";
   const nextHint = q.rotation_mode === "Random" ? "Next picture is chosen randomly" : "";
 
   return `<div class="wallchanger-queue-card">

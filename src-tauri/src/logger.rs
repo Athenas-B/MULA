@@ -4,22 +4,17 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
 
 const MAX_LINES: usize = 1000;
 const LOG_FILE_NAME: &str = "mula.log";
 
-fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|p| p.join("mula"))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 pub fn logs_dir() -> PathBuf {
-    config_dir().join("logs")
+    crate::util::mula_config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("logs")
 }
 
 pub fn log_path() -> PathBuf {
@@ -84,45 +79,21 @@ pub fn init() -> Result<(), log::SetLoggerError> {
 
     // Load any existing log file so we keep history across restarts.
     let mut initial_lines: VecDeque<String> = VecDeque::with_capacity(MAX_LINES + 1);
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(&path) {
-            for line in content.lines() {
-                if !line.trim().is_empty() {
-                    initial_lines.push_back(line.to_string());
-                }
-            }
+    if let Ok(content) = fs::read_to_string(&path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            push_line(&mut initial_lines, line.to_string());
         }
-    }
-    while initial_lines.len() > MAX_LINES {
-        initial_lines.pop_front();
     }
 
     thread::spawn(move || {
         let mut lines = initial_lines;
         let _ = write_log_lines(&path, &lines);
-        // Only rewrite the file when new lines arrived; otherwise an idle app would rewrite
-        // the whole log every second.
-        let mut dirty = false;
-        loop {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(msg) => {
-                    push_line(&mut lines, msg);
-                    // Batch everything already queued into a single write.
-                    while let Ok(msg) = rx.try_recv() {
-                        push_line(&mut lines, msg);
-                    }
-                    dirty = true;
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+        // Write only when something was logged, batching everything already queued.
+        while let Ok(msg) = rx.recv() {
+            push_line(&mut lines, msg);
+            for msg in rx.try_iter() {
+                push_line(&mut lines, msg);
             }
-            if dirty {
-                let _ = write_log_lines(&path, &lines);
-                dirty = false;
-            }
-        }
-        // Final flush before the thread exits
-        if dirty {
             let _ = write_log_lines(&path, &lines);
         }
     });

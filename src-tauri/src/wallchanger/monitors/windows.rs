@@ -1,28 +1,10 @@
-use serde::{Deserialize, Serialize};
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{DesktopWallpaper, DESKTOP_WALLPAPER_POSITION, DSS_ENABLED, IDesktopWallpaper};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Monitor {
-    pub id: String,
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
-impl Monitor {
-    pub fn aspect_ratio(&self) -> f64 {
-        if self.height == 0 {
-            return 1.0;
-        }
-        self.width as f64 / self.height as f64
-    }
-}
+pub use super::Monitor;
+use super::settings::ScalingMode;
 
 pub fn initialize_com() -> Result<(), String> {
     unsafe {
@@ -33,86 +15,97 @@ pub fn initialize_com() -> Result<(), String> {
     Ok(())
 }
 
-pub fn create_desktop_wallpaper() -> Result<IDesktopWallpaper, String> {
+/// Initializes COM on the calling thread (idempotent) and creates the wallpaper COM object.
+fn desktop_wallpaper() -> Result<IDesktopWallpaper, String> {
+    initialize_com()?;
     unsafe {
         CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL)
             .map_err(|e| format!("Failed to create IDesktopWallpaper: {e}"))
     }
 }
 
-pub fn get_monitors() -> Result<Vec<Monitor>, String> {
-    initialize_com()?;
-    let wallpaper = create_desktop_wallpaper()?;
+/// Copies a string allocated by COM and frees it.
+unsafe fn take_pwstr(value: PWSTR) -> Result<String, String> {
+    let text = value.to_string().map_err(|e| format!("Failed to read string from Windows: {e}"));
+    CoTaskMemFree(Some(value.as_ptr() as *const _));
+    text
+}
 
+fn monitor_ids(wallpaper: &IDesktopWallpaper) -> Result<Vec<String>, String> {
     unsafe {
-        let count = wallpaper.GetMonitorDevicePathCount()
+        let count = wallpaper
+            .GetMonitorDevicePathCount()
             .map_err(|e| format!("Failed to get monitor count: {e}"))?;
-
-        let mut monitors = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let id_pwstr = wallpaper.GetMonitorDevicePathAt(i)
-                .map_err(|e| format!("Failed to get monitor device path: {e}"))?;
-            let id = id_pwstr.to_string()
-                .map_err(|e| format!("Failed to read monitor id: {e}"))?;
-            CoTaskMemFree(Some(id_pwstr.as_ptr() as *const _));
-
-            let id_hstring = HSTRING::from(&id);
-            match wallpaper.GetMonitorRECT(&id_hstring) {
-                Ok(rect) => {
-                    monitors.push(Monitor {
-                        id,
-                        left: rect.left,
-                        top: rect.top,
-                        right: rect.right,
-                        bottom: rect.bottom,
-                        width: rect.right - rect.left,
-                        height: rect.bottom - rect.top,
-                    });
-                }
-                Err(e) => {
-                    log::warn!("Skipping monitor {id}: could not get monitor rect: {e}");
-                }
-            }
-        }
-
-        if monitors.is_empty() {
-            return Err("No active monitors were found".to_string());
-        }
-
-        Ok(monitors)
+        (0..count)
+            .map(|i| {
+                let id = wallpaper
+                    .GetMonitorDevicePathAt(i)
+                    .map_err(|e| format!("Failed to get monitor device path: {e}"))?;
+                take_pwstr(id)
+            })
+            .collect()
     }
+}
+
+fn wallpaper_for_monitor(wallpaper: &IDesktopWallpaper, monitor_id: &HSTRING) -> Result<String, String> {
+    unsafe {
+        let path = wallpaper
+            .GetWallpaper(monitor_id)
+            .map_err(|e| format!("Failed to get current wallpaper: {e}"))?;
+        take_pwstr(path)
+    }
+}
+
+pub fn get_monitors() -> Result<Vec<Monitor>, String> {
+    let wallpaper = desktop_wallpaper()?;
+
+    let mut monitors = Vec::new();
+    for id in monitor_ids(&wallpaper)? {
+        match unsafe { wallpaper.GetMonitorRECT(&HSTRING::from(&id)) } {
+            Ok(rect) => monitors.push(Monitor {
+                id,
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
+            }),
+            Err(e) => log::warn!("Skipping monitor {id}: could not get monitor rect: {e}"),
+        }
+    }
+
+    if monitors.is_empty() {
+        return Err("No active monitors were found".to_string());
+    }
+    Ok(monitors)
 }
 
 pub fn set_wallpaper_for_monitor(monitor_id: &str, image_path: &str) -> Result<(), String> {
-    initialize_com()?;
-    let wallpaper = create_desktop_wallpaper()?;
-
+    let wallpaper = desktop_wallpaper()?;
     unsafe {
-        let id = HSTRING::from(monitor_id);
-        let path = HSTRING::from(image_path);
-        wallpaper.SetWallpaper(&id, &path)
-            .map_err(|e| format!("Failed to set wallpaper: {e}"))?;
+        wallpaper
+            .SetWallpaper(&HSTRING::from(monitor_id), &HSTRING::from(image_path))
+            .map_err(|e| format!("Failed to set wallpaper: {e}"))
     }
-    Ok(())
 }
 
-pub fn apply_display_settings(scaling_mode: &super::settings::ScalingMode, background_color_argb: i32) -> Result<(), String> {
-    initialize_com()?;
-    let wallpaper = create_desktop_wallpaper()?;
+pub fn apply_display_settings(scaling_mode: &ScalingMode, background_color_argb: i32) -> Result<(), String> {
+    let wallpaper = desktop_wallpaper()?;
 
     let position = match scaling_mode {
-        super::settings::ScalingMode::Fill => DESKTOP_WALLPAPER_POSITION(4), // DWPOS_FILL
-        super::settings::ScalingMode::FitInsideScreen => DESKTOP_WALLPAPER_POSITION(3), // DWPOS_FIT
+        ScalingMode::Fill => DESKTOP_WALLPAPER_POSITION(4),            // DWPOS_FILL
+        ScalingMode::FitInsideScreen => DESKTOP_WALLPAPER_POSITION(3), // DWPOS_FIT
     };
 
-    let color_ref = argb_to_colorref(background_color_argb);
-
     unsafe {
-        wallpaper.SetPosition(position)
+        wallpaper
+            .SetPosition(position)
             .map_err(|e| format!("Failed to set wallpaper position: {e}"))?;
 
-        if matches!(scaling_mode, super::settings::ScalingMode::FitInsideScreen) {
-            wallpaper.SetBackgroundColor(COLORREF(color_ref))
+        if matches!(scaling_mode, ScalingMode::FitInsideScreen) {
+            wallpaper
+                .SetBackgroundColor(COLORREF(argb_to_colorref(background_color_argb)))
                 .map_err(|e| format!("Failed to set background color: {e}"))?;
         }
     }
@@ -127,59 +120,35 @@ fn argb_to_colorref(argb: i32) -> u32 {
 }
 
 pub fn is_windows_slideshow_enabled() -> Result<bool, String> {
-    initialize_com()?;
-    let wallpaper = create_desktop_wallpaper()?;
-
+    let wallpaper = desktop_wallpaper()?;
     unsafe {
-        let state = wallpaper.GetStatus()
+        let state = wallpaper
+            .GetStatus()
             .map_err(|e| format!("Failed to get wallpaper status: {e}"))?;
         Ok(state.contains(DSS_ENABLED))
-    }
-}
-
-fn get_wallpaper_for_monitor(wallpaper: &IDesktopWallpaper, monitor_id: &HSTRING) -> Result<String, String> {
-    unsafe {
-        let path_pwstr = wallpaper.GetWallpaper(monitor_id)
-            .map_err(|e| format!("Failed to get current wallpaper: {e}"))?;
-        let path = path_pwstr.to_string()
-            .map_err(|e| format!("Failed to read wallpaper path: {e}"))?;
-        CoTaskMemFree(Some(path_pwstr.as_ptr() as *const _));
-        Ok(path)
     }
 }
 
 /// Returns the wallpaper file currently set for a monitor, according to Windows itself
 /// (used as the "before" frame when building a fade transition).
 pub fn get_current_wallpaper(monitor_id: &str) -> Result<String, String> {
-    initialize_com()?;
-    let wallpaper = create_desktop_wallpaper()?;
-    let id_hstring = HSTRING::from(monitor_id);
-    get_wallpaper_for_monitor(&wallpaper, &id_hstring)
+    let wallpaper = desktop_wallpaper()?;
+    wallpaper_for_monitor(&wallpaper, &HSTRING::from(monitor_id))
 }
 
+/// Re-applies each monitor's current wallpaper, which stops a running Windows slideshow.
 pub fn try_disable_windows_slideshow() -> Result<(), String> {
-    initialize_com()?;
-    let wallpaper = create_desktop_wallpaper()?;
+    let wallpaper = desktop_wallpaper()?;
 
-    unsafe {
-        let count = wallpaper.GetMonitorDevicePathCount()
-            .map_err(|e| format!("Failed to get monitor count: {e}"))?;
-
-        for i in 0..count {
-            let id_pwstr = wallpaper.GetMonitorDevicePathAt(i)
-                .map_err(|e| format!("Failed to get monitor device path: {e}"))?;
-            let id = id_pwstr.to_string()
-                .map_err(|e| format!("Failed to read monitor id: {e}"))?;
-            CoTaskMemFree(Some(id_pwstr.as_ptr() as *const _));
-
-            let id_hstring = HSTRING::from(&id);
-            let current = match get_wallpaper_for_monitor(&wallpaper, &id_hstring) {
-                Ok(p) if !p.is_empty() => p,
-                _ => continue,
-            };
-
-            let current_hstring = HSTRING::from(&current);
-            wallpaper.SetWallpaper(&id_hstring, &current_hstring)
+    for id in monitor_ids(&wallpaper)? {
+        let id = HSTRING::from(&id);
+        let current = match wallpaper_for_monitor(&wallpaper, &id) {
+            Ok(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+        unsafe {
+            wallpaper
+                .SetWallpaper(&id, &HSTRING::from(&current))
                 .map_err(|e| format!("Failed to reapply wallpaper to stop slideshow: {e}"))?;
         }
     }

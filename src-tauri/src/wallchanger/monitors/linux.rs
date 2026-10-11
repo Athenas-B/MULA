@@ -1,32 +1,8 @@
-use serde::{Deserialize, Serialize};
+pub use super::Monitor;
 use super::settings::ScalingMode;
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Monitor {
-    pub id: String,
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
-impl Monitor {
-    pub fn aspect_ratio(&self) -> f64 {
-        if self.height == 0 {
-            return 1.0;
-        }
-        self.width as f64 / self.height as f64
-    }
-}
 
 pub fn initialize_com() -> Result<(), String> {
     Ok(())
-}
-
-pub fn create_desktop_wallpaper() -> Result<(), String> {
-    Err("Desktop wallpaper API is only available on Windows".to_string())
 }
 
 pub fn get_monitors() -> Result<Vec<Monitor>, String> {

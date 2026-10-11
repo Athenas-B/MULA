@@ -98,8 +98,9 @@ function Write-Response([string]$id, $res) {
 if (-not (Test-DirIsSafe)) { exit 3 }
 [IO.File]::WriteAllText((Join-Path $Dir 'ready'), '', $utf8)
 
+$tick = 0
 while ($true) {
-    if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+    if (($tick++ % 8) -eq 0 -and -not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
     $files = Get-ChildItem -LiteralPath $Dir -Filter 'cmd_*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime
     foreach ($f in $files) {
         $id = $f.BaseName.Substring(4)
@@ -133,7 +134,7 @@ while ($true) {
         Write-Response $id $res
         if ($exitAfter) { exit 0 }
     }
-    Start-Sleep -Milliseconds 100
+    Start-Sleep -Milliseconds 250
 }
 "#;
 
@@ -150,9 +151,14 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Escapes a value for use inside a PowerShell single-quoted string literal.
+pub fn ps_escape(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// Quotes a value as a PowerShell single-quoted string literal.
 pub fn ps_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", ps_escape(value))
 }
 
 /// Encodes a script for `powershell -EncodedCommand` (base64 of UTF-16LE).
@@ -187,16 +193,32 @@ fn write_script_with_stub(dir: &Path, script: &str) -> Result<String, String> {
     ))
 }
 
+/// Launcher exit codes for "Start-Process failed" and "the UAC prompt was declined".
+const EXIT_START_FAILED: i32 = 9001;
+const EXIT_UAC_DECLINED: i32 = 9002;
+
 /// Starts `stub` in a new PowerShell process, elevated through UAC when `elevate` is set.
 /// With `wait`, blocks until it finishes and returns its exit code.
 fn launch_stub(stub: &str, elevate: bool, wait: bool) -> Result<i32, String> {
     let verb = if elevate { "-Verb RunAs " } else { "" };
     let wait_flags = if wait { "-Wait -PassThru " } else { "" };
-    let launcher = format!(
-        "$ErrorActionPreference = 'Stop';          try {{ $p = Start-Process -FilePath 'powershell.exe' {verb}{wait_flags}-WindowStyle Hidden          -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-EncodedCommand','{encoded}' }}          catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 9001 }};          {exit}",
-        encoded = encode_ps(stub),
-        exit = if wait { "exit $p.ExitCode" } else { "exit 0" },
-    );
+    let launcher = [
+        "$ErrorActionPreference = 'Stop'".to_string(),
+        format!(
+            "try {{ $p = Start-Process -FilePath 'powershell.exe' {verb}{wait_flags}-WindowStyle Hidden \
+             -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-WindowStyle','Hidden',\
+             '-EncodedCommand','{}' }}",
+            encode_ps(stub)
+        ),
+        format!(
+            "catch {{ $e = $_.Exception; \
+             while ($e -and -not ($e -is [ComponentModel.Win32Exception])) {{ $e = $e.InnerException }}; \
+             if ($e -and $e.NativeErrorCode -eq 1223) {{ exit {EXIT_UAC_DECLINED} }}; \
+             [Console]::Error.WriteLine($_.Exception.Message); exit {EXIT_START_FAILED} }}"
+        ),
+        (if wait { "exit $p.ExitCode" } else { "exit 0" }).to_string(),
+    ]
+    .join("\n");
 
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encode_ps(&launcher)])
@@ -206,15 +228,14 @@ fn launch_stub(stub: &str, elevate: bool, wait: bool) -> Result<i32, String> {
         .output()
         .map_err(|e| format!("Failed to start PowerShell: {e}"))?;
 
-    let code = output.status.code().unwrap_or(-1);
-    if code == 9001 {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.to_lowercase().contains("canceled by the user") {
-            return Err("Administrator rights were declined".to_string());
-        }
-        return Err(format!("Failed to start elevated process: {stderr}"));
+    match output.status.code().unwrap_or(-1) {
+        EXIT_UAC_DECLINED => Err("Administrator rights were declined".to_string()),
+        EXIT_START_FAILED => Err(format!(
+            "Failed to start elevated process: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        code => Ok(code),
     }
-    Ok(code)
 }
 
 /// Refuses executables the current user could replace, since the helper runs them elevated.
@@ -243,8 +264,8 @@ fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, String> {
     let cmd_dir = new_private_dir("mula_smartd")?;
     let token = random_token();
     let script = HELPER_SCRIPT
-        .replace("__DIR__", &cmd_dir.to_string_lossy().replace('\'', "''"))
-        .replace("__EXE__", &exe.to_string_lossy().replace('\'', "''"))
+        .replace("__DIR__", &ps_escape(&cmd_dir.to_string_lossy()))
+        .replace("__EXE__", &ps_escape(&exe.to_string_lossy()))
         .replace("__TOKEN__", &token)
         .replace("__PARENT_PID__", &std::process::id().to_string());
     let stub = write_script_with_stub(&cmd_dir, &script)?;
@@ -356,7 +377,7 @@ pub fn run_elevated_script(script: &str) -> Result<String, String> {
 fn run_script(script: &str, elevate: bool) -> Result<String, String> {
     let dir = new_private_dir("mula_elevated")?;
     let result_path = dir.join("result.txt");
-    let script = script.replace("__RESULT_PATH__", &result_path.to_string_lossy().replace('\'', "''"));
+    let script = script.replace("__RESULT_PATH__", &ps_escape(&result_path.to_string_lossy()));
 
     let outcome = write_script_with_stub(&dir, &script).and_then(|stub| launch_stub(&stub, elevate, true));
     let message = std::fs::read(&result_path)
@@ -452,6 +473,12 @@ mod tests {
 #[cfg(test)]
 mod encoding_tests {
     use super::*;
+
+    #[test]
+    fn powershell_values_are_escaped_for_single_quoted_literals() {
+        assert_eq!(ps_escape(r"C:\O'Brien\x"), r"C:\O''Brien\x");
+        assert_eq!(ps_quote("a'b"), format!("'{}'", ps_escape("a'b")));
+    }
 
     #[test]
     fn powershell_literals_escape_single_quotes() {

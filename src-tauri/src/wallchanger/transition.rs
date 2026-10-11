@@ -52,20 +52,21 @@ fn run_fade(monitor: &Monitor, new_wallpaper_path: &str, settings: &Settings) ->
     let dir = transition_dir()?;
     let monitor_key = sanitize_for_filename(&monitor.id);
 
+    // Render every frame before showing any, so encoding time doesn't stretch the fade.
+    let mut frames = Vec::with_capacity(steps as usize);
     for step in 1..=steps {
-        let alpha = step as f32 / steps as f32;
-        let frame = blend(&from, &to, alpha);
-
         let frame_path = dir.join(format!("{monitor_key}_{step}.jpg"));
-        frame
+        blend(&from, &to, step as f32 / steps as f32)
             .save(&frame_path)
             .map_err(|e| format!("Failed to save transition frame: {e}"))?;
+        frames.push(frame_path);
+    }
 
-        set_wallpaper_for_monitor(&monitor.id, &frame_path.to_string_lossy())?;
-
-        if step < steps {
+    for (i, frame_path) in frames.iter().enumerate() {
+        if i > 0 {
             std::thread::sleep(step_duration);
         }
+        set_wallpaper_for_monitor(&monitor.id, &frame_path.to_string_lossy())?;
     }
 
     // Finish on the real image so Windows applies the configured Fill/Fit mode itself
@@ -98,22 +99,13 @@ fn load_fitted(path: &str, width: u32, height: u32, settings: &Settings) -> Resu
 
 fn blend(from: &RgbImage, to: &RgbImage, alpha: f32) -> RgbImage {
     let (width, height) = from.dimensions();
-    let mut out = RgbImage::new(width, height);
-
-    for y in 0..height {
-        for x in 0..width {
-            let a = from.get_pixel(x, y).0;
-            let b = to.get_pixel(x, y).0;
-            let mixed = [
-                lerp(a[0], b[0], alpha),
-                lerp(a[1], b[1], alpha),
-                lerp(a[2], b[2], alpha),
-            ];
-            out.put_pixel(x, y, image::Rgb(mixed));
-        }
-    }
-
-    out
+    let mixed = from
+        .as_raw()
+        .iter()
+        .zip(to.as_raw())
+        .map(|(&a, &b)| lerp(a, b, alpha))
+        .collect();
+    RgbImage::from_raw(width, height, mixed).expect("both frames have the monitor's size")
 }
 
 fn lerp(a: u8, b: u8, alpha: f32) -> u8 {

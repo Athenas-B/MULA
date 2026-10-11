@@ -151,8 +151,13 @@ fn refresh(source: &Source, settings: &Settings, cache_dir: &Path, query: String
             std::thread::sleep(API_REQUEST_SPACING);
         }
 
-        let url = build_api_url(base_url, api_key, page, purity)?;
-        let response = match agent.get(&url).call() {
+        let url = build_api_url(base_url, page, purity)?;
+        let mut request = agent.get(&url);
+        if let Some(key) = api_key {
+            // A header keeps the key out of URLs, and so out of logs and error messages.
+            request = request.set("X-API-Key", key);
+        }
+        let response = match request.call() {
             Ok(r) => r,
             Err(ureq::Error::Status(429, _)) if !image_urls.is_empty() => {
                 log::warn!("Wallhaven rate limit reached after {} page(s); using the results so far", page - 1);
@@ -229,9 +234,7 @@ fn read_manifest(cache_dir: &Path) -> Option<Manifest> {
 
 fn write_manifest(cache_dir: &Path, manifest: &Manifest) -> Result<(), String> {
     let text = serde_json::to_string(manifest).map_err(|e| e.to_string())?;
-    let tmp = cache_dir.join(format!("{MANIFEST_FILE}.tmp"));
-    fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, cache_dir.join(MANIFEST_FILE)).map_err(|e| e.to_string())
+    crate::util::write_atomic(&cache_dir.join(MANIFEST_FILE), &text)
 }
 
 /// Files of the last successful fetch, or (for caches made before manifests existed) every
@@ -286,7 +289,7 @@ fn legacy_cache_folder_name(url: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn build_api_url(input: &str, api_key: Option<&str>, page: u32, purity: &str) -> Result<String, String> {
+fn build_api_url(input: &str, page: u32, purity: &str) -> Result<String, String> {
     let trimmed = input.trim();
 
     if trimmed.contains("/api/v1/search") {
@@ -296,9 +299,6 @@ fn build_api_url(input: &str, api_key: Option<&str>, page: u32, purity: &str) ->
         }
         set_or_append_param(&mut url, "purity", purity);
         set_or_append_param(&mut url, "page", &page.to_string());
-        if let Some(key) = api_key {
-            set_or_append_param(&mut url, "apikey", key);
-        }
         return Ok(url);
     }
 
@@ -314,9 +314,6 @@ fn build_api_url(input: &str, api_key: Option<&str>, page: u32, purity: &str) ->
         };
         set_or_append_param(&mut url, "purity", purity);
         set_or_append_param(&mut url, "page", &page.to_string());
-        if let Some(key) = api_key {
-            set_or_append_param(&mut url, "apikey", key);
-        }
         return Ok(url);
     }
 
@@ -440,15 +437,16 @@ mod tests {
 
     #[test]
     fn api_url_is_built_from_search_page_urls() {
-        let url = build_api_url("https://wallhaven.cc/search?q=forest&purity=100", Some("k"), 3, "110").unwrap();
-        assert_eq!(url, "https://wallhaven.cc/api/v1/search?q=forest&purity=110&page=3&apikey=k");
-        assert!(build_api_url("https://wallhaven.cc/w/abc", None, 1, "100").is_err());
+        let url = build_api_url("https://wallhaven.cc/search?q=forest&purity=100", 3, "110").unwrap();
+        assert_eq!(url, "https://wallhaven.cc/api/v1/search?q=forest&purity=110&page=3");
+        assert!(!url.contains("apikey"), "the API key is sent as a header, never in the URL");
+        assert!(build_api_url("https://wallhaven.cc/w/abc", 1, "100").is_err());
     }
 
     #[test]
     fn cached_files_follow_the_manifest_and_skip_missing_files() {
-        let dir = std::env::temp_dir().join(format!("mula_wh_test_{}", now_secs()));
-        fs::create_dir_all(&dir).unwrap();
+        let tmp = crate::test_support::TempDir::new("wh_cached");
+        let dir = tmp.path().to_path_buf();
         fs::write(dir.join("a.jpg"), b"x").unwrap();
         fs::write(dir.join("b.jpg.part"), b"x").unwrap();
 
@@ -456,7 +454,6 @@ mod tests {
         assert_eq!(cached_files(&dir, Some(&manifest)), vec![dir.join("a.jpg")]);
         // Without a manifest, partial downloads are never picked up.
         assert_eq!(cached_files(&dir, None), vec![dir.join("a.jpg")]);
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -510,16 +507,16 @@ mod helper_tests {
     #[test]
     fn api_urls_are_completed_with_scheme_purity_page_and_key() {
         assert_eq!(
-            build_api_url("wallhaven.cc/api/v1/search?q=a", None, 1, "100").unwrap(),
+            build_api_url("wallhaven.cc/api/v1/search?q=a", 1, "100").unwrap(),
             "https://wallhaven.cc/api/v1/search?q=a&purity=100&page=1"
         );
         assert_eq!(
-            build_api_url("https://wallhaven.cc/search?", None, 2, "110").unwrap(),
+            build_api_url("https://wallhaven.cc/search?", 2, "110").unwrap(),
             "https://wallhaven.cc/api/v1/search?purity=110&page=2"
         );
         assert_eq!(
-            build_api_url("https://wallhaven.cc/api/v1/search?apikey=old&page=9", Some("new"), 1, "111").unwrap(),
-            "https://wallhaven.cc/api/v1/search?apikey=new&page=1&purity=111"
+            build_api_url("https://wallhaven.cc/api/v1/search?apikey=pasted&page=9", 1, "111").unwrap(),
+            "https://wallhaven.cc/api/v1/search?apikey=pasted&page=1&purity=111"
         );
     }
 

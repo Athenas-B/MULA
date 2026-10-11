@@ -2,7 +2,8 @@ use super::images::ImageInfo;
 use super::monitors::Monitor;
 use super::settings::{PictureSizeHandling, QueueState, RotationMode, Settings};
 use rand::Rng;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct RankedImage {
@@ -11,8 +12,13 @@ pub struct RankedImage {
     pub last_resort: bool,
 }
 
+/// Whether all monitors draw from one shared queue.
+pub fn uses_shared_queue(settings: &Settings, monitor_count: usize) -> bool {
+    !settings.use_separate_monitor_queues || monitor_count <= 1
+}
+
 pub fn get_queue_key(settings: &Settings, monitor_count: usize, monitor_id: &str, fallback: bool) -> String {
-    if !settings.use_separate_monitor_queues || monitor_count <= 1 {
+    if uses_shared_queue(settings, monitor_count) {
         "shared".to_string()
     } else if fallback {
         format!("fallback:{monitor_id}")
@@ -93,50 +99,36 @@ pub fn rank_images_for_monitor(images: &[ImageInfo], monitor: &Monitor, settings
         .iter()
         .map(|image| {
             let (score, last_resort) = score_image(image, monitor, settings);
-            RankedImage {
-                image: image.clone(),
-                score,
-                last_resort,
-            }
+            RankedImage { image: image.clone(), score, last_resort }
         })
         .collect();
-
-    ranked.sort_by(|a, b| {
-        a.last_resort
-            .cmp(&b.last_resort)
-            .then(a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
+    ranked.sort_by(rank_sort);
     ranked
+}
+
+/// The monitor an image fits best, with its score (the first monitor wins ties).
+fn best_fit<'a>(image: &ImageInfo, monitors: &'a [Monitor], settings: &Settings) -> Option<(&'a Monitor, f64, bool)> {
+    monitors
+        .iter()
+        .map(|monitor| {
+            let (score, last_resort) = score_image(image, monitor, settings);
+            (monitor, score, last_resort)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
 }
 
 pub fn build_queues(images: &[ImageInfo], monitors: &[Monitor], settings: &Settings) -> HashMap<String, Vec<RankedImage>> {
     let mut queues = HashMap::new();
 
-    if !settings.use_separate_monitor_queues || monitors.len() <= 1 {
+    if uses_shared_queue(settings, monitors.len()) {
         // Shared queue: rank each image against its best-fitting monitor.
         let mut shared: Vec<RankedImage> = images
             .iter()
-            .map(|image| {
-                let mut best: Option<RankedImage> = None;
-                for monitor in monitors {
-                    let (score, last_resort) = score_image(image, monitor, settings);
-                    if best.is_none() || score < best.as_ref().unwrap().score {
-                        best = Some(RankedImage {
-                            image: image.clone(),
-                            score,
-                            last_resort,
-                        });
-                    }
-                }
-                best.unwrap_or_else(|| RankedImage {
-                    image: image.clone(),
-                    score: f64::MAX,
-                    last_resort: true,
-                })
+            .map(|image| match best_fit(image, monitors, settings) {
+                Some((_, score, last_resort)) => RankedImage { image: image.clone(), score, last_resort },
+                None => RankedImage { image: image.clone(), score: f64::MAX, last_resort: true },
             })
             .collect();
-
         shared.sort_by(rank_sort);
         queues.insert("shared".to_string(), shared);
         return queues;
@@ -145,23 +137,14 @@ pub fn build_queues(images: &[ImageInfo], monitors: &[Monitor], settings: &Setti
     if settings.keep_image_in_single_monitor_queue {
         // Assign each image to exactly one monitor queue (the one it fits best).
         for image in images {
-            let mut best: Option<(String, RankedImage)> = None;
-            for monitor in monitors {
-                let (score, last_resort) = score_image(image, monitor, settings);
+            if let Some((monitor, score, last_resort)) = best_fit(image, monitors, settings) {
                 let key = get_queue_key(settings, monitors.len(), &monitor.id, false);
-                if best.is_none() || score < best.as_ref().unwrap().1.score {
-                    best = Some((key, RankedImage {
-                        image: image.clone(),
-                        score,
-                        last_resort,
-                    }));
-                }
-            }
-            if let Some((key, ranked)) = best {
-                queues.entry(key).or_default().push(ranked);
+                queues
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .push(RankedImage { image: image.clone(), score, last_resort });
             }
         }
-
         for queue in queues.values_mut() {
             queue.sort_by(rank_sort);
         }
@@ -209,7 +192,7 @@ pub fn peek_next_sequence_path(queue: &[RankedImage], state: &QueueState) -> Opt
         return None;
     }
 
-    let available: std::collections::HashSet<&String> = queue.iter().map(|r| &r.image.path).collect();
+    let available: HashSet<&String> = queue.iter().map(|r| &r.image.path).collect();
     let ordered: Vec<&String> = state
         .ordered_image_paths
         .iter()
@@ -224,45 +207,28 @@ pub fn peek_next_sequence_path(queue: &[RankedImage], state: &QueueState) -> Opt
     Some(ordered[idx].clone())
 }
 
-pub fn choose_from_queue(
-    queue: &[RankedImage],
-    rotation_mode: RotationMode,
-    _queue_key: &str,
-    state: &mut QueueState,
-) -> Option<RankedImage> {
+pub fn choose_from_queue(queue: &[RankedImage], rotation_mode: RotationMode, state: &mut QueueState) -> Option<RankedImage> {
     if queue.is_empty() {
         return None;
     }
 
-    // Rebuild ordered paths if missing or mismatched.
-    let available: std::collections::HashSet<String> = queue.iter().map(|r| r.image.path.clone()).collect();
-    if state.ordered_image_paths.is_empty() || !state.ordered_image_paths.iter().any(|p| available.contains(p)) {
+    // Rebuild ordered paths if missing or mismatched; otherwise drop missing paths but keep order.
+    let available: HashSet<&str> = queue.iter().map(|r| r.image.path.as_str()).collect();
+    if !state.ordered_image_paths.iter().any(|p| available.contains(p.as_str())) {
         state.ordered_image_paths = queue.iter().map(|r| r.image.path.clone()).collect();
         state.next_index = 0;
     } else {
-        // Remove missing paths but keep order.
-        state.ordered_image_paths.retain(|p| available.contains(p));
+        state.ordered_image_paths.retain(|p| available.contains(p.as_str()));
     }
 
     match rotation_mode {
         RotationMode::Random => {
             let candidates: Vec<&RankedImage> = queue.iter().filter(|r| !r.last_resort).collect();
-            let pool: Vec<RankedImage> = if candidates.is_empty() {
-                queue.to_vec()
-            } else {
-                candidates.iter().map(|&r| r.clone()).collect()
-            };
-            if pool.is_empty() {
-                return None;
-            }
-            let mut rng = rand::thread_rng();
-            let index = rng.gen_range(0..pool.len());
+            let pool = if candidates.is_empty() { queue.iter().collect() } else { candidates };
+            let index = rand::thread_rng().gen_range(0..pool.len());
             Some(pool[index].clone())
         }
         RotationMode::Sequence => {
-            if state.ordered_image_paths.is_empty() {
-                return None;
-            }
             if state.next_index >= state.ordered_image_paths.len() as i32 {
                 state.next_index = 0;
             }
@@ -426,7 +392,7 @@ mod tests {
         let mut state = sequence_state(&queue);
 
         let picked: Vec<String> = (0..4)
-            .map(|_| choose_from_queue(&queue, RotationMode::Sequence, "k", &mut state).unwrap().image.path)
+            .map(|_| choose_from_queue(&queue, RotationMode::Sequence, &mut state).unwrap().image.path)
             .collect();
         assert_eq!(picked, ["a.jpg", "b.jpg", "c.jpg", "a.jpg"]);
     }
@@ -439,7 +405,7 @@ mod tests {
         state.next_index = 1;
 
         let without_b = rank_images_for_monitor(&[all[0].clone(), all[2].clone()], &m, &settings());
-        let next = choose_from_queue(&without_b, RotationMode::Sequence, "k", &mut state).unwrap();
+        let next = choose_from_queue(&without_b, RotationMode::Sequence, &mut state).unwrap();
         assert_eq!(next.image.path, "c.jpg");
         assert_eq!(state.ordered_image_paths, ["a.jpg", "c.jpg"]);
     }
@@ -450,7 +416,7 @@ mod tests {
         let mut state = QueueState { ordered_image_paths: vec!["gone.jpg".into()], next_index: 5, ..Default::default() };
         let queue = rank_images_for_monitor(&[image("new1.jpg", 1, 1), image("new2.jpg", 1, 1)], &m, &settings());
 
-        let next = choose_from_queue(&queue, RotationMode::Sequence, "k", &mut state).unwrap();
+        let next = choose_from_queue(&queue, RotationMode::Sequence, &mut state).unwrap();
         assert_eq!(next.image.path, "new1.jpg");
         assert_eq!(state.next_index, 1);
     }
@@ -468,20 +434,20 @@ mod tests {
         let mut state = sequence_state(&queue);
 
         for _ in 0..100 {
-            let picked = choose_from_queue(&queue, RotationMode::Random, "k", &mut state).unwrap();
+            let picked = choose_from_queue(&queue, RotationMode::Random, &mut state).unwrap();
             assert_ne!(picked.image.path, "tiny.jpg");
         }
 
         let only_tiny = rank_images_for_monitor(&[image("tiny.jpg", 100, 50)], &m, &s);
-        let picked = choose_from_queue(&only_tiny, RotationMode::Random, "k", &mut sequence_state(&only_tiny)).unwrap();
+        let picked = choose_from_queue(&only_tiny, RotationMode::Random, &mut sequence_state(&only_tiny)).unwrap();
         assert_eq!(picked.image.path, "tiny.jpg", "last resort images are used when nothing else exists");
     }
 
     #[test]
     fn empty_queues_yield_nothing() {
         let mut state = QueueState::default();
-        assert!(choose_from_queue(&[], RotationMode::Sequence, "k", &mut state).is_none());
-        assert!(choose_from_queue(&[], RotationMode::Random, "k", &mut state).is_none());
+        assert!(choose_from_queue(&[], RotationMode::Sequence, &mut state).is_none());
+        assert!(choose_from_queue(&[], RotationMode::Random, &mut state).is_none());
         assert!(peek_next_sequence_path(&[], &state).is_none());
     }
 
@@ -496,7 +462,7 @@ mod tests {
 
         let peeked = peek_next_sequence_path(&queue, &state);
         assert_eq!(state.next_index, 3, "peek must not mutate");
-        let chosen = choose_from_queue(&queue, RotationMode::Sequence, "k", &mut state).unwrap();
+        let chosen = choose_from_queue(&queue, RotationMode::Sequence, &mut state).unwrap();
         assert_eq!(peeked.as_deref(), Some(chosen.image.path.as_str()));
     }
 }

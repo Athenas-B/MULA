@@ -32,41 +32,24 @@ pub fn build_monitor_previews(settings: &Settings) -> Result<Vec<MonitorPreview>
     let mut previews = Vec::new();
     for (index, monitor) in monitors.iter().enumerate() {
         let wallpaper_path = get_current_wallpaper(&monitor.id).unwrap_or_default();
+        let placeholder = |fit: &str| {
+            (0, 0, fit.to_string(), render_placeholder(monitor.width, monitor.height, settings.background_color_argb))
+        };
         let (image_width, image_height, fit, preview) =
             if wallpaper_path.is_empty() || !std::path::Path::new(&wallpaper_path).exists() {
-                (
-                    0,
-                    0,
-                    "No wallpaper".to_string(),
-                    render_placeholder(
-                        monitor.width,
-                        monitor.height,
-                        settings.background_color_argb,
-                    ),
-                )
+                placeholder("No wallpaper")
             } else {
-                match render_wallpaper_preview(
+                render_wallpaper_preview(
                     &wallpaper_path,
                     monitor.width,
                     monitor.height,
                     &settings.scaling_mode,
                     settings.background_color_argb,
-                ) {
-                    Ok((w, h, fit, img)) => (w, h, fit, img),
-                    Err(e) => {
-                        log::warn!("Failed to render monitor preview for {}: {e}", monitor.id);
-                        (
-                            0,
-                            0,
-                            "Error".to_string(),
-                            render_placeholder(
-                                monitor.width,
-                                monitor.height,
-                                settings.background_color_argb,
-                            ),
-                        )
-                    }
-                }
+                )
+                .unwrap_or_else(|e| {
+                    log::warn!("Failed to render monitor preview for {}: {e}", monitor.id);
+                    placeholder("Error")
+                })
             };
 
         previews.push(MonitorPreview {
@@ -74,7 +57,7 @@ pub fn build_monitor_previews(settings: &Settings) -> Result<Vec<MonitorPreview>
             monitor_index: index + 1,
             width: monitor.width,
             height: monitor.height,
-            wallpaper_path: wallpaper_path.clone(),
+            wallpaper_path,
             image_width,
             image_height,
             fit,
@@ -101,7 +84,8 @@ fn render_wallpaper_preview(
     let (preview_width, preview_height) = preview_dimensions(monitor_width, monitor_height);
     let bg = argb_to_rgba(background_color_argb);
 
-    let canvas = fit_to_canvas(&image, preview_width, preview_height, scaling_mode, bg, FilterType::Lanczos3);
+    // Triangle is plenty for a ~420 px thumbnail and far cheaper than Lanczos3 on large images.
+    let canvas = fit_to_canvas(&image, preview_width, preview_height, scaling_mode, bg, FilterType::Triangle);
     let fit = match scaling_mode {
         ScalingMode::Fill => "Fill (cropped)",
         ScalingMode::FitInsideScreen => "Fit inside screen (letterbox)",
@@ -196,7 +180,7 @@ pub(super) fn argb_to_rgba(argb: i32) -> Rgba<u8> {
 
 fn png_data_url(image: &RgbaImage) -> Result<String, String> {
     let mut buffer = Vec::new();
-    image::DynamicImage::ImageRgba8(image.clone())
+    image
         .write_to(&mut Cursor::new(&mut buffer), image::ImageFormat::Png)
         .map_err(|e| format!("Failed to encode preview PNG: {e}"))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);

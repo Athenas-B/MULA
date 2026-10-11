@@ -16,10 +16,7 @@ pub struct ImageInfo {
 
 impl ImageInfo {
     pub fn aspect_ratio(&self) -> f64 {
-        if self.height == 0 {
-            return 1.0;
-        }
-        self.width as f64 / self.height as f64
+        super::aspect_ratio(self.width, self.height)
     }
 
     pub fn is_landscape(&self) -> bool {
@@ -51,26 +48,34 @@ pub fn is_eligible_source(source: &Source, settings: &Settings) -> bool {
     source.enabled && source.level <= settings.maximum_source_level && !source.path.is_empty()
 }
 
-fn walkdir(root: &Path) -> Vec<PathBuf> {
+/// Image files below `root` with the metadata the directory listing already provides
+/// (free on Windows, so files don't have to be opened again just to stat them).
+fn walkdir(root: &Path) -> Vec<(PathBuf, fs::Metadata)> {
     let mut result = Vec::new();
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() && is_image_file(&path) {
-                        result.push(path);
-                    } else if meta.is_dir() {
-                        stack.push(path);
-                    }
-                }
+        for (path, meta) in list_dir(&dir) {
+            if meta.is_file() && is_image_file(&path) {
+                result.push((path, meta));
+            } else if meta.is_dir() {
+                stack.push(path);
             }
         }
     }
 
     result
+}
+
+fn list_dir(dir: &Path) -> Vec<(PathBuf, fs::Metadata)> {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok().map(|meta| (e.path(), meta)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn read_image_dimensions(path: &str) -> Option<(i32, i32)> {
@@ -86,10 +91,9 @@ fn read_image_dimensions(path: &str) -> Option<(i32, i32)> {
 /// Collects every image of the eligible sources. A source that fails (missing folder, Wallhaven
 /// unreachable, ...) is skipped with a warning instead of failing the whole collection.
 pub fn load_images(settings: &mut Settings, network: NetworkPolicy) -> Result<Vec<ImageInfo>, String> {
-    let cache: HashMap<String, ImageCacheEntry> = settings
-        .image_cache_entries
-        .iter()
-        .map(|e| (e.path.clone(), e.clone()))
+    let cache: HashMap<String, ImageCacheEntry> = std::mem::take(&mut settings.image_cache_entries)
+        .into_iter()
+        .map(|e| (e.path.clone(), e))
         .collect();
 
     let mut images = Vec::new();
@@ -105,8 +109,9 @@ pub fn load_images(settings: &mut Settings, network: NetworkPolicy) -> Result<Ve
             match wallhaven::images_for_source(source, settings, network) {
                 Ok(paths) => {
                     for path in paths {
-                        let path_str = path.to_string_lossy().to_string();
-                        add_image(path_str, path, &cache, &mut new_cache, &mut images);
+                        if let Ok(meta) = fs::metadata(&path) {
+                            add_image(path, &meta, &cache, &mut new_cache, &mut images);
+                        }
                     }
                 }
                 Err(e) => {
@@ -132,24 +137,17 @@ pub fn load_images(settings: &mut Settings, network: NetworkPolicy) -> Result<Ve
             continue;
         }
 
-        let paths = if source.include_subfolders {
+        let files = if source.include_subfolders {
             walkdir(&root)
         } else {
-            fs::read_dir(&root)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-                        .filter(|e| is_image_file(&e.path()))
-                        .map(|e| e.path())
-                        .collect()
-                })
-                .unwrap_or_default()
+            list_dir(&root)
+                .into_iter()
+                .filter(|(path, meta)| meta.is_file() && is_image_file(path))
+                .collect()
         };
 
-        for path in paths {
-            let path_str = path.to_string_lossy().to_string();
-            add_image(path_str, path, &cache, &mut new_cache, &mut images);
+        for (path, meta) in files {
+            add_image(path, &meta, &cache, &mut new_cache, &mut images);
         }
     }
 
@@ -161,17 +159,13 @@ pub fn load_images(settings: &mut Settings, network: NetworkPolicy) -> Result<Ve
 }
 
 fn add_image(
-    path_str: String,
     path: PathBuf,
+    meta: &fs::Metadata,
     cache: &HashMap<String, ImageCacheEntry>,
     new_cache: &mut Vec<ImageCacheEntry>,
     images: &mut Vec<ImageInfo>,
 ) {
-    let meta = match fs::metadata(&path) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-
+    let path_str = path.to_string_lossy().to_string();
     let length = meta.len() as i64;
     let last_write = meta
         .modified()

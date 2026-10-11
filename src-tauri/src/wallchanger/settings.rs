@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+
+use crate::util::write_atomic;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -61,11 +63,7 @@ pub struct QueueState {
     #[serde(default)]
     pub last_image_path: String,
     #[serde(default)]
-    pub next_image_path: String,
-    #[serde(default)]
     pub next_index: i32,
-    #[serde(default)]
-    pub rotation_mode: RotationMode,
     #[serde(default)]
     pub ordered_image_paths: Vec<String>,
 }
@@ -109,8 +107,6 @@ pub struct Settings {
     pub interval_minutes: i32,
     #[serde(default)]
     pub rotation_mode: RotationMode,
-    #[serde(default = "default_true")]
-    pub include_subfolders: bool,
     #[serde(default = "default_max_level")]
     pub maximum_source_level: i32,
     #[serde(default = "default_true")]
@@ -161,8 +157,6 @@ pub struct Settings {
     pub use_wallhaven_api_key: bool,
     #[serde(default)]
     pub wallhaven_api_key: String,
-    #[serde(default)]
-    pub sequence_offset: i32,
     #[serde(default, skip_serializing)]
     pub queue_states: Vec<QueueState>,
     #[serde(default, skip_serializing)]
@@ -179,12 +173,10 @@ fn default_wallhaven_page_limit() -> i32 { 1 }
 
 fn normalize_purity(purity: &str) -> String {
     let s = purity.trim();
-    if s.len() == 3 && s.chars().all(|c| c == '0' || c == '1') {
-        if s == "000" { "100".to_string() } else { s.to_string() }
-    } else if s.is_empty() {
-        "110".to_string()
-    } else {
-        "110".to_string()
+    match s {
+        "000" => "100".to_string(),
+        _ if s.len() == 3 && s.chars().all(|c| c == '0' || c == '1') => s.to_string(),
+        _ => "110".to_string(),
     }
 }
 fn default_black() -> i32 { 0xFF000000u32 as i32 }
@@ -234,8 +226,8 @@ static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static STATE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn config_dir() -> Result<PathBuf, String> {
-    dirs::config_dir()
-        .map(|p| p.join("mula").join("wallchanger"))
+    crate::util::mula_config_dir()
+        .map(|p| p.join("wallchanger"))
         .ok_or_else(|| "Could not determine config directory".to_string())
 }
 
@@ -245,17 +237,6 @@ pub fn settings_path() -> Result<PathBuf, String> {
 
 pub fn state_path() -> Result<PathBuf, String> {
     Ok(config_dir()?.join("state.json"))
-}
-
-/// Writes via a temporary file and a rename, so a crash mid-write never leaves a truncated file.
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create wallchanger config directory: {e}"))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|e| format!("Failed to replace {}: {e}", path.display()))
 }
 
 fn lock(m: &'static Mutex<()>) -> MutexGuard<'static, ()> {
@@ -290,6 +271,31 @@ fn read_state_file() -> Result<Option<RuntimeState>, String> {
             Ok(Some(RuntimeState::default()))
         }
     }
+}
+
+/// The service flag alone; deserializing into this skips building the (large) state vectors.
+#[derive(Deserialize)]
+struct ServiceFlag {
+    #[serde(default)]
+    change_service_running: bool,
+}
+
+fn read_service_flag() -> Result<Option<bool>, String> {
+    let path = state_path()?;
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str::<ServiceFlag>(&text).map(|f| f.change_service_running).unwrap_or(false)))
+}
+
+/// Serializes the runtime state straight from `Settings`, without cloning its vectors.
+#[derive(Serialize)]
+struct RuntimeStateRef<'a> {
+    change_service_running: bool,
+    next_monitor_change_index: i32,
+    queue_states: &'a [QueueState],
+    image_cache_entries: &'a [ImageCacheEntry],
+    image_show_stats: &'a [ImageShowStat],
 }
 
 fn write_state_file(state: &RuntimeState) -> Result<(), String> {
@@ -357,15 +363,24 @@ pub fn update_config(f: impl FnOnce(&mut Settings)) -> Result<Settings, String> 
 /// The service on/off flag is owned by [`set_service_running`] and is preserved as-is.
 pub fn save_apply_state(settings: &Settings) -> Result<(), String> {
     let _guard = lock(&STATE_LOCK);
-    let mut state = RuntimeState::from_settings(settings);
-    state.change_service_running = read_state_file()?
-        .map(|s| s.change_service_running)
-        .unwrap_or(settings.change_service_running);
-    write_state_file(&state)
+    let state = RuntimeStateRef {
+        change_service_running: read_service_flag()?.unwrap_or(settings.change_service_running),
+        next_monitor_change_index: settings.next_monitor_change_index,
+        queue_states: &settings.queue_states,
+        image_cache_entries: &settings.image_cache_entries,
+        image_show_stats: &settings.image_show_stats,
+    };
+    let text = serde_json::to_string(&state)
+        .map_err(|e| format!("Failed to serialize wallchanger state: {e}"))?;
+    write_atomic(&state_path()?, &text)
 }
 
 pub fn service_running() -> Result<bool, String> {
-    Ok(load()?.change_service_running)
+    match read_service_flag()? {
+        Some(running) => Ok(running),
+        // Not migrated yet: the flag still lives in the old combined settings file.
+        None => Ok(read_config_file()?.change_service_running),
+    }
 }
 
 pub fn set_service_running(running: bool) -> Result<(), String> {
@@ -404,9 +419,6 @@ pub fn normalize(settings: &mut Settings) {
     }
     if settings.wallpaper_fade_steps < 1 {
         settings.wallpaper_fade_steps = 1;
-    }
-    if settings.sequence_offset < 0 {
-        settings.sequence_offset = 0;
     }
     if settings.next_monitor_change_index < 0 {
         settings.next_monitor_change_index = 0;
@@ -472,7 +484,6 @@ mod tests {
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
-    use crate::test_support::TempDir;
 
     fn defaults() -> Settings {
         serde_json::from_str("{}").unwrap()
@@ -493,7 +504,6 @@ mod normalize_tests {
         assert_eq!(s.background_color_argb as u32, 0xFF00_0000);
         assert_eq!(s.picture_name_overlay_text_color_argb as u32, 0xFFFF_FFFF);
         assert!(s.use_separate_monitor_queues);
-        assert!(s.include_subfolders);
         assert!(s.enable_wallpaper_fade_transition);
         assert!(s.disable_windows_slideshow_when_running);
         assert!(!s.change_service_running);
@@ -534,7 +544,6 @@ mod normalize_tests {
         s.picture_name_overlay_font_size = -3;
         s.wallpaper_fade_duration_ms = -1;
         s.wallpaper_fade_steps = 0;
-        s.sequence_offset = -2;
         s.next_monitor_change_index = -7;
         normalize(&mut s);
         assert_eq!(s.interval_minutes, 1);
@@ -542,7 +551,6 @@ mod normalize_tests {
         assert_eq!(s.picture_name_overlay_font_size, 1);
         assert_eq!(s.wallpaper_fade_duration_ms, 0);
         assert_eq!(s.wallpaper_fade_steps, 1);
-        assert_eq!(s.sequence_offset, 0);
         assert_eq!(s.next_monitor_change_index, 0);
 
         s.interval_minutes = 99_999;
@@ -618,12 +626,21 @@ mod normalize_tests {
     }
 
     #[test]
-    fn atomic_writes_replace_existing_files_and_leave_no_temp_file() {
-        let dir = TempDir::new("atomic");
-        let path = dir.join("sub").join("settings.json");
-        write_atomic(&path, "{\"a\":1}").unwrap();
-        write_atomic(&path, "{\"a\":2}").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
-        assert!(!path.with_extension("json.tmp").exists());
+    fn removed_legacy_fields_are_still_accepted() {
+        let s: Settings = serde_json::from_str(
+            r#"{"sequence_offset": 3, "include_subfolders": false,
+                "queue_states": [{"queue_key": "k", "next_image_path": "a.jpg", "rotation_mode": "Sequence"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.queue_states[0].queue_key, "k");
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json.get("sequence_offset").is_none() && json.get("include_subfolders").is_none());
+    }
+
+    #[test]
+    fn the_service_flag_is_read_without_the_rest_of_the_state() {
+        let flag: ServiceFlag =
+            serde_json::from_str(r#"{"change_service_running": true, "image_cache_entries": [{"path": "a"}]}"#).unwrap();
+        assert!(flag.change_service_running);
     }
 }

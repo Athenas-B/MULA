@@ -111,6 +111,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - `src-tauri/src/wallchanger/service.rs` — Background timer service.
 - `src-tauri/src/wallchanger/monitors/windows.rs` / `linux.rs` — Monitor + wallpaper COM API wrappers (selected via `#[path]`).
 - `src-tauri/src/elevated_helper.rs` — Admin-rights execution (see Architecture notes).
+- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`, `blocking`/`logged_blocking` (run command work off the UI thread), `write_atomic`.
 - `src-tauri/src/wallchanger/overlay.rs` — Picture-name overlay rendering.
 - `src-tauri/src/wallchanger/transition.rs` — Fade transition frame generation.
 - `src-tauri/src/wallchanger/preview.rs` — Monitor-fit preview rendering; `fit_to_canvas` is shared with the fade transition.

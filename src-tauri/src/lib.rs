@@ -8,6 +8,7 @@ use std::sync::Mutex;
 mod elevated_helper;
 mod logger;
 mod startup;
+mod util;
 mod wallchanger;
 
 static VSD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
@@ -23,8 +24,8 @@ pub struct AppInfo {
 
 #[tauri::command]
 fn get_app_info() -> AppInfo {
-    let config_dir = dirs::config_dir()
-        .map(|p| p.join("mula").to_string_lossy().to_string())
+    let config_dir = util::mula_config_dir()
+        .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
     AppInfo {
@@ -37,9 +38,7 @@ fn get_app_info() -> AppInfo {
 
 #[tauri::command]
 fn open_config_dir() -> Result<String, String> {
-    let config_dir = dirs::config_dir()
-        .map(|p| p.join("mula"))
-        .ok_or("Could not determine config directory")?;
+    let config_dir = util::mula_config_dir().ok_or("Could not determine config directory")?;
 
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("Failed to create config directory: {e}"))?;
@@ -91,132 +90,99 @@ fn get_python_command(venv_dir: &Path) -> std::path::PathBuf {
     }
 }
 
+fn push_vsd_log(line: String) {
+    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
+        logs.push(line);
+        if logs.len() > 1000 {
+            logs.drain(0..100);
+        }
+    }
+}
+
+/// Forwards one output stream of the VSD server to the MULA log and the UI log buffer.
+fn spawn_vsd_log_reader(stream: impl std::io::Read + Send + 'static) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { continue };
+            log::info!("[VSD] {line}");
+            push_vsd_log(format!("{line}\n"));
+        }
+    });
+}
+
 #[tauri::command]
 async fn vsd_start() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    util::blocking(move || {
         let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
 
         if proc_guard.is_some() {
             return Err("VSD Server is already running".to_string());
         }
 
-    let server_path = get_vsd_server_path()
-        .ok_or("Could not find VSD server.py")?;
+        let server_path = get_vsd_server_path().ok_or("Could not find VSD server.py")?;
+        let working_dir = server_path.parent().unwrap().to_path_buf();
+        let python = get_python_command(&working_dir);
 
-    let working_dir = server_path.parent().unwrap().to_path_buf();
-    let python = get_python_command(&working_dir);
-
-    // Install dependencies if needed
-    let requirements = working_dir.join("requirements.txt");
-    if requirements.exists() {
         if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
             logs.clear();
-            logs.push("[Checking dependencies...]\n".to_string());
         }
 
-        let install = Command::new(&python)
-            .args(["-m", "pip", "install", "-r"])
-            .arg(&requirements)
-            .arg("--quiet")
+        // Install dependencies if needed
+        let requirements = working_dir.join("requirements.txt");
+        if requirements.exists() {
+            push_vsd_log("[Checking dependencies...]\n".to_string());
+
+            let output = Command::new(&python)
+                .args(["-m", "pip", "install", "-r"])
+                .arg(&requirements)
+                .arg("--quiet")
+                .current_dir(&working_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| format!("Failed to run pip: {e}"))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                push_vsd_log(format!("[pip install failed: {}]\n", stderr.trim()));
+                return Err(format!("Failed to install dependencies: {}", stderr.trim()));
+            }
+            push_vsd_log("[Dependencies OK]\n".to_string());
+        }
+
+        // Pass configured download dir to server via env var
+        let mut child = Command::new(&python)
+            .arg(&server_path)
             .current_dir(&working_dir)
+            .env("VSD_DOWNLOAD_DIR", vsd_get_download_dir())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output();
+            .spawn()
+            .map_err(|e| format!("Failed to start VSD server: {e}"))?;
 
-        match install {
-            Ok(output) => {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-                        logs.push(format!("[pip install failed: {}]\n", stderr.trim()));
-                    }
-                    return Err(format!("Failed to install dependencies: {}", stderr.trim()));
-                }
-                if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-                    logs.push("[Dependencies OK]\n".to_string());
-                }
-            }
-            Err(e) => {
-                return Err(format!("Failed to run pip: {e}"));
-            }
+        if let Some(stdout) = child.stdout.take() {
+            spawn_vsd_log_reader(stdout);
         }
-    } else {
-        // Clear log buffer
-        if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-            logs.clear();
+        if let Some(stderr) = child.stderr.take() {
+            spawn_vsd_log_reader(stderr);
         }
-    }
-
-    // Pass configured download dir to server via env var
-    let download_dir = vsd_get_download_dir();
-
-    let mut child = Command::new(&python)
-        .arg(&server_path)
-        .current_dir(&working_dir)
-        .env("VSD_DOWNLOAD_DIR", &download_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start VSD server: {e}"))?;
-
-    // Spawn thread to read stdout
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    log::info!("[VSD] {line}");
-                    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-                        logs.push(format!("{line}\n"));
-                        if logs.len() > 1000 {
-                            logs.drain(0..100);
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // Spawn thread to read stderr
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    log::info!("[VSD] {line}");
-                    if let Ok(mut logs) = VSD_LOG_BUFFER.lock() {
-                        logs.push(format!("{line}\n"));
-                        if logs.len() > 1000 {
-                            logs.drain(0..100);
-                        }
-                    }
-                }
-            }
-        });
-    }
 
         *proc_guard = Some(child);
         Ok(())
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[tauri::command]
 async fn vsd_stop() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-    let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
-
-        if let Some(mut child) = proc_guard.take() {
-            child.kill().map_err(|e| format!("Failed to stop VSD server: {e}"))?;
-            let _ = child.wait();
-            Ok(())
-        } else {
-            Err("VSD Server is not running".to_string())
-        }
+    util::blocking(move || {
+        let mut proc_guard = VSD_PROCESS.lock().map_err(|e| e.to_string())?;
+        let mut child = proc_guard.take().ok_or("VSD Server is not running")?;
+        child.kill().map_err(|e| format!("Failed to stop VSD server: {e}"))?;
+        let _ = child.wait();
+        Ok(())
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 fn vsd_is_running_sync() -> bool {
@@ -276,11 +242,6 @@ fn read_config_value_at(config_path: &Path, key: &str) -> Option<String> {
 }
 
 fn write_config_value_at(config_path: &Path, key: &str, value: &str) -> Result<(), String> {
-    if let Some(config_dir) = config_path.parent() {
-        std::fs::create_dir_all(config_dir)
-            .map_err(|e| format!("Failed to create config dir: {e}"))?;
-    }
-
     let mut lines: Vec<String> = std::fs::read_to_string(config_path)
         .unwrap_or_default()
         .lines()
@@ -294,16 +255,12 @@ fn write_config_value_at(config_path: &Path, key: &str, value: &str) -> Result<(
         None => lines.push(new_line),
     }
 
-    std::fs::write(config_path, lines.join("\n") + "\n")
-        .map_err(|e| format!("Failed to write config: {e}"))?;
-    Ok(())
+    util::write_atomic(config_path, &(lines.join("\n") + "\n"))
 }
 
 /// Get the MULA config directory (e.g. C:\Users\<user>\AppData\Roaming\mula)
 fn get_config_dir() -> std::path::PathBuf {
-    dirs::config_dir()
-        .map(|p| p.join("mula"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+    util::mula_config_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 #[tauri::command]
@@ -354,19 +311,21 @@ fn get_autostart() -> Result<bool, String> {
     startup::is_enabled()
 }
 
-#[tauri::command]
-fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+/// Applies "Start MULA with Windows" and keeps the tray item and the System tab in sync.
+fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri::{Emitter, Manager};
 
     startup::set_enabled(enabled)?;
-
     if let Some(state) = app.try_state::<AutostartMenuState>() {
         let _ = state.0.set_checked(enabled);
     }
-
     let _ = app.emit("autostart-changed", enabled);
-
     Ok(())
+}
+
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    apply_autostart(&app, enabled)
 }
 
 fn urllib_post(url: &str, body: &str) -> Result<(), String> {
@@ -391,48 +350,33 @@ fn get_extension_build_script() -> Option<std::path::PathBuf> {
     if build_script.exists() { Some(build_script) } else { None }
 }
 
+/// Builds the browser extension and returns its folder (the UI reveals it).
 #[tauri::command]
 async fn vsd_install_extension(browser: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-    let build_script = get_extension_build_script()
-        .ok_or("Could not find extension build script")?;
+    util::blocking(move || {
+        let build_script = get_extension_build_script().ok_or("Could not find extension build script")?;
+        let python = get_python_command(build_script.parent().unwrap());
 
-    let python = get_python_command(build_script.parent().unwrap());
+        let output = Command::new(&python)
+            .arg(&build_script)
+            .arg(&browser)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("Failed to run build script: {e}"))?;
 
-    // Build the extension
-    let output = Command::new(&python)
-        .arg(&build_script)
-        .arg(&browser)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run build script: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Build failed: {}", stderr.trim()));
+        }
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Build failed: {}", stderr.trim()));
-    }
-
-    let ext_dir = get_extension_dir(&browser)
-        .ok_or("Could not determine extension output directory")?;
-
-    if !ext_dir.exists() {
-        return Err(format!("Extension not found at {}", ext_dir.display()));
-    }
-
-    // Open the built extension folder in the file explorer
-    if cfg!(target_os = "windows") {
-        let _ = Command::new("explorer").arg(&ext_dir).spawn();
-    } else if cfg!(target_os = "macos") {
-        let _ = Command::new("open").arg(&ext_dir).spawn();
-    } else {
-        let _ = Command::new("xdg-open").arg(&ext_dir).spawn();
-    }
-
-    Ok(ext_dir.to_string_lossy().to_string())
+        let ext_dir = get_extension_dir(&browser).ok_or("Could not determine extension output directory")?;
+        if !ext_dir.exists() {
+            return Err(format!("Extension not found at {}", ext_dir.display()));
+        }
+        Ok(ext_dir.to_string_lossy().to_string())
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 // ── Drive Test commands ──
@@ -514,7 +458,7 @@ fn guess_vendor_from_model(model: &str) -> Option<String> {
         .to_uppercase();
     let prefix: String = first_token.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
 
-    // Exact full-token matches
+    // Brand names written out as the first word.
     let exact_vendor = match first_token.as_str() {
         "SAMSUNG" => "Samsung",
         "INTEL" => "Intel",
@@ -535,44 +479,32 @@ fn guess_vendor_from_model(model: &str) -> Option<String> {
         "KIOXIA" => "Kioxia",
         "SABRENT" => "Sabrent",
         "TEAM" => "Team",
-        "ASU" => "ADATA",
-        "XPG" => "ADATA",
-        "SP" => "Silicon Power",
-        "TS" => "Transcend",
-        "CSSD" => "Corsair",
-        "WDS" => "Western Digital",
-        "T253" => "Team",
-        "NM" => "Lexar",
         _ => "",
     };
     if !exact_vendor.is_empty() {
         return Some(exact_vendor.to_string());
     }
 
-    // Prefix matches
+    // The leading letters of a model number.
     let vendor = match prefix.as_str() {
         "ST" | "STX" => "Seagate",
-        "WD" | "WDC" => "Western Digital",
-        "SK" | "SKHYNIX" | "HFS" | "HFM" => "SK hynix",
+        "WD" | "WDC" | "WDS" => "Western Digital",
+        "SK" | "HFS" | "HFM" => "SK hynix",
         "PNY" | "CS" => "PNY",
-        "SSDPE" => "Intel",
         "CT" => "Crucial",
-        "THNS" | "KXG" | "XQ" => "Toshiba",
-        "SD" | "SDSS" => "SanDisk",
-        "SA400" | "KC" | "SUV" | "SH" | "SKC" => "Kingston",
-        "MTFD" | "MT" => "Micron",
+        "KXG" | "XQ" => "Toshiba",
+        "SD" => "SanDisk",
+        "KC" | "SUV" | "SH" | "SKC" => "Kingston",
+        "MT" => "Micron",
         "HTS" | "HUA" => "Hitachi",
         "HUS" | "HUH" | "HM" => "HGST",
         "SU" | "ASU" | "XPG" => "ADATA",
         "SP" | "SPCC" => "Silicon Power",
         "TS" => "Transcend",
-        "CSSD" => "Corsair",
-        "WDS" => "Western Digital",
-        "T253" => "Team",
         "NM" | "NQ" | "NS" => "Lexar",
         _ => {
-            // Some vendor prefixes are followed directly by more letters ("SA400S37240G",
-            // "MTFDDAK256TBN"), so the leading letter run never equals them: match by prefix.
+            // Prefixes followed directly by more letters or digits ("SA400S37240G",
+            // "MTFDDAK256TBN") never equal the leading letter run, so match those by prefix.
             const LONG_PREFIXES: &[(&str, &str)] = &[
                 ("SA400", "Kingston"),
                 ("MTFD", "Micron"),
@@ -610,14 +542,8 @@ fn format_bitrate(bits_per_sec: u64) -> String {
     if bits_per_sec == 0 {
         return "Unknown".to_string();
     }
-    // Some WMI sources report the value scaled down (e.g. Mbps or 100 Mbps).
-    // Detect and normalize to bits/s for display.
-    let bps = bits_per_sec as f64;
-    if bps < 1_000_000.0 {
-        // Possibly already in Mbps? Unlikely, but handle by leaving as-is.
-    }
     const UNITS: &[&str] = &["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
-    let mut size = bps;
+    let mut size = bits_per_sec as f64;
     let mut unit_index = 0;
     while size >= 1000.0 && unit_index < UNITS.len() - 1 {
         size /= 1000.0;
@@ -648,6 +574,16 @@ fn infer_connection_speed(bus_type: &str, interface_type: &str) -> String {
         return "SCSI (varies by generation)".to_string();
     }
     "Unknown".to_string()
+}
+
+/// PowerShell's ConvertTo-Json emits a single string for one-element arrays.
+#[cfg(target_os = "windows")]
+fn value_to_strings(v: Option<serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::String(s)) => vec![s],
+        Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+        _ => vec![],
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -841,23 +777,12 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
 
         let media_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
         let bus_type = d.physical_bus_type.as_deref().or(d.interface_type.as_deref()).unwrap_or("Unknown").trim().to_string();
-        let drive_type = d.physical_media_type.as_deref().or(d.media_type.as_deref()).unwrap_or("Unknown").trim().to_string();
+        let drive_type = media_type.clone();
 
-        let connection_speed_text = if d.connection_speed.unwrap_or(0) > 0 {
-            format_bitrate(d.connection_speed.unwrap())
-        } else {
-            infer_connection_speed(&bus_type, d.interface_type.as_deref().unwrap_or(""))
+        let connection_speed_text = match d.connection_speed {
+            Some(bps) if bps > 0 => format_bitrate(bps),
+            _ => infer_connection_speed(&bus_type, d.interface_type.as_deref().unwrap_or("")),
         };
-
-        fn value_to_strings(v: Option<serde_json::Value>) -> Vec<String> {
-            match v {
-                None => vec![],
-                Some(serde_json::Value::Null) => vec![],
-                Some(serde_json::Value::String(s)) => vec![s],
-                Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
-                Some(_) => vec![],
-            }
-        }
 
         let drive_letters = value_to_strings(d.drive_letters);
         let is_system = holds_system_drive(&drive_letters, &system_drive_letter());
@@ -898,21 +823,14 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
 
 #[tauri::command]
 async fn list_physical_drives() -> Result<Vec<DriveInfo>, String> {
-    tauri::async_runtime::spawn_blocking(list_physical_drives_impl)
-        .await
-        .map_err(|e| format!("Background task failed: {e}"))?
+    util::blocking(list_physical_drives_impl).await
 }
 
-#[tauri::command]
-async fn get_drive_details(id: String) -> Result<DriveInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let drives = list_physical_drives_impl()?;
-        drives.into_iter()
-            .find(|d| d.id == id || d.device_id == id)
-            .ok_or_else(|| format!("Drive not found: {id}"))
-    })
-    .await
-    .map_err(|e| format!("Background task failed: {e}"))?
+fn find_drive(id: &str) -> Result<DriveInfo, String> {
+    list_physical_drives_impl()?
+        .into_iter()
+        .find(|d| d.device_id == id)
+        .ok_or_else(|| format!("Drive not found: {id}"))
 }
 
 fn extract_physical_drive_number(id: &str) -> Result<u32, String> {
@@ -943,8 +861,13 @@ fn find_smartctl() -> Option<std::path::PathBuf> {
             return Some(path);
         }
     }
-    // Try PATH, resolving to an absolute path (the elevated helper requires one).
-    if let Ok(output) = Command::new("where").arg("smartctl").output() {
+    find_on_path("smartctl")
+}
+
+/// Finds `name` on PATH: the absolute path `where` reports (the elevated helper requires
+/// one), else the bare name if it can be run.
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    if let Ok(output) = Command::new("where").arg(name).output() {
         let out = String::from_utf8_lossy(&output.stdout);
         if let Some(first) = out.lines().map(str::trim).find(|l| !l.is_empty()) {
             let path = std::path::PathBuf::from(first);
@@ -953,27 +876,11 @@ fn find_smartctl() -> Option<std::path::PathBuf> {
             }
         }
     }
-    if Command::new("smartctl").arg("--version").output().is_ok() {
-        return Some(std::path::PathBuf::from("smartctl"));
-    }
-    None
-}
-
-fn find_winget() -> Option<std::path::PathBuf> {
-    if let Ok(output) = Command::new("where").arg("winget").output() {
-        let out = String::from_utf8_lossy(&output.stdout);
-        let first = out.lines().next().map(|s| s.trim().to_string());
-        if let Some(p) = first {
-            if !p.is_empty() && std::path::Path::new(&p).exists() {
-                return Some(std::path::PathBuf::from(p));
-            }
-        }
-    }
-    // Try a direct winget invocation
-    if Command::new("winget").arg("--version").output().is_ok() {
-        return Some(std::path::PathBuf::from("winget"));
-    }
-    None
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok()
+        .then(|| std::path::PathBuf::from(name))
 }
 
 fn install_smartctl() -> Result<std::path::PathBuf, String> {
@@ -981,7 +888,7 @@ fn install_smartctl() -> Result<std::path::PathBuf, String> {
         return Err("smartctl not found. Please install smartmontools using your package manager.".to_string());
     }
 
-    let winget = find_winget().ok_or("winget not found. Please install smartmontools manually from https://www.smartmontools.org/")?;
+    let winget = find_on_path("winget").ok_or("winget not found. Please install smartmontools manually from https://www.smartmontools.org/")?;
 
     let output = Command::new(&winget)
         .args([
@@ -1032,7 +939,7 @@ fn ensure_smartctl() -> Result<std::path::PathBuf, String> {
 /// Installs smartmontools with winget. Only called after the user agreed in the UI.
 #[tauri::command]
 async fn install_smartmontools() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    util::logged_blocking("install_smartmontools", || {
         let path = install_smartctl()?;
         if let Ok(mut guard) = SMARTCTL_PATH.lock() {
             *guard = Some(path.clone());
@@ -1040,7 +947,6 @@ async fn install_smartmontools() -> Result<String, String> {
         Ok(path.to_string_lossy().to_string())
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 /// Drive id → (smartctl device, device type). Resolving a drive enumerates every disk through
@@ -1156,10 +1062,6 @@ fn normalize_serial(s: &str) -> String {
     s.to_lowercase().trim().trim_end_matches('.').replace(' ', "")
 }
 
-fn run_smartctl_elevated(smartctl: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    elevated_helper::run_smartctl_elevated(smartctl, args)
-}
-
 const SELF_TEST_TYPES: &[&str] = &["short", "long", "conveyance", "offline"];
 
 fn validate_test_type(test_type: &str) -> Result<(), String> {
@@ -1180,7 +1082,7 @@ fn run_smartctl_on_device(
     let mut args: Vec<&str> = extra_args.to_vec();
     args.extend(["-d", dtype, device]);
     let out = if elevated {
-        run_smartctl_elevated(smartctl, &args)?
+        elevated_helper::run_smartctl_elevated(smartctl, &args)?
     } else {
         let (stdout, stderr, _code) = run_smartctl(smartctl, &args)?;
         if stdout.trim().is_empty() && !stderr.trim().is_empty() {
@@ -1211,11 +1113,7 @@ fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Res
     let pd_path = format!(r"/dev/pd{}", number);
 
     // Look up the drive we already enumerated so we can match by serial.
-    let drives = list_physical_drives_impl()?;
-    let drive = drives
-        .into_iter()
-        .find(|d| d.id == id || d.device_id == id)
-        .ok_or_else(|| format!("Drive not found: {id}"))?;
+    let drive = find_drive(&id)?;
     let expected_serial = normalize_serial(&drive.serial);
 
     // Prefer the device and type reported by smartctl --scan, but verify the
@@ -1267,84 +1165,23 @@ fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Res
     Err("smartctl command did not produce output for this drive.".to_string())
 }
 
-fn get_drive_smart_internal(id: String, elevated: bool) -> Result<String, String> {
-    run_smartctl_on_drive(id, elevated, &["-a"])
-}
-
 #[tauri::command]
 async fn get_drive_smart(id: String) -> Result<String, String> {
-    let res = tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, false))
-        .await
-        .map_err(|e| format!("Background task failed: {e}"))?;
-    if let Err(ref e) = res {
-        log::error!("get_drive_smart failed: {}", e);
-    }
-    res
+    util::logged_blocking("get_drive_smart", move || run_smartctl_on_drive(id, false, &["-a"])).await
 }
 
 #[tauri::command]
 async fn get_drive_smart_elevated(id: String) -> Result<String, String> {
-    let res = tauri::async_runtime::spawn_blocking(move || get_drive_smart_internal(id, true))
-        .await
-        .map_err(|e| format!("Background task failed: {e}"))?;
-    if let Err(ref e) = res {
-        log::error!("get_drive_smart_elevated failed: {}", e);
-    }
-    res
-}
-
-#[tauri::command]
-async fn run_drive_test(id: String, test_type: String) -> Result<String, String> {
-    let res = tauri::async_runtime::spawn_blocking(move || {
-        validate_test_type(&test_type)?;
-        run_smartctl_on_drive(id, false, &["-t", &test_type])
-    })
-    .await
-    .map_err(|e| format!("Background task failed: {e}"))?;
-    if let Err(ref e) = res {
-        log::error!("run_drive_test failed: {}", e);
-    }
-    res
+    util::logged_blocking("get_drive_smart_elevated", move || run_smartctl_on_drive(id, true, &["-a"])).await
 }
 
 #[tauri::command]
 async fn run_drive_test_elevated(id: String, test_type: String) -> Result<String, String> {
-    let res = tauri::async_runtime::spawn_blocking(move || {
+    util::logged_blocking("run_drive_test_elevated", move || {
         validate_test_type(&test_type)?;
         run_smartctl_on_drive(id, true, &["-t", &test_type])
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))?;
-    if let Err(ref e) = res {
-        log::error!("run_drive_test_elevated failed: {}", e);
-    }
-    res
-}
-
-#[tauri::command]
-async fn get_drive_test_status(id: String) -> Result<String, String> {
-    let res = tauri::async_runtime::spawn_blocking(move || {
-        run_smartctl_on_drive(id, false, &["-l", "selftest"])
-    })
-    .await
-    .map_err(|e| format!("Background task failed: {e}"))?;
-    if let Err(ref e) = res {
-        log::error!("get_drive_test_status failed: {}", e);
-    }
-    res
-}
-
-#[tauri::command]
-async fn get_drive_test_status_elevated(id: String) -> Result<String, String> {
-    let res = tauri::async_runtime::spawn_blocking(move || {
-        run_smartctl_on_drive(id, true, &["-l", "selftest"])
-    })
-    .await
-    .map_err(|e| format!("Background task failed: {e}"))?;
-    if let Err(ref e) = res {
-        log::error!("get_drive_test_status_elevated failed: {}", e);
-    }
-    res
 }
 
 fn sanitize_for_path(s: &str) -> String {
@@ -1355,34 +1192,21 @@ fn sanitize_for_path(s: &str) -> String {
 
 #[tauri::command]
 async fn save_smart_snapshot(id: String, label: String) -> Result<String, String> {
-    let id_for_drive = id.clone();
-    let res = tauri::async_runtime::spawn_blocking(move || {
-        run_smartctl_on_drive(id_for_drive, true, &["-a"])
+    util::logged_blocking("save_smart_snapshot", move || {
+        let data = run_smartctl_on_drive(id.clone(), true, &["-a"])?;
+
+        let config_dir = util::mula_config_dir().ok_or("Could not determine config directory")?;
+        let drive_dir = config_dir.join("snapshots").join(sanitize_for_path(&id));
+        std::fs::create_dir_all(&drive_dir)
+            .map_err(|e| format!("Failed to create snapshot directory: {e}"))?;
+
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+        let path = drive_dir.join(format!("smart_{label}_{timestamp}.txt"));
+        std::fs::write(&path, data).map_err(|e| format!("Failed to write snapshot file: {e}"))?;
+
+        Ok(path.to_string_lossy().to_string())
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))?;
-
-    if let Err(ref e) = res {
-        log::error!("save_smart_snapshot failed: {}", e);
-        return res;
-    }
-
-    let data = res?;
-
-    let config_dir = dirs::config_dir()
-        .map(|p| p.join("mula"))
-        .ok_or("Could not determine config directory")?;
-    let drive_dir = config_dir.join("snapshots").join(sanitize_for_path(&id));
-    std::fs::create_dir_all(&drive_dir)
-        .map_err(|e| format!("Failed to create snapshot directory: {e}"))?;
-
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let filename = format!("smart_{label}_{timestamp}.txt");
-    let path = drive_dir.join(&filename);
-    std::fs::write(&path, data)
-        .map_err(|e| format!("Failed to write snapshot file: {e}"))?;
-
-    Ok(path.to_string_lossy().to_string())
 }
 
 /// Erases a drive and creates one NTFS partition (full format). Runs in its own elevated
@@ -1431,16 +1255,13 @@ try {
 "#;
 
 fn format_script_for(device_id: &str) -> String {
-    FORMAT_SCRIPT.replace("__DEVICE_ID__", &device_id.replace('\'', "''"))
+    FORMAT_SCRIPT.replace("__DEVICE_ID__", &elevated_helper::ps_escape(device_id))
 }
 
 #[tauri::command]
 async fn format_drive(id: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let drive = list_physical_drives_impl()?
-            .into_iter()
-            .find(|d| d.id == id || d.device_id == id)
-            .ok_or_else(|| format!("Drive not found: {id}"))?;
+    util::blocking(move || {
+        let drive = find_drive(&id)?;
         if drive.is_system {
             return Err(format!(
                 "Refusing to format {}: it holds the running Windows installation ({}).",
@@ -1457,15 +1278,12 @@ async fn format_drive(id: String) -> Result<String, String> {
         result
     })
     .await
-    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 #[tauri::command]
 async fn log_message(level: String, message: String) {
     logger::log_message(&level, &message);
 }
-
-
 
 /// Stops everything MULA started that would otherwise outlive it.
 fn shutdown() {
@@ -1510,13 +1328,9 @@ pub fn run() {
             vsd_set_autostart,
             vsd_install_extension,
             list_physical_drives,
-            get_drive_details,
             get_drive_smart,
             get_drive_smart_elevated,
-            run_drive_test,
             run_drive_test_elevated,
-            get_drive_test_status,
-            get_drive_test_status_elevated,
             save_smart_snapshot,
             install_smartmontools,
             format_drive,
@@ -1524,10 +1338,7 @@ pub fn run() {
             wallchanger::wc_get_settings,
             wallchanger::wc_save_settings,
             wallchanger::wc_get_monitors,
-            wallchanger::wc_apply,
             wallchanger::wc_change_now,
-            wallchanger::wc_start_service,
-            wallchanger::wc_stop_service,
             wallchanger::wc_toggle_service,
             wallchanger::wc_get_status,
             wallchanger::wc_get_queue_preview,
@@ -1621,23 +1432,16 @@ pub fn run() {
                     "stop" => spawn_tray_action("stop service", || wallchanger::service::set_running(false)),
                     "autostart" => {
                         let enabled = autostart_menu_item.is_checked().unwrap_or(false);
-                        if let Err(e) = startup::set_enabled(enabled) {
+                        if let Err(e) = apply_autostart(app, enabled) {
                             log::error!("Failed to update autostart setting: {e}");
                             let _ = autostart_menu_item.set_checked(!enabled);
-                        } else {
-                            use tauri::Emitter;
-                            let _ = app.emit("autostart-changed", enabled);
                         }
                     }
                     id if id.starts_with("max_level_") => {
                         if let Ok(level) = id.trim_start_matches("max_level_").parse::<i32>() {
                             let result = wallchanger::settings::update_config(|s| s.maximum_source_level = level);
                             match result {
-                                Ok(_) => {
-                                    wallchanger::sync_max_level_menu(app, level);
-                                    use tauri::Emitter;
-                                    let _ = app.emit("max-level-changed", level);
-                                }
+                                Ok(_) => wallchanger::on_max_level_changed(app, level),
                                 Err(e) => log::error!("Failed to update max source level: {e}"),
                             }
                         }

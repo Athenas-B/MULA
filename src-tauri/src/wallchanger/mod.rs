@@ -10,11 +10,40 @@ pub mod settings;
 mod transition;
 mod wallhaven;
 
-use serde::Serialize;
+use crate::util::blocking;
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-pub use monitors::Monitor;
+/// The UI lists this many images per queue; the rest is summarized by `image_count`.
+const QUEUE_PREVIEW_LIMIT: usize = 30;
+
 pub use settings::Settings;
+
+/// Width / height, treating a zero height as square.
+pub(crate) fn aspect_ratio(width: i32, height: i32) -> f64 {
+    if height == 0 {
+        1.0
+    } else {
+        width as f64 / height as f64
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Monitor {
+    pub id: String,
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Monitor {
+    pub fn aspect_ratio(&self) -> f64 {
+        aspect_ratio(self.width, self.height)
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueImagePreview {
@@ -62,12 +91,11 @@ pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
     }
 }
 
-/// Runs blocking work (disk scans, COM calls, image decoding, network) off the UI thread.
-/// Tauri runs synchronous commands on the main thread, which would freeze the window.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
-    tauri::async_runtime::spawn_blocking(f)
-        .await
-        .map_err(|e| format!("Background task failed: {e}"))?
+/// Keeps the tray's "Max source level" items and the Wall Changer tab in sync after a change.
+pub fn on_max_level_changed(app: &tauri::AppHandle, level: i32) {
+    use tauri::Emitter;
+    sync_max_level_menu(app, level);
+    let _ = app.emit("max-level-changed", level);
 }
 
 #[tauri::command]
@@ -79,8 +107,6 @@ pub async fn wc_get_settings() -> Result<Settings, String> {
 /// image cache, service on/off) lives in a separate file the UI never writes.
 #[tauri::command]
 pub async fn wc_save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
-    use tauri::Emitter;
-
     let saved = blocking(move || {
         let mut settings = settings;
         settings::normalize(&mut settings);
@@ -89,9 +115,7 @@ pub async fn wc_save_settings(app: tauri::AppHandle, settings: Settings) -> Resu
     })
     .await?;
 
-    sync_max_level_menu(&app, saved.maximum_source_level);
-    let _ = app.emit("max-level-changed", saved.maximum_source_level);
-
+    on_max_level_changed(&app, saved.maximum_source_level);
     Ok(())
 }
 
@@ -101,23 +125,8 @@ pub async fn wc_get_monitors() -> Result<Vec<Monitor>, String> {
 }
 
 #[tauri::command]
-pub async fn wc_apply() -> Result<String, String> {
-    blocking(|| service::apply(false)).await
-}
-
-#[tauri::command]
 pub async fn wc_change_now() -> Result<String, String> {
     blocking(|| service::apply(false)).await
-}
-
-#[tauri::command]
-pub async fn wc_start_service() -> Result<(), String> {
-    blocking(|| service::set_running(true)).await
-}
-
-#[tauri::command]
-pub async fn wc_stop_service() -> Result<(), String> {
-    blocking(|| service::set_running(false)).await
 }
 
 #[tauri::command]
@@ -171,7 +180,7 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
 
     let mut previews = Vec::new();
 
-    if !settings.use_separate_monitor_queues || monitors.len() <= 1 {
+    if queue::uses_shared_queue(&settings, monitors.len()) {
         if let Some(queue) = queues.get("shared").cloned() {
             previews.push(build_queue_preview(
                 &mut settings,
@@ -226,6 +235,7 @@ fn build_queue_preview(
 
     let images = queue
         .iter()
+        .take(QUEUE_PREVIEW_LIMIT)
         .map(|ranked| QueueImagePreview {
             path: ranked.image.path.clone(),
             file_name: std::path::Path::new(&ranked.image.path)

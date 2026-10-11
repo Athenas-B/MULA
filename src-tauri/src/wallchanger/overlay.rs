@@ -2,6 +2,7 @@
 //! wallpaper image before it is handed to Windows, mirroring the original
 //! Wall Changer's "Show picture name overlay" feature.
 
+use super::preview::argb_to_rgba;
 use super::settings::{PictureNameOverlayTextMode, Settings};
 use ab_glyph::{FontRef, PxScale};
 use image::{Rgba, RgbaImage};
@@ -55,15 +56,6 @@ fn overlay_text(original_path: &str, mode: PictureNameOverlayTextMode) -> String
         }
         PictureNameOverlayTextMode::FullPath => original_path.to_string(),
     }
-}
-
-fn argb_to_rgba(argb: i32) -> Rgba<u8> {
-    let u32v = argb as u32;
-    let a = ((u32v >> 24) & 0xFF) as u8;
-    let r = ((u32v >> 16) & 0xFF) as u8;
-    let g = ((u32v >> 8) & 0xFF) as u8;
-    let b = (u32v & 0xFF) as u8;
-    Rgba([r, g, b, a])
 }
 
 /// Cap the overlay render cache at roughly 300 MB...
@@ -218,8 +210,7 @@ mod tests {
 
     #[test]
     fn renders_overlay_onto_a_copy_of_the_image() {
-        let tmp_dir = std::env::temp_dir().join("mula_overlay_test");
-        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_dir = crate::test_support::TempDir::new("overlay");
         let source_path = tmp_dir.join("sample.png");
 
         let img = RgbaImage::from_pixel(320, 200, Rgba([10, 10, 10, 255]));
@@ -243,9 +234,8 @@ mod tests {
 
     #[test]
     fn cleanup_prunes_oldest_files_over_the_limit() {
-        let dir = std::env::temp_dir().join("mula_overlay_cleanup_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = crate::test_support::TempDir::new("overlay_cleanup");
+        let dir = tmp.path();
 
         let older = dir.join("older.jpg");
         let newer = dir.join("newer.jpg");

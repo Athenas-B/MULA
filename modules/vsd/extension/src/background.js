@@ -123,13 +123,16 @@ function queryTabs() {
   });
 }
 
+// The tab showing `pageUrl` (or another page of the same site). Throws for invalid URLs.
+function matchTab(tabs, pageUrl) {
+  const origin = new URL(pageUrl).origin;
+  return tabs.find(t => t.url && !isExtensionUrl(t.url) && (t.url === pageUrl || t.url.startsWith(origin + '/')));
+}
+
 async function findTabTitle(pageUrl) {
   if (isExtensionUrl(pageUrl)) return '';
   try {
-    const origin = new URL(pageUrl).origin;
-    const tabs = await queryTabs();
-    const tab = tabs.find(t => t.url && !isExtensionUrl(t.url) && (t.url === pageUrl || t.url.startsWith(origin + '/')));
-    return tab?.title || '';
+    return matchTab(await queryTabs(), pageUrl)?.title || '';
   } catch (e) {
     return '';
   }
@@ -141,8 +144,7 @@ async function enrichTitles(streams) {
     return streams.map(s => {
       if (s.title || !s.pageUrl || s.pageUrl === 'unknown' || isExtensionUrl(s.pageUrl)) return s;
       try {
-        const origin = new URL(s.pageUrl).origin;
-        const tab = tabs.find(t => t.url && !isExtensionUrl(t.url) && (t.url === s.pageUrl || t.url.startsWith(origin + '/')));
+        const tab = matchTab(tabs, s.pageUrl);
         if (tab?.title) return { ...s, title: tab.title };
       } catch (e) {}
       return s;
@@ -185,6 +187,21 @@ function removeStream(url) {
   });
 }
 
+// Records a detected HLS playlist, then drops it again if it lists no .ts segments.
+function trackStream(url, pageUrl, title = '') {
+  const headers = makePageHeaders(pageUrl);
+  addStream(url, pageUrl, 'hls', title, headers);
+  hasTsSegments(url, headers).then(ok => { if (!ok) removeStream(url); });
+}
+
+// Keeps only the streams (and their active jobs) whose URL passes `keep`.
+function pruneByUrl({ streams, activeJobs }, keep) {
+  return {
+    streams: streams.filter(s => keep(s.url)),
+    activeJobs: Object.fromEntries(Object.entries(activeJobs || {}).filter(([url]) => keep(url))),
+  };
+}
+
 // ── Network Interception ────────────────────────────────────────────────────
 
 function handleRequest(details) {
@@ -193,21 +210,13 @@ function handleRequest(details) {
   const fallbackPageUrl = details.documentUrl || details.initiator || 'unknown';
   if (isExtensionUrl(fallbackPageUrl)) return;
 
-  if (details.tabId && details.tabId > 0) {
+  if (details.tabId > 0) {
     chrome.tabs.get(details.tabId, (tab) => {
-      if (chrome.runtime.lastError) {
-        addStream(details.url, fallbackPageUrl, 'hls', '', makePageHeaders(fallbackPageUrl));
-        hasTsSegments(details.url, makePageHeaders(fallbackPageUrl)).then(ok => { if (!ok) removeStream(details.url); });
-        return;
-      }
-      const pageUrl = tab?.url || fallbackPageUrl;
-      const title = tab?.title || '';
-      addStream(details.url, pageUrl, 'hls', title, makePageHeaders(pageUrl));
-      hasTsSegments(details.url, makePageHeaders(pageUrl)).then(ok => { if (!ok) removeStream(details.url); });
+      if (chrome.runtime.lastError) return trackStream(details.url, fallbackPageUrl);
+      trackStream(details.url, tab?.url || fallbackPageUrl, tab?.title || '');
     });
   } else {
-    addStream(details.url, fallbackPageUrl, 'hls', '', makePageHeaders(fallbackPageUrl));
-    hasTsSegments(details.url, makePageHeaders(fallbackPageUrl)).then(ok => { if (!ok) removeStream(details.url); });
+    trackStream(details.url, fallbackPageUrl);
   }
 }
 
@@ -293,14 +302,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const pageUrl = sender.tab?.url || 'unknown';
       if (message.metadata && pageUrl !== 'unknown') pageMetadata.set(pageUrl, message.metadata);
       if (detectionEnabled) {
-        const headers = makePageHeaders(pageUrl);
-        (message.streams || []).forEach(async (s) => {
-          addStream(s.url, pageUrl, s.type, message.title || '', headers);
-          if (s.type === 'hls') {
-            const ok = await hasTsSegments(s.url, headers);
-            if (!ok) removeStream(s.url);
-          }
-        });
+        for (const s of message.streams || []) {
+          if (s.type === 'hls') trackStream(s.url, pageUrl, message.title || '');
+          else addStream(s.url, pageUrl, s.type, message.title || '', makePageHeaders(pageUrl));
+        }
       }
       sendResponse({ ok: true });
       break;
@@ -368,12 +373,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'clear': {
       chrome.storage.local.get({ streams: [], activeJobs: {} }, (result) => {
         const keepUrls = new Set(message.keepUrls || []);
-        const streams = result.streams.filter(s => keepUrls.has(s.url));
-        const jobs = {};
-        for (const [url, jobId] of Object.entries(result.activeJobs || {})) {
-          if (keepUrls.has(url)) jobs[url] = jobId;
-        }
-        chrome.storage.local.set({ streams, activeJobs: jobs }, () => sendResponse({ ok: true }));
+        chrome.storage.local.set(pruneByUrl(result, url => keepUrls.has(url)), () => sendResponse({ ok: true }));
       });
       return true;
     }
@@ -381,12 +381,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'removeUrls': {
       const removeUrls = new Set(message.urls || []);
       chrome.storage.local.get({ streams: [], activeJobs: {} }, (result) => {
-        const streams = result.streams.filter(s => !removeUrls.has(s.url));
-        const jobs = {};
-        for (const [url, jobId] of Object.entries(result.activeJobs || {})) {
-          if (!removeUrls.has(url)) jobs[url] = jobId;
-        }
-        chrome.storage.local.set({ streams, activeJobs: jobs }, () => sendResponse({ ok: true }));
+        chrome.storage.local.set(pruneByUrl(result, url => !removeUrls.has(url)), () => sendResponse({ ok: true }));
       });
       return true;
     }
@@ -400,12 +395,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const p = message.jobProgress?.[jobId];
           if (p && p.status === 'done') savedUrls.add(url);
         }
-        const kept = streams.filter(s => !savedUrls.has(s.url));
-        const keptJobs = {};
-        for (const [url, jobId] of Object.entries(jobs)) {
-          if (!savedUrls.has(url)) keptJobs[url] = jobId;
-        }
-        chrome.storage.local.set({ streams: kept, activeJobs: keptJobs }, () => sendResponse({ ok: true }));
+        chrome.storage.local.set(pruneByUrl(result, url => !savedUrls.has(url)), () => sendResponse({ ok: true }));
       });
       return true;
     }

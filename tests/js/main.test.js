@@ -505,8 +505,9 @@ describe("extractSelfTestProgress", () => {
 describe("wcRenderQueueCard", () => {
   const image = (i, extra = {}) => ({ path: `C:\\pics\\img${i}.jpg`, file_name: `img${i}.jpg`, ...extra });
 
-  it("renders at most 30 images plus a '+N more' line", () => {
-    const images = Array.from({ length: 35 }, (_, i) => image(i));
+  it("renders the images it gets plus a '+N more' line for the rest of image_count", () => {
+    // The backend sends at most 30 images per queue (QUEUE_PREVIEW_LIMIT) plus the total.
+    const images = Array.from({ length: 30 }, (_, i) => image(i));
     const html = pure.wcRenderQueueCard({ label: "Monitor 1", image_count: 35, rotation_mode: "Sequential", images });
     assert.equal((html.match(/<li class="wallchanger-queue-item/g) || []).length, 30);
     assert.match(html, /\+5 more/);

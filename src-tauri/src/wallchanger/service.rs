@@ -1,7 +1,7 @@
 use super::images::{is_eligible_source, load_images, NetworkPolicy};
 use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, try_disable_windows_slideshow};
 use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
-use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor};
+use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor, RankedImage};
 use super::transition::apply_wallpaper;
 use super::settings::{self, Settings};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,18 +150,19 @@ fn apply_with(settings: &mut Settings, change_one_monitor_only: bool) -> Result<
 
     for monitor in targets {
         let key = get_queue_key(settings, monitors.len(), &monitor.id, false);
-        let mut queue = queues.get(&key).cloned().unwrap_or_default();
-        let mut fallback = false;
-
-        if queue.is_empty() {
-            fallback = true;
-            queue = rank_images_for_monitor(&images, monitor, settings);
-        }
+        let fallback_queue;
+        let (queue, fallback): (&[RankedImage], bool) = match queues.get(&key) {
+            Some(queue) if !queue.is_empty() => (queue, false),
+            _ => {
+                fallback_queue = rank_images_for_monitor(&images, monitor, settings);
+                (&fallback_queue, true)
+            }
+        };
 
         let fallback_key = get_queue_key(settings, monitors.len(), &monitor.id, fallback);
         let selected = {
-            let state = ensure_queue_state(settings, &fallback_key, &queue);
-            let chosen = choose_from_queue(&queue, rotation_mode, &fallback_key, state)
+            let state = ensure_queue_state(settings, &fallback_key, queue);
+            let chosen = choose_from_queue(queue, rotation_mode, state)
                 .ok_or_else(|| "No suitable wallpaper found".to_string())?;
             state.last_image_path = chosen.image.path.clone();
             chosen
