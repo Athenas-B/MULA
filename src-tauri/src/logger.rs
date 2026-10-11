@@ -37,6 +37,13 @@ fn write_log_lines(path: &Path, lines: &VecDeque<String>) -> Result<(), std::io:
     Ok(())
 }
 
+fn push_line(lines: &mut VecDeque<String>, line: String) {
+    lines.push_back(line);
+    while lines.len() > MAX_LINES {
+        lines.pop_front();
+    }
+}
+
 fn format_record(record: &Record) -> String {
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
     format!(
@@ -93,23 +100,29 @@ pub fn init() -> Result<(), log::SetLoggerError> {
     thread::spawn(move || {
         let mut lines = initial_lines;
         let _ = write_log_lines(&path, &lines);
+        // Only rewrite the file when new lines arrived; otherwise an idle app would rewrite
+        // the whole log every second.
+        let mut dirty = false;
         loop {
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(msg) => {
-                    lines.push_back(msg);
-                    while lines.len() > MAX_LINES {
-                        lines.pop_front();
+                    push_line(&mut lines, msg);
+                    // Batch everything already queued into a single write.
+                    while let Ok(msg) = rx.try_recv() {
+                        push_line(&mut lines, msg);
                     }
+                    dirty = true;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            if !lines.is_empty() {
+            if dirty {
                 let _ = write_log_lines(&path, &lines);
+                dirty = false;
             }
         }
         // Final flush before the thread exits
-        if !lines.is_empty() {
+        if dirty {
             let _ = write_log_lines(&path, &lines);
         }
     });
@@ -158,6 +171,17 @@ mod tests {
         // Rewrites replace the file instead of appending.
         write_log_lines(&path, &VecDeque::from(["only".to_string()])).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "only\n");
+    }
+
+    #[test]
+    fn the_line_buffer_keeps_only_the_newest_lines() {
+        let mut lines = VecDeque::new();
+        for i in 0..MAX_LINES + 5 {
+            push_line(&mut lines, i.to_string());
+        }
+        assert_eq!(lines.len(), MAX_LINES);
+        assert_eq!(lines.front().map(String::as_str), Some("5"));
+        assert_eq!(lines.back().map(String::as_str), Some((MAX_LINES + 4).to_string().as_str()));
     }
 
     #[test]

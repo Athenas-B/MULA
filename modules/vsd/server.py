@@ -17,6 +17,8 @@ import threading
 import subprocess
 import urllib.parse
 import urllib.request
+from collections import deque
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from time import time
 
@@ -51,7 +53,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -267,10 +269,23 @@ def _mux_with_ffmpeg(seg_files: list[Path], output_path: Path, metadata: dict | 
     """Concatenate .ts segments into a single MP4 using ffmpeg."""
     concat_list = output_path.parent / f".{output_path.stem}_concat.txt"
     concat_list.write_text(
-        "".join(f"file '{seg.as_posix()}'\n" for seg in seg_files),
+        "".join(f"file {_concat_quote(seg.as_posix())}\n" for seg in seg_files),
         encoding="utf-8",
     )
+    try:
+        _run_ffmpeg(concat_list, output_path, metadata)
+    finally:
+        concat_list.unlink(missing_ok=True)
+    logger.info(f"Output: {output_path.name} ({output_path.stat().st_size // 1024} KB)")
 
+
+def _concat_quote(path: str) -> str:
+    """Quote a path for ffmpeg's concat demuxer (a ' inside quotes is written as '\\'')."""
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def _run_ffmpeg(concat_list: Path, output_path: Path, metadata: dict | None):
+    """Remux the segments listed in `concat_list` into `output_path`."""
     cmd = [
         FFMPEG_PATH, "-y",
         "-f", "concat", "-safe", "0",
@@ -287,9 +302,6 @@ def _mux_with_ffmpeg(seg_files: list[Path], output_path: Path, metadata: dict | 
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")[-500:]
         raise RuntimeError(f"ffmpeg failed (code {result.returncode}): {stderr}")
-
-    concat_list.unlink(missing_ok=True)
-    logger.info(f"Output: {output_path.name} ({output_path.stat().st_size // 1024} KB)")
 
 
 def _build_output_name(title: str, resolution: str, job_id: str) -> str:
@@ -345,6 +357,12 @@ def _run_download(job_id: str, url: str, title: str, headers: dict | None, raw_m
         seg_files = _download_segments(segments, tmpdir, headers, job_id)
         if not seg_files:
             raise ValueError("No segments could be downloaded")
+        if len(seg_files) < len(segments):
+            missing = len(segments) - len(seg_files)
+            raise ValueError(
+                f"{missing} of {len(segments)} segments could not be downloaded; "
+                "the video would have gaps, so nothing was saved"
+            )
 
         # Determine output filename
         resolution = _extract_resolution(url, segments)
@@ -443,8 +461,8 @@ def get_logs():
         return jsonify({"log": ""})
 
     with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-        all_lines = f.readlines()
-    return jsonify({"log": "".join(all_lines[-n:])})
+        tail = deque(f, maxlen=n)
+    return jsonify({"log": "".join(tail)})
 
 
 @app.route("/open", methods=["POST"])

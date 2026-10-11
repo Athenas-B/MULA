@@ -576,10 +576,64 @@ describe("appendLog", () => {
     const log = m.document.add("vsd-log", { scrollHeight: 500 });
     m.fn.appendLog("a<b");
     m.fn.appendLog("\x1b[31mX");
-    assert.equal(content.innerHTML, 'a&lt;b<span style="color:#e74c3c">X</span>');
+    assert.equal(
+      content.innerHTML,
+      '<span class="vsd-log-chunk">a&lt;b</span>' +
+        '<span class="vsd-log-chunk"><span style="color:#e74c3c">X</span></span>'
+    );
     assert.equal(log.scrollTop, 500);
     m.fn.clearLog();
     assert.equal(content.innerHTML, "");
+  });
+
+  it("keeps only the newest chunks so the log view stays bounded", () => {
+    const m = loadMain();
+    const content = m.document.add("vsd-log-content");
+    m.document.add("vsd-log", { scrollHeight: 0 });
+    const max = m.run("MAX_LOG_CHUNKS");
+    for (let i = 0; i < max + 3; i++) m.fn.appendLog(`line ${i}\n`);
+    assert.equal(content.childElementCount, max);
+    assert.ok(content.innerHTML.startsWith('<span class="vsd-log-chunk">line 3\n</span>'), content.innerHTML.slice(0, 80));
+    assert.ok(content.innerHTML.endsWith(`line ${max + 2}\n</span>`));
+  });
+});
+
+describe("invokeSmart", () => {
+  it("passes through results and unrelated errors", async () => {
+    const m = loadMain();
+    m.state.invoke = (async (cmd) => (cmd === "get_drive_smart" ? "data" : Promise.reject("boom")));
+    assert.equal(await m.fn.invokeSmart("get_drive_smart", { id: "x" }), "data");
+    await assert.rejects(m.fn.invokeSmart("save_smart_snapshot", {}), (e) => e === "boom");
+  });
+
+  it("asks before installing smartmontools and retries after installing", async () => {
+    const m = loadMain();
+    const calls = [];
+    let installed = false;
+    m.state.invoke = (async (cmd) => {
+      calls.push(cmd);
+      if (cmd === "install_smartmontools") {
+        installed = true;
+        return "C:/Program Files/smartmontools/bin/smartctl.exe";
+      }
+      if (!installed) throw "SMARTCTL_MISSING: smartmontools (smartctl) is not installed.";
+      return "smart data";
+    });
+    m.state.confirm = (() => true);
+    assert.equal(await m.fn.invokeSmart("get_drive_smart", { id: "x" }), "smart data");
+    assert.deepEqual(calls, ["get_drive_smart", "install_smartmontools", "get_drive_smart"]);
+  });
+
+  it("never installs when the user declines", async () => {
+    const m = loadMain();
+    const calls = [];
+    m.state.invoke = (async (cmd) => {
+      calls.push(cmd);
+      throw "SMARTCTL_MISSING: smartmontools (smartctl) is not installed.";
+    });
+    m.state.confirm = (() => false);
+    await assert.rejects(m.fn.invokeSmart("get_drive_smart", { id: "x" }), /smartmontools is not installed/);
+    assert.deepEqual(calls, ["get_drive_smart"]);
   });
 });
 

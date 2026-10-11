@@ -541,6 +541,28 @@ class MuxWithFfmpegTests(_ServerStateMixin, unittest.TestCase):
         self.assertIn(f"file '{self.segs[0].as_posix()}'", self.concat_text)
         self.assertFalse((self.download_dir / ".out_concat.txt").exists())
 
+    def test_paths_with_apostrophes_are_escaped_for_the_concat_demuxer(self):
+        seg = self.tmp / "O'Brien" / "seg_00000.ts"
+        seg.parent.mkdir()
+        seg.write_bytes(b"ts")
+
+        def fake_run(cmd, capture_output):
+            self.concat_text = Path(cmd[cmd.index("-i") + 1]).read_text(encoding="utf-8")
+            Path(cmd[-1]).write_bytes(b"mp4")
+            return mock.Mock(returncode=0, stderr=b"")
+
+        with mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+            server._mux_with_ffmpeg([seg], self.output)
+        escaped = seg.as_posix().replace("'", "'\\''")
+        self.assertEqual(self.concat_text, f"file '{escaped}'\n")
+        self.assertEqual(server._concat_quote("a'b"), "'a'\\''b'")
+
+    def test_concat_list_is_removed_when_ffmpeg_fails(self):
+        with mock.patch.object(server.subprocess, "run", return_value=mock.Mock(returncode=1, stderr=b"bad")):
+            with self.assertRaises(RuntimeError):
+                server._mux_with_ffmpeg(self.segs, self.output)
+        self.assertFalse((self.download_dir / ".out_concat.txt").exists())
+
     def test_failure_raises_with_stderr_tail(self):
         with mock.patch.object(
             server.subprocess, "run",
@@ -620,6 +642,23 @@ class RunDownloadTests(_ServerStateMixin, unittest.TestCase):
         with mock.patch.object(server, "_fetch", side_effect=fetch):
             server._run_download("job4", self.PLAYLIST_URL, "", None, {})
         self.assertIn("No segments could be downloaded", server._jobs["job4"]["error"])
+
+    def test_missing_segments_fail_the_job_instead_of_saving_a_gappy_video(self):
+        def fetch(url, headers=None):
+            if url == self.PLAYLIST_URL:
+                return self.PLAYLIST
+            if url.endswith("s1.ts"):
+                raise OSError("timed out")
+            return b"ts"
+
+        with mock.patch.object(server, "_fetch", side_effect=fetch), \
+                mock.patch.object(server, "_mux_with_ffmpeg") as mux:
+            server._run_download("job7", self.PLAYLIST_URL, "", None, {})
+        job = server._jobs["job7"]
+        self.assertEqual(job["status"], "error")
+        self.assertIn("1 of 2 segments", job["error"])
+        mux.assert_not_called()
+        self.assertFalse(self.work.exists())
 
     def test_ffmpeg_failure_marks_error(self):
         with mock.patch.object(server, "_fetch", side_effect=self._fake_fetch), \
@@ -880,6 +919,13 @@ class LogsEndpointTests(_ClientMixin, unittest.TestCase):
 
     def _write(self, n):
         server.LOG_FILE.write_text("".join(f"line {i}\n" for i in range(n)), encoding="utf-8")
+
+    def test_server_log_is_rotated(self):
+        from logging.handlers import RotatingFileHandler
+        rotating = [h for h in _IMPORT_LOG_FILE_HANDLERS if isinstance(h, RotatingFileHandler)]
+        self.assertEqual(len(rotating), 1)
+        self.assertGreater(rotating[0].maxBytes, 0)
+        self.assertGreater(rotating[0].backupCount, 0)
 
     def test_missing_log_file(self):
         r = self.client.get("/logs")

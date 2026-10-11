@@ -375,9 +375,17 @@ function ansiToHtml(text) {
   return html;
 }
 
+// The VSD log is append-only; keep the view bounded (each chunk is ~1 s of output).
+const MAX_LOG_CHUNKS = 500;
+
 function appendLog(text) {
   const logEl = document.getElementById("vsd-log-content");
-  logEl.innerHTML += ansiToHtml(text);
+  // insertAdjacentHTML appends without re-parsing everything already shown
+  // (`innerHTML +=` re-serializes the whole log on every poll).
+  logEl.insertAdjacentHTML("beforeend", `<span class="vsd-log-chunk">${ansiToHtml(text)}</span>`);
+  while (logEl.childElementCount > MAX_LOG_CHUNKS) {
+    logEl.firstElementChild.remove();
+  }
   // Auto-scroll to bottom
   const logContainer = document.getElementById("vsd-log");
   logContainer.scrollTop = logContainer.scrollHeight;
@@ -549,6 +557,24 @@ function stopTestProgressPolling() {
   testPollNoProgressCount = 0;
 }
 
+// smartmontools is never installed silently: if smartctl is missing, ask the user first.
+async function invokeSmart(command, args) {
+  try {
+    return await invoke(command, args);
+  } catch (err) {
+    if (!String(err).includes("SMARTCTL_MISSING")) throw err;
+    const install = window.confirm(
+      "SMART features need smartmontools (smartctl), which is not installed.\n\n" +
+        "Install it now with winget? This accepts the smartmontools package license."
+    );
+    if (!install) {
+      throw new Error("smartmontools is not installed. Install it from https://www.smartmontools.org/ to use SMART features.");
+    }
+    await invoke("install_smartmontools");
+    return await invoke(command, args);
+  }
+}
+
 function needsAdminRights(text) {
   const t = String(text).toLowerCase();
   return (
@@ -576,7 +602,7 @@ async function onSmartRetryAdmin() {
   smartStatus.textContent = "Loading SMART data with administrator privileges...";
   smartStatus.classList.remove("hidden");
   try {
-    const data = await invoke("get_drive_smart_elevated", { id });
+    const data = await invokeSmart("get_drive_smart_elevated", { id });
     smartData.textContent = data;
     smartLoadedId = id;
   } catch (err) {
@@ -624,13 +650,13 @@ async function onRunDriveTest() {
 
   try {
     if (saveBefore) {
-      const path = await invoke("save_smart_snapshot", { id, label: "before" });
+      const path = await invokeSmart("save_smart_snapshot", { id, label: "before" });
       appendLine(`SMART snapshot saved before tests:\n  ${path}`);
     }
 
     for (const type of types) {
       try {
-        const data = await invoke("run_drive_test_elevated", { id, testType: type });
+        const data = await invokeSmart("run_drive_test_elevated", { id, testType: type });
         if (String(data).toLowerCase().includes("failed")) {
           appendLine(`${type}: failed\n  ${data}`, true);
         } else {
@@ -642,7 +668,7 @@ async function onRunDriveTest() {
     }
 
     if (saveAfter) {
-      const path = await invoke("save_smart_snapshot", { id, label: "after" });
+      const path = await invokeSmart("save_smart_snapshot", { id, label: "after" });
       appendLine(`SMART snapshot saved after tests:\n  ${path}`);
     }
 
@@ -702,7 +728,7 @@ async function pollTestStatus(id) {
   }
 
   try {
-    const full = await invoke("get_drive_smart_elevated", { id });
+    const full = await invokeSmart("get_drive_smart_elevated", { id });
     const { status, log, inProgress, hasFailed, progress } = extractSelfTestProgress(full);
 
     let header;
@@ -759,7 +785,7 @@ async function onCheckDriveTestStatus() {
   if (checkBtn) checkBtn.disabled = true;
 
   try {
-    const full = await invoke("get_drive_smart_elevated", { id });
+    const full = await invokeSmart("get_drive_smart_elevated", { id });
     const { text, inProgress, hasFailed } = extractSelfTestProgress(full);
     if (testStatus) {
       testStatus.textContent = text;
@@ -841,7 +867,7 @@ async function onSmartToggle(toggle, content) {
     smartStatus.textContent = "Loading SMART data...";
     smartStatus.classList.remove("hidden");
     try {
-      const data = await invoke("get_drive_smart", { id });
+      const data = await invokeSmart("get_drive_smart", { id });
       smartData.textContent = data;
       smartLoadedId = id;
       if (smartAdmin && needsAdminRights(data)) {

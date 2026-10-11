@@ -19,7 +19,7 @@ const popoutBtn = document.getElementById('popout');
 const protectActive = document.getElementById('protectActive');
 const detectionToggle = document.getElementById('detectionEnabled');
 
-const SERVER_URL = 'http://127.0.0.1:8765';
+const DEFAULT_SERVER = 'http://127.0.0.1:8765';
 const activeJobs = new Map();
 const jobProgress = new Map();
 let cachedStreams = [];
@@ -52,6 +52,12 @@ function buildTooltip(s) {
 function isJobActive(jobId) {
   const p = jobProgress.get(jobId);
   return !p || p.status === 'running';
+}
+
+// Same setting background.js uses, so /open and /logs reach the configured server.
+async function getServerUrl() {
+  const result = await new Promise(r => chrome.storage.local.get({ serverUrl: DEFAULT_SERVER }, r));
+  return result.serverUrl || DEFAULT_SERVER;
 }
 
 function fetchWithTimeout(url, ms) {
@@ -134,9 +140,9 @@ function render(streams) {
     openFileBtn.textContent = 'Open file';
     openFileBtn.className = 'open-file-btn';
     openFileBtn.disabled = !(p?.status === 'done' && p.output) && !s.saved;
-    openFileBtn.onclick = () => {
+    openFileBtn.onclick = async () => {
       if (p?.output) {
-        fetch(`${SERVER_URL}/open`, {
+        fetch(`${await getServerUrl()}/open`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: p.output })
@@ -294,7 +300,7 @@ copyLogsBtn.onclick = async () => {
     let serverLog = '';
     let serverAvailable = true;
     try {
-      const res = await fetchWithTimeout(`${SERVER_URL}/logs?lines=200`, 1500);
+      const res = await fetchWithTimeout(`${await getServerUrl()}/logs?lines=200`, 1500);
       if (res.ok) { serverLog = (await res.json()).log || ''; }
       else serverAvailable = false;
     } catch (e) { serverAvailable = false; }

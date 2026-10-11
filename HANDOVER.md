@@ -49,6 +49,12 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   MULA's PID disappears. Formatting uses `run_elevated_script` (separate UAC prompt) and refuses
   system/boot disks both in Rust (`DriveInfo::is_system`) and in the PowerShell script.
   Residual risk: a same-user process can still ask the helper for SMART reads / self-tests.
+- **smartctl lookup.** smartmontools is never installed silently: when smartctl is missing,
+  commands fail with an error containing `SMARTCTL_MISSING`; the frontend's `invokeSmart` asks
+  the user and only then calls `install_smartmontools` (winget). Each drive's resolved smartctl
+  device is cached (`SMART_DEVICES`) so self-test polling doesn't re-enumerate all disks.
+- **Interval timing.** `service::apply` records `LAST_APPLY` for every trigger, so a manual
+  change restarts the service interval.
 - **VSD server.** Rejects any `Origin` other than browser-extension origins, rejects non-loopback
   `Host` headers (DNS rebinding), `/open` only opens files VSD produced or inside the download
   dir, `/download` only accepts http(s), and only MULA (no Origin) may change the download dir.

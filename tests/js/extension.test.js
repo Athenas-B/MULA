@@ -816,6 +816,14 @@ function loadPopup({ storage = {}, search = "", onSend } = {}) {
 describe("popup.js helpers", () => {
   const p = loadPopup();
 
+  it("getServerUrl uses the server configured in the options page", async () => {
+    assert.equal(await p.fn.getServerUrl(), "http://127.0.0.1:8765");
+    const configured = loadPopup({ storage: { serverUrl: "http://localhost:9000" } });
+    assert.equal(await configured.fn.getServerUrl(), "http://localhost:9000");
+    const blank = loadPopup({ storage: { serverUrl: "" } });
+    assert.equal(await blank.fn.getServerUrl(), "http://127.0.0.1:8765");
+  });
+
   it("formatProgress describes each job state", () => {
     assert.equal(p.fn.formatProgress(null), "Starting...");
     assert.equal(p.fn.formatProgress(undefined), "Starting...");

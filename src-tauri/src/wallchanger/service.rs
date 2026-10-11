@@ -14,6 +14,15 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 static WORKER_ACTIVE: Mutex<bool> = Mutex::new(false);
 /// Wallpaper changes are serialized: the service, the UI and the tray can all trigger one.
 static APPLY_LOCK: Mutex<()> = Mutex::new(());
+/// When the last wallpaper change (from any trigger) finished, so a manual change restarts
+/// the interval instead of being replaced moments later by the service.
+static LAST_APPLY: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether the interval has elapsed since the later of the worker's start and the last change.
+fn is_change_due(worker_started: Instant, last_apply: Option<Instant>, interval: Duration, now: Instant) -> bool {
+    let since = last_apply.map_or(worker_started, |t| t.max(worker_started));
+    now.saturating_duration_since(since) >= interval
+}
 
 pub fn start() -> Result<(), String> {
     let mut active = WORKER_ACTIVE.lock().map_err(|e| e.to_string())?;
@@ -63,16 +72,16 @@ fn run_worker(generation: u64) {
         return;
     }
 
-    let mut last_apply = Instant::now();
+    let started = Instant::now();
     while GENERATION.load(Ordering::SeqCst) == generation {
         match settings::load_config() {
             Ok(config) => {
                 let interval = Duration::from_secs(config.interval_minutes.max(1) as u64 * 60);
-                if last_apply.elapsed() >= interval {
+                let last_apply = LAST_APPLY.lock().ok().and_then(|t| *t);
+                if is_change_due(started, last_apply, interval, Instant::now()) {
                     if let Err(e) = apply(config.change_one_monitor_per_interval) {
                         log::error!("Wallchanger apply failed: {}", e);
                     }
-                    last_apply = Instant::now();
                 }
             }
             Err(e) => log::error!("Wallchanger failed to load settings: {}", e),
@@ -88,6 +97,15 @@ fn run_worker(generation: u64) {
 /// Blocking (image decoding, Wallhaven downloads, fade transitions): never call it on the UI thread.
 pub fn apply(change_one_monitor_only: bool) -> Result<String, String> {
     let _apply_guard = APPLY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = apply_locked(change_one_monitor_only);
+    // Failed attempts count too, so a broken source isn't retried every second.
+    if let Ok(mut last) = LAST_APPLY.lock() {
+        *last = Some(Instant::now());
+    }
+    result
+}
+
+fn apply_locked(change_one_monitor_only: bool) -> Result<String, String> {
     super::monitors::initialize_com()?;
 
     let mut settings = settings::load()?;
@@ -263,6 +281,24 @@ mod tests {
         let (targets, next) = select_target_monitors(&ms, &s, true);
         assert_eq!(ids(&targets), ["M0"]);
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn the_interval_counts_from_the_later_of_worker_start_and_last_change() {
+        let start = Instant::now();
+        let minute = Duration::from_secs(60);
+        let at = |secs| start + Duration::from_secs(secs);
+
+        assert!(!is_change_due(start, None, minute, at(59)));
+        assert!(is_change_due(start, None, minute, at(60)));
+
+        // A manual change 50 s in restarts the interval.
+        assert!(!is_change_due(start, Some(at(50)), minute, at(100)));
+        assert!(is_change_due(start, Some(at(50)), minute, at(110)));
+
+        // A change from before the worker started (previous run) doesn't shorten the wait.
+        let earlier = Instant::now();
+        assert!(!is_change_due(at(10), Some(earlier), minute, at(30)));
     }
 
     #[test]

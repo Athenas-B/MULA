@@ -185,11 +185,22 @@ fn refresh(source: &Source, settings: &Settings, cache_dir: &Path, query: String
     }
 
     let mut files = Vec::new();
-    for url in image_urls {
-        match download_image(&agent, &url, cache_dir) {
+    for url in &image_urls {
+        match download_image(&agent, url, cache_dir) {
             Ok(path) => files.push(path),
             Err(e) => log::warn!("Skipping Wallhaven image {url}: {e}"),
         }
+    }
+
+    record_refresh(cache_dir, query, image_urls.len(), files)
+}
+
+/// Stores the result of a refresh. If images were found but none could be downloaded (e.g.
+/// the image CDN is unreachable), this is an error, so the caller keeps using the cache
+/// instead of treating the source as freshly fetched and empty for the next few hours.
+fn record_refresh(cache_dir: &Path, query: String, attempted: usize, files: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    if attempted > 0 && files.is_empty() {
+        return Err(format!("None of the {attempted} Wallhaven image(s) could be downloaded"));
     }
 
     let manifest = Manifest {
@@ -572,6 +583,29 @@ mod helper_tests {
         assert!(files.is_empty());
         let dir = super::super::settings::config_dir().unwrap().join("wallhaven").join(cache_folder_name(src.path.trim()));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refresh_without_any_successful_download_keeps_the_old_manifest() {
+        let dir = crate::test_support::TempDir::new("refresh_fail");
+        let old = Manifest { query: "q".into(), fetched_at: 1, files: vec!["old.jpg".into()] };
+        write_manifest(dir.path(), &old).unwrap();
+
+        assert!(record_refresh(dir.path(), "q".into(), 3, Vec::new()).is_err());
+        let kept = read_manifest(dir.path()).unwrap();
+        assert_eq!((kept.fetched_at, kept.files), (1, vec!["old.jpg".to_string()]));
+    }
+
+    #[test]
+    fn a_successful_or_empty_search_refresh_is_recorded() {
+        let dir = crate::test_support::TempDir::new("refresh_ok");
+        let files = record_refresh(dir.path(), "q".into(), 2, vec![dir.join("a.jpg")]).unwrap();
+        assert_eq!(files, vec![dir.join("a.jpg")]);
+        assert_eq!(read_manifest(dir.path()).unwrap().files, vec!["a.jpg".to_string()]);
+
+        // A search that genuinely has no results is a valid (empty) result.
+        assert!(record_refresh(dir.path(), "q2".into(), 0, Vec::new()).unwrap().is_empty());
+        assert_eq!(read_manifest(dir.path()).unwrap().query, "q2");
     }
 
     #[test]

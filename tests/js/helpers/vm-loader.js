@@ -181,6 +181,25 @@ export class FakeElement {
     this.children = this.children.filter((c) => c !== child);
     return child;
   }
+  /** Minimal insertAdjacentHTML("beforeend"): each call becomes one child that keeps its markup. */
+  insertAdjacentHTML(position, html) {
+    if (position !== "beforeend") throw new Error(`insertAdjacentHTML: unsupported position ${position}`);
+    const child = new FakeElement({ outerHTML: String(html), parentElement: this });
+    this.children.push(child);
+    this._innerHTML += child.outerHTML;
+  }
+  get childElementCount() {
+    return this.children.length;
+  }
+  get firstElementChild() {
+    return this.children[0] ?? null;
+  }
+  remove() {
+    const parent = this.parentElement;
+    if (!parent) return;
+    parent.children = parent.children.filter((c) => c !== this);
+    parent._innerHTML = parent.children.map((c) => c.outerHTML ?? "").join("");
+  }
   select() {}
   setQuery(selector, el) {
     this._query.set(selector, el);

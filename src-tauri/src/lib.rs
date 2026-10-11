@@ -1010,20 +1010,58 @@ fn install_smartctl() -> Result<std::path::PathBuf, String> {
     find_smartctl().ok_or_else(|| "smartmontools was installed but smartctl could not be found. Restart MULA or add C:\\Program Files\\smartmontools\\bin to PATH.".to_string())
 }
 
+/// Marker in error messages that tells the frontend smartctl is missing, so it can ask the
+/// user before calling `install_smartmontools`.
+const SMARTCTL_MISSING: &str = "SMARTCTL_MISSING";
+
+static SMARTCTL_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Finds smartctl. Never installs anything by itself; only successes are cached, so a
+/// smartctl installed later is picked up without restarting MULA.
 fn ensure_smartctl() -> Result<std::path::PathBuf, String> {
-    static SMARTCTL_PATH: std::sync::Mutex<Option<Result<std::path::PathBuf, String>>> = std::sync::Mutex::new(None);
-
     let mut guard = SMARTCTL_PATH.lock().map_err(|e| e.to_string())?;
-    if let Some(result) = guard.as_ref() {
-        return result.clone();
+    if let Some(path) = guard.as_ref() {
+        return Ok(path.clone());
     }
+    let path = find_smartctl()
+        .ok_or_else(|| format!("{SMARTCTL_MISSING}: smartmontools (smartctl) is not installed."))?;
+    *guard = Some(path.clone());
+    Ok(path)
+}
 
-    let result = find_smartctl()
-        .map(Ok)
-        .unwrap_or_else(|| install_smartctl())
-        .clone();
-    *guard = Some(result.clone());
-    result
+/// Installs smartmontools with winget. Only called after the user agreed in the UI.
+#[tauri::command]
+async fn install_smartmontools() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = install_smartctl()?;
+        if let Ok(mut guard) = SMARTCTL_PATH.lock() {
+            *guard = Some(path.clone());
+        }
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
+}
+
+/// Drive id → (smartctl device, device type). Resolving a drive enumerates every disk through
+/// PowerShell and probes each smartctl device, which is far too slow to repeat on every poll.
+static SMART_DEVICES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, (String, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn cached_smart_device(id: &str) -> Option<(String, String)> {
+    SMART_DEVICES.lock().ok()?.get(id).cloned()
+}
+
+fn remember_smart_device(id: &str, device: &str, dtype: &str) {
+    if let Ok(mut map) = SMART_DEVICES.lock() {
+        map.insert(id.to_string(), (device.to_string(), dtype.to_string()));
+    }
+}
+
+fn forget_smart_device(id: &str) {
+    if let Ok(mut map) = SMART_DEVICES.lock() {
+        map.remove(id);
+    }
 }
 
 fn sd_letter_to_number(s: &str) -> u32 {
@@ -1132,11 +1170,45 @@ fn validate_test_type(test_type: &str) -> Result<(), String> {
     }
 }
 
+fn run_smartctl_on_device(
+    smartctl: &std::path::Path,
+    elevated: bool,
+    extra_args: &[&str],
+    device: &str,
+    dtype: &str,
+) -> Result<String, String> {
+    let mut args: Vec<&str> = extra_args.to_vec();
+    args.extend(["-d", dtype, device]);
+    let out = if elevated {
+        run_smartctl_elevated(smartctl, &args)?
+    } else {
+        let (stdout, stderr, _code) = run_smartctl(smartctl, &args)?;
+        if stdout.trim().is_empty() && !stderr.trim().is_empty() {
+            return Err(format!("smartctl error: {}", stderr.trim()));
+        }
+        stdout
+    };
+    if out.trim().is_empty() {
+        return Err("smartctl returned no output".to_string());
+    }
+    Ok(out)
+}
+
 fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Result<String, String> {
+    let smartctl = ensure_smartctl()?;
+
+    if let Some((device, dtype)) = cached_smart_device(&id) {
+        match run_smartctl_on_device(&smartctl, elevated, extra_args, &device, &dtype) {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                log::warn!("Cached smartctl device {device} for {id} failed ({e}); resolving it again");
+                forget_smart_device(&id);
+            }
+        }
+    }
+
     let number = extract_physical_drive_number(&id)?;
     let pd_path = format!(r"/dev/pd{}", number);
-
-    let smartctl = ensure_smartctl()?;
 
     // Look up the drive we already enumerated so we can match by serial.
     let drives = list_physical_drives_impl()?;
@@ -1168,28 +1240,9 @@ fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Res
         }
     }
 
-    let run_a = |smartctl: &std::path::Path, base_args: &[&str]| -> Result<String, String> {
-        if elevated {
-            run_smartctl_elevated(smartctl, base_args)
-        } else {
-            let (stdout, stderr, _code) = run_smartctl(smartctl, base_args)?;
-            if !stdout.trim().is_empty() {
-                Ok(stdout)
-            } else if !stderr.trim().is_empty() {
-                Err(format!("smartctl error: {}", stderr.trim()))
-            } else {
-                Err("smartctl returned no output".to_string())
-            }
-        }
-    };
-
     if let Some((device, dtype)) = matched {
-        let mut args: Vec<&str> = extra_args.to_vec();
-        args.extend(["-d", &dtype, &device]);
-        let out = run_a(&smartctl, &args)?;
-        if out.trim().is_empty() {
-            return Err("smartctl returned no output".to_string());
-        }
+        let out = run_smartctl_on_device(&smartctl, elevated, extra_args, &device, &dtype)?;
+        remember_smart_device(&id, &device, &dtype);
         return Ok(out);
     }
 
@@ -1197,10 +1250,9 @@ fn run_smartctl_on_drive(id: String, elevated: bool, extra_args: &[&str]) -> Res
     let fallback_types = ["sat", "nvme", "ata", "scsi"];
     let mut last_error = String::new();
     for dtype in &fallback_types {
-        let mut args: Vec<&str> = extra_args.to_vec();
-        args.extend(["-d", dtype, &pd_path]);
-        match run_a(&smartctl, &args) {
-            Ok(out) if !out.trim().is_empty() && !out.to_lowercase().contains("open failed") => {
+        match run_smartctl_on_device(&smartctl, elevated, extra_args, &pd_path, dtype) {
+            Ok(out) if !out.to_lowercase().contains("open failed") => {
+                remember_smart_device(&id, &pd_path, dtype);
                 return Ok(out);
             }
             Ok(out) => last_error = out,
@@ -1466,6 +1518,7 @@ pub fn run() {
             get_drive_test_status,
             get_drive_test_status_elevated,
             save_smart_snapshot,
+            install_smartmontools,
             format_drive,
             log_message,
             wallchanger::wc_get_settings,
@@ -1808,6 +1861,21 @@ garbage line
         let letter = system_drive_letter();
         assert!(letter.ends_with(':'), "{letter}");
         assert_eq!(letter, letter.to_uppercase());
+    }
+
+    #[test]
+    fn resolved_smart_devices_are_cached_per_drive() {
+        let id = r"\\.\PHYSICALDRIVE_TEST_CACHE";
+        assert_eq!(cached_smart_device(id), None);
+        remember_smart_device(id, "/dev/sdb", "sat");
+        assert_eq!(cached_smart_device(id), Some(("/dev/sdb".to_string(), "sat".to_string())));
+        forget_smart_device(id);
+        assert_eq!(cached_smart_device(id), None);
+    }
+
+    #[test]
+    fn missing_smartctl_errors_carry_the_marker_the_frontend_looks_for() {
+        assert_eq!(SMARTCTL_MISSING, "SMARTCTL_MISSING", "src/main.js checks for this exact text");
     }
 
     #[test]
