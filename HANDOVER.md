@@ -31,6 +31,10 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   kind }` with `SourceKind::Folder { include_subfolders }` / `SourceKind::Wallhaven { page_limit,
   purity: Purity { sfw, sketchy, nsfw } }` (serialized with a `"kind"` tag). Unreadable files
   are moved aside to `*.bak` and defaults are used. All JSON files are written atomically.
+  The three files are `util::JsonStore`s: read once, then served from memory; every change is
+  written first and only adopted in memory when the write succeeded (hand edits to these files
+  while MULA runs are not picked up). `vsd.json` is still read on demand, so a hand-edited
+  `port` applies on the next server start.
 - **Backend-owned settings.** The UI sends partial updates (`wc_update_settings(patch)` → normalized
   `Settings`) and renders from the result or the `wc-settings-changed` event, which every change
   (UI or tray) emits via `wallchanger::on_settings_changed`. Unknown keys are rejected. Each form

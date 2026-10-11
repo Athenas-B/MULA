@@ -127,10 +127,163 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| format!("Failed to replace {}: {e}", path.display()))
 }
 
+/// How a [`JsonStore`] writes its file.
+#[derive(Clone, Copy)]
+pub enum JsonFormat {
+    /// Indented, for files people may read.
+    Pretty,
+    /// One line, for large machine-only files.
+    Compact,
+}
+
+/// A JSON file under MULA's data directory, kept in memory: it is read on first use (missing:
+/// default; unreadable: moved aside, default) and then served from memory. A change is written
+/// to disk first and only adopted when the write succeeded, so memory never runs ahead of the
+/// file. Edits made to the file by hand while MULA runs are not picked up.
+pub struct JsonStore<T> {
+    relative_path: &'static str,
+    format: JsonFormat,
+    /// Fixes up freshly read values (e.g. clamping); not applied to values the app stores.
+    on_load: fn(&mut T),
+    path_override: Option<PathBuf>,
+    value: Mutex<Option<T>>,
+}
+
+impl<T: Default + Clone + serde::Serialize + serde::de::DeserializeOwned> JsonStore<T> {
+    pub const fn new(relative_path: &'static str, format: JsonFormat, on_load: fn(&mut T)) -> Self {
+        Self { relative_path, format, on_load, path_override: None, value: Mutex::new(None) }
+    }
+
+    /// A store for a file at an explicit path (tests).
+    #[cfg(test)]
+    pub fn at(path: PathBuf, format: JsonFormat, on_load: fn(&mut T)) -> Self {
+        Self { relative_path: "", format, on_load, path_override: Some(path), value: Mutex::new(None) }
+    }
+
+    fn path(&self) -> Result<PathBuf, String> {
+        match &self.path_override {
+            Some(path) => Ok(path.clone()),
+            None => mula_path(self.relative_path),
+        }
+    }
+
+    fn loaded<'a>(&self, slot: &'a mut Option<T>) -> Result<&'a mut T, String> {
+        if slot.is_none() {
+            let mut value = read_json_or_default(&self.path()?)?;
+            (self.on_load)(&mut value);
+            *slot = Some(value);
+        }
+        Ok(slot.as_mut().expect("just loaded"))
+    }
+
+    fn write(&self, value: &T) -> Result<(), String> {
+        let path = self.path()?;
+        let text = match self.format {
+            JsonFormat::Pretty => serde_json::to_string_pretty(value),
+            JsonFormat::Compact => serde_json::to_string(value),
+        }
+        .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
+        write_atomic(&path, &text)
+    }
+
+    /// Runs `f` on the current value.
+    pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, String> {
+        let mut slot = lock(&self.value);
+        Ok(f(self.loaded(&mut slot)?))
+    }
+
+    /// A copy of the current value.
+    pub fn get(&self) -> Result<T, String> {
+        self.read(T::clone)
+    }
+
+    /// Changes the value through `f` and saves it; nothing changes when `f` fails or the file
+    /// can't be written. Other readers and writers wait until it is done.
+    pub fn update<R>(&self, f: impl FnOnce(&mut T) -> Result<R, String>) -> Result<R, String> {
+        let mut slot = lock(&self.value);
+        let current = self.loaded(&mut slot)?;
+        let mut next = current.clone();
+        let result = f(&mut next)?;
+        self.write(&next)?;
+        *current = next;
+        Ok(result)
+    }
+
+    /// Replaces the value and saves it (kept only when the write succeeded).
+    pub fn set(&self, value: T) -> Result<(), String> {
+        let mut slot = lock(&self.value);
+        self.write(&value)?;
+        *slot = Some(value);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+
+    #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Doc {
+        n: i32,
+    }
+
+    fn clamp_doc(doc: &mut Doc) {
+        doc.n = doc.n.min(10);
+    }
+
+    #[test]
+    fn stores_read_the_file_once_and_serve_later_reads_from_memory() {
+        let dir = TempDir::new("store_read");
+        let path = dir.join("doc.json");
+        fs::write(&path, r#"{"n":42}"#).unwrap();
+        let store = JsonStore::<Doc>::at(path.clone(), JsonFormat::Pretty, clamp_doc);
+
+        assert_eq!(store.get().unwrap(), Doc { n: 10 }, "freshly read values are fixed up");
+        fs::write(&path, r#"{"n":1}"#).unwrap();
+        assert_eq!(store.read(|d| d.n).unwrap(), 10, "the file is not read again");
+    }
+
+    #[test]
+    fn missing_files_start_from_the_default() {
+        let dir = TempDir::new("store_missing");
+        let store = JsonStore::<Doc>::at(dir.join("none.json"), JsonFormat::Pretty, clamp_doc);
+        assert_eq!(store.get().unwrap(), Doc::default());
+        assert!(!dir.join("none.json").exists(), "reading never creates the file");
+    }
+
+    #[test]
+    fn updates_and_sets_are_written_through() {
+        let dir = TempDir::new("store_write");
+        let path = dir.join("sub").join("doc.json");
+        let store = JsonStore::<Doc>::at(path.clone(), JsonFormat::Compact, clamp_doc);
+
+        assert_eq!(store.update(|d| { d.n = 50; Ok(d.n * 2) }).unwrap(), 100);
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"n":50}"#, "stored values are not re-clamped");
+        assert_eq!(store.get().unwrap().n, 50);
+
+        store.set(Doc { n: 7 }).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"n":7}"#);
+        assert_eq!(store.get().unwrap().n, 7);
+    }
+
+    #[test]
+    fn failed_changes_leave_memory_and_file_untouched() {
+        let dir = TempDir::new("store_fail");
+        let path = dir.join("doc.json");
+        let store = JsonStore::<Doc>::at(path.clone(), JsonFormat::Compact, clamp_doc);
+        store.set(Doc { n: 3 }).unwrap();
+
+        assert!(store.update(|d| { d.n = 9; Err::<(), _>("nope".to_string()) }).is_err());
+        assert_eq!(store.get().unwrap().n, 3);
+
+        // A directory in the file's place makes the write fail.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.update(|d| { d.n = 9; Ok(()) }).is_err());
+        assert!(store.set(Doc { n: 9 }).is_err());
+        assert_eq!(store.get().unwrap().n, 3, "memory never runs ahead of the file");
+    }
 
     #[test]
     fn atomic_writes_create_folders_replace_files_and_leave_no_temp_file() {

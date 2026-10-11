@@ -137,7 +137,7 @@ fn apply_locked(change_one_monitor_only: bool) -> Result<String, String> {
     let settings = settings::load()?;
     let mut runtime = settings::load_state()?;
     let result = apply_with(&settings, &mut runtime, change_one_monitor_only)?;
-    settings::save_state(&runtime)?;
+    settings::save_state(runtime)?;
 
     if let Err(e) = cleanup_rendered_cache() {
         log::warn!("Failed to clean up rendered wallpaper cache: {e}");

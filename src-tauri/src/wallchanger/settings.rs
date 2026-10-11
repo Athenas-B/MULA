@@ -5,9 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
-use crate::util::{lock, read_json_or_default, write_json};
+use crate::util::{JsonFormat, JsonStore};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -252,10 +251,15 @@ fn default_font_size() -> i32 { 28 }
 fn default_fade_duration() -> i32 { 600 }
 fn default_fade_steps() -> i32 { 12 }
 
-/// Serializes read-modify-write cycles on `settings.json`.
-static CONFIG_LOCK: Mutex<()> = Mutex::new(());
-/// Bumped on every settings write, so the UI can ignore responses and events that are older
-/// than what it already shows.
+static SETTINGS: JsonStore<Settings> = JsonStore::new("wallchanger/settings.json", JsonFormat::Pretty, normalize);
+/// Compact: it can hold thousands of paths.
+static STATE: JsonStore<RuntimeState> = JsonStore::new("wallchanger/state.json", JsonFormat::Compact, keep::<RuntimeState>);
+static SERVICE: JsonStore<ServiceFlag> = JsonStore::new("wallchanger/service.json", JsonFormat::Pretty, keep::<ServiceFlag>);
+
+fn keep<T>(_: &mut T) {}
+
+/// Bumped on every settings change (while the store is locked), so the UI can ignore responses
+/// and events that are older than what it already shows.
 static REVISION: AtomicU64 = AtomicU64::new(0);
 
 /// Settings together with the revision they belong to.
@@ -269,46 +273,34 @@ pub fn config_dir() -> Result<PathBuf, String> {
     crate::util::mula_path("wallchanger")
 }
 
-fn settings_path() -> Result<PathBuf, String> {
-    Ok(config_dir()?.join("settings.json"))
-}
-
-fn state_path() -> Result<PathBuf, String> {
-    Ok(config_dir()?.join("state.json"))
-}
-
 pub fn load() -> Result<Settings, String> {
-    let mut settings: Settings = read_json_or_default(&settings_path()?)?;
-    normalize(&mut settings);
-    Ok(settings)
+    SETTINGS.get()
 }
 
 /// The current settings and their revision.
 pub fn load_versioned() -> Result<Versioned, String> {
-    let _guard = lock(&CONFIG_LOCK);
-    Ok(Versioned { revision: REVISION.load(Ordering::SeqCst), settings: load()? })
+    SETTINGS.read(|settings| Versioned { revision: REVISION.load(Ordering::SeqCst), settings: settings.clone() })
 }
 
-/// Saves `settings` (with the config lock held) and returns them with a new revision.
-fn save_versioned(settings: Settings) -> Result<Versioned, String> {
-    write_json(&settings_path()?, &settings)?;
-    Ok(Versioned { revision: REVISION.fetch_add(1, Ordering::SeqCst) + 1, settings })
-}
-
-/// Loads the settings, lets `f` change them, normalizes and saves, without racing other writers.
+/// Changes the settings through `f`, normalizes and saves them, without racing other writers.
 pub fn update(f: impl FnOnce(&mut Settings)) -> Result<Versioned, String> {
-    let _guard = lock(&CONFIG_LOCK);
-    let mut settings = load()?;
-    f(&mut settings);
-    normalize(&mut settings);
-    save_versioned(settings)
+    SETTINGS.update(|settings| {
+        f(settings);
+        normalize(settings);
+        Ok(versioned(settings))
+    })
 }
 
 /// Applies a partial update: each top-level key of `patch` replaces that setting.
 pub fn update_with_patch(patch: serde_json::Value) -> Result<Versioned, String> {
-    let _guard = lock(&CONFIG_LOCK);
-    let next = apply_patch(&load()?, patch)?;
-    save_versioned(next)
+    SETTINGS.update(|settings| {
+        *settings = apply_patch(settings, patch)?;
+        Ok(versioned(settings))
+    })
+}
+
+fn versioned(settings: &Settings) -> Versioned {
+    Versioned { revision: REVISION.fetch_add(1, Ordering::SeqCst) + 1, settings: settings.clone() }
 }
 
 fn apply_patch(settings: &Settings, patch: serde_json::Value) -> Result<Settings, String> {
@@ -329,34 +321,27 @@ fn apply_patch(settings: &Settings, patch: serde_json::Value) -> Result<Settings
 }
 
 pub fn load_state() -> Result<RuntimeState, String> {
-    read_json_or_default(&state_path()?)
+    STATE.get()
 }
 
-/// Saves the state a wallpaper change produced (compact: it can hold thousands of paths).
-pub fn save_state(state: &RuntimeState) -> Result<(), String> {
-    let text = serde_json::to_string(state).map_err(|e| format!("Failed to serialize wallchanger state: {e}"))?;
-    crate::util::write_atomic(&state_path()?, &text)
+/// Stores the state a wallpaper change produced.
+pub fn save_state(state: RuntimeState) -> Result<(), String> {
+    STATE.set(state)
 }
 
 /// Whether the interval service is switched on; stored on its own in `service.json`.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct ServiceFlag {
     #[serde(default)]
     running: bool,
 }
 
-fn service_path() -> Result<PathBuf, String> {
-    Ok(config_dir()?.join("service.json"))
-}
-
 pub fn service_running() -> bool {
-    service_path()
-        .and_then(|path| read_json_or_default::<ServiceFlag>(&path))
-        .is_ok_and(|flag| flag.running)
+    SERVICE.read(|flag| flag.running).unwrap_or(false)
 }
 
 pub fn set_service_running(running: bool) -> Result<(), String> {
-    write_json(&service_path()?, &ServiceFlag { running })
+    SERVICE.set(ServiceFlag { running })
 }
 
 pub fn normalize(settings: &mut Settings) {
