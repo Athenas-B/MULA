@@ -2,9 +2,10 @@ use super::images::{is_eligible_source, load_images, NetworkPolicy};
 use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, try_disable_windows_slideshow};
 use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor, RankedImage};
-use super::transition::apply_wallpaper;
+use super::transition::{apply_wallpapers, WallpaperChange};
 use super::settings::{self, RuntimeState, Settings};
-use crate::util::lock;
+use crate::util::{lock, parallel_map, IMAGE_WORKERS};
+use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -173,9 +174,10 @@ fn apply_with(settings: &Settings, runtime: &mut RuntimeState, change_one_monito
     }
 
     let rotation_mode = settings.rotation_mode;
+    // Pick every monitor's image first (this advances the queues), then prepare and set them
+    // all together.
     let mut applied = Vec::new();
-
-    for monitor in targets {
+    for &monitor in &targets {
         let key = get_queue_key(settings, monitors.len(), &monitor.id, false);
         let fallback_queue;
         let (queue, fallback): (&[RankedImage], bool) = match queues.get(&key) {
@@ -195,12 +197,26 @@ fn apply_with(settings: &Settings, runtime: &mut RuntimeState, change_one_monito
             chosen
         };
 
-        let wallpaper_path = resolve_wallpaper_path(&selected.image.path, settings);
-        apply_wallpaper(monitor, &wallpaper_path, settings)?;
-
-        record_image_shown(runtime, &selected.image.path);
-
         applied.push(selected.image.path.clone());
+    }
+
+    // Overlay renders are independent; each distinct image is rendered once (two monitors may
+    // show the same one, and its render is cached under one file name).
+    let mut originals: Vec<&str> = applied.iter().map(String::as_str).collect();
+    originals.sort_unstable();
+    originals.dedup();
+    let rendered = parallel_map(originals.len(), IMAGE_WORKERS, |i| resolve_wallpaper_path(originals[i], settings));
+    let resolved: HashMap<&str, String> = originals.iter().copied().zip(rendered).collect();
+
+    let changes: Vec<WallpaperChange> = targets
+        .iter()
+        .zip(&applied)
+        .map(|(monitor, path)| WallpaperChange { monitor, path: resolved[path.as_str()].clone() })
+        .collect();
+    apply_wallpapers(&changes, settings)?;
+
+    for path in &applied {
+        record_image_shown(runtime, path);
     }
 
     Ok(format!(

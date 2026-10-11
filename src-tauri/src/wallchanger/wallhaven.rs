@@ -14,7 +14,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -225,21 +224,14 @@ fn refresh(job: &RefreshJob) -> Result<Vec<PathBuf>, String> {
 
 /// Downloads `urls` with a few workers, returning the files in the order of `urls`.
 fn download_all(agent: &ureq::Agent, urls: &[String], dir: &Path) -> Vec<PathBuf> {
-    let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<Option<PathBuf>>> = Mutex::new(vec![None; urls.len()]);
-    std::thread::scope(|scope| {
-        for _ in 0..DOWNLOAD_WORKERS.min(urls.len()) {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(url) = urls.get(i) else { break };
-                match download_image(agent, url, dir) {
-                    Ok(path) => crate::util::lock(&results)[i] = Some(path),
-                    Err(e) => log::warn!("Skipping Wallhaven image {url}: {e}"),
-                }
-            });
-        }
-    });
-    results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).into_iter().flatten().collect()
+    crate::util::parallel_map(urls.len(), DOWNLOAD_WORKERS, |i| {
+        download_image(agent, &urls[i], dir)
+            .inspect_err(|e| log::warn!("Skipping Wallhaven image {}: {e}", urls[i]))
+            .ok()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Stores the result of a refresh. If images were found but none could be downloaded (e.g.

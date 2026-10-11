@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// MULA's data directory, e.g. `%APPDATA%\mula`.
@@ -19,6 +20,43 @@ pub fn mula_path(relative: &str) -> Result<PathBuf, String> {
 /// guard plain data that stays consistent between operations.
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Workers for parallel image decoding/encoding; each holds a few full-size images in memory.
+pub const IMAGE_WORKERS: usize = 4;
+
+/// Computes `f(0)`..`f(count - 1)` on up to `max_workers` threads and returns the results in
+/// index order. Each worker takes the next index as soon as it is free.
+pub fn parallel_map<R: Send>(count: usize, max_workers: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    let workers = max_workers.min(count);
+    if workers <= 1 {
+        return (0..count).map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<Option<R>> = std::iter::repeat_with(|| None).take(count).collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= count {
+                            break done;
+                        }
+                        done.push((i, f(i)));
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            let done = handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (i, result) in done {
+                results[i] = Some(result);
+            }
+        }
+    });
+    results.into_iter().map(|r| r.expect("every index was computed")).collect()
 }
 
 /// Runs `command` and returns its stdout. A failure to start or a non-zero exit becomes an
@@ -230,6 +268,21 @@ mod tests {
 
     fn clamp_doc(doc: &mut Doc) {
         doc.n = doc.n.min(10);
+    }
+
+    #[test]
+    fn parallel_map_keeps_the_index_order_and_uses_several_threads() {
+        let threads = Mutex::new(std::collections::HashSet::new());
+        let squares = parallel_map(50, 4, |i| {
+            lock(&threads).insert(std::thread::current().id());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            i * i
+        });
+        assert_eq!(squares, (0..50).map(|i| i * i).collect::<Vec<_>>());
+        assert!(lock(&threads).len() > 1);
+
+        assert!(parallel_map(0, 4, |i| i).is_empty());
+        assert_eq!(parallel_map(3, 1, |i| i + 1), [1, 2, 3], "one worker runs inline");
     }
 
     #[test]

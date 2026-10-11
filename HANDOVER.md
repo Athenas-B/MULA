@@ -115,7 +115,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Manual Change / Apply | Done | In tab and tray menu. |
 | Change one monitor per interval | Done | Rotates target monitor index. |
 | Picture-name overlay | Done | Filename/path text, font size, color, offset, optional backdrop; cached rendered copies. |
-| Fade transition | Done | Generates blended frames and steps through them. |
+| Fade transition | Done | All monitors fade together: images load, overlays render and frames blend/encode in parallel (`util::parallel_map`, `IMAGE_WORKERS`), then frames play in lockstep. |
 | Rendered cache cleanup | Done | Prunes by total size and file count. |
 | Windows slideshow conflict handling | Done | Detects `DSS_ENABLED` and reapplies current wallpaper to break Windows slideshow before MULA takes over. |
 | Queue preview / state UI | Done | Read-only preview with next/last/last-resort markers. |
@@ -150,7 +150,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - `src-tauri/src/wallchanger/service.rs` — Background timer service.
 - `src-tauri/src/wallchanger/monitors/windows.rs` / `linux.rs` — Monitor + wallpaper COM API wrappers (selected via `#[path]`).
 - `src-tauri/src/elevated_helper.rs` — Admin-rights execution (see Architecture notes).
-- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`/`mula_path`, `blocking`/`logged_blocking`, `lock`, `run_command`, `read_json_or_default`/`write_json`/`write_atomic`, `safe_file_name`, `stable_hash` (FNV-1a for cache names).
+- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`/`mula_path`, `blocking`/`logged_blocking`, `lock`, `parallel_map`, `run_command`, `JsonStore`, `read_json_or_default`/`write_json`/`write_atomic`, `safe_file_name`, `stable_hash` (FNV-1a for cache names).
 - `src-tauri/src/events.rs` — Event names and `emit`.
 - `src-tauri/src/logger.rs` — Rotating app log.
 - `src-tauri/src/wallchanger/overlay.rs` — Picture-name overlay rendering.
