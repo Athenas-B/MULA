@@ -72,7 +72,12 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   `-EncodedCommand` stub that verifies the SHA-256 of the script before running it; it only runs
   the smartctl path fixed at launch (must be outside the user profile) with an allowlist of
   argument shapes (optionally prefixed by `--json=o`), requires a per-session token, names its
-  own response files, and exits when MULA's PID disappears. Script inputs are always passed as
+  own response files, and exits when MULA's PID disappears. Neither side polls: the helper sleeps
+  in `Wait-Event` on a `FileSystemWatcher` (events only wake it; it still lists and validates the
+  folder) and MULA waits with `FindFirstChangeNotificationW` (`wait_for_file`), so a round trip
+  takes ~16 ms instead of ~260 ms and the idle helper wakes every 2 s instead of 4×/s. Files are
+  kept over a named pipe on purpose: a UAC-started process can't inherit handles, and a pipe name
+  chosen up front could be claimed first by another same-user process (pipe squatting). Script inputs are always passed as
   PowerShell variables declared as single-quoted literals (`ps_script`) — no text placeholders.
   Formatting uses `run_elevated_script` (separate UAC prompt; a declined prompt is detected by
   ERROR_CANCELLED) and refuses system/boot disks in Rust and in the script.

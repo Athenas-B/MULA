@@ -4,7 +4,13 @@
 //!
 //! * A long-lived elevated **smartctl helper** ([`run_smartctl_elevated`]), so polling self-test
 //!   progress does not raise a UAC prompt every few seconds. It talks to MULA through command /
-//!   response files in a temp directory.
+//!   response files in a temp directory; both sides sleep on directory change notifications
+//!   instead of polling (the helper a `FileSystemWatcher`, MULA [`wait_for_file`]).
+//!
+//! Files rather than a named pipe: an elevated process started through UAC can't inherit
+//! handles, so a pipe would need a name chosen up front, which another process of the same user
+//! could read from the script and claim first while the UAC prompt is open (pipe squatting),
+//! receiving the token and feeding MULA fake SMART data.
 //! * A **one-shot elevated script** ([`run_elevated_script`]) that raises its own UAC prompt and
 //!   is used for destructive operations such as formatting a drive. Those never go through the
 //!   long-lived helper.
@@ -94,11 +100,20 @@ function Write-Response([string]$id, $res) {
 }
 
 if (-not (Test-DirIsSafe)) { exit 3 }
+
+# New command files wake the loop through a watcher. Its events are only a wake-up signal: the
+# loop always lists and validates the folder itself, so a missed or spurious event costs at most
+# a rescan. Events raised while commands run stay queued, so none is lost between scans.
+$watcher = New-Object IO.FileSystemWatcher -ArgumentList $Dir, 'cmd_*.json'
+$watcher.NotifyFilter = [IO.NotifyFilters]::FileName
+$null = Register-ObjectEvent -InputObject $watcher -EventName Created -SourceIdentifier 'MulaCmdCreated'
+$null = Register-ObjectEvent -InputObject $watcher -EventName Renamed -SourceIdentifier 'MulaCmdRenamed'
+$watcher.EnableRaisingEvents = $true
+
 [IO.File]::WriteAllText((Join-Path $Dir 'ready'), '', $utf8)
 
-$tick = 0
 while ($true) {
-    if (($tick++ % 8) -eq 0 -and -not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+    if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
     $files = Get-ChildItem -LiteralPath $Dir -Filter 'cmd_*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime
     foreach ($f in $files) {
         $id = $f.BaseName.Substring(4)
@@ -132,7 +147,9 @@ while ($true) {
         Write-Response $id $res
         if ($exitAfter) { exit 0 }
     }
-    Start-Sleep -Milliseconds 250
+    # Sleep until a command file appears, or 2 s pass so the helper notices MULA exiting.
+    $null = Wait-Event -Timeout 2
+    Get-Event | Remove-Event
 }
 "#;
 
@@ -160,6 +177,67 @@ fn ps_script(template: &str, vars: &[(&str, &str)]) -> String {
 fn encode_ps(script: &str) -> String {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
+/// Re-check interval when change notifications are unavailable or fail.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Waits until `file` exists in `dir` (created or renamed into it), up to `timeout`; returns
+/// whether it appeared. Sleeps on a directory change notification rather than polling.
+#[cfg(target_os = "windows")]
+fn wait_for_file(dir: &Path, file: &Path, timeout: Duration) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::Storage::FileSystem::{
+        FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification, FILE_NOTIFY_CHANGE_FILE_NAME,
+    };
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let deadline = Instant::now() + timeout;
+    // Registered before the first check, so a file appearing in between still signals it.
+    let Ok(handle) = (unsafe { FindFirstChangeNotificationW(&HSTRING::from(dir), false, FILE_NOTIFY_CHANGE_FILE_NAME) }) else {
+        return poll_for_file(file, deadline);
+    };
+    let found = loop {
+        if file.exists() {
+            break true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(handle, wait_ms) } {
+            WAIT_OBJECT_0 => {
+                // Re-arm for the next change. If that fails (e.g. the folder was deleted) the
+                // handle stays signaled, so throttle the loop into plain polling.
+                if unsafe { FindNextChangeNotification(handle) }.is_err() {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+            WAIT_TIMEOUT => {}
+            _ => std::thread::sleep(POLL_INTERVAL),
+        }
+    };
+    let _ = unsafe { FindCloseChangeNotification(handle) };
+    found
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_file(_dir: &Path, file: &Path, timeout: Duration) -> bool {
+    poll_for_file(file, Instant::now() + timeout)
+}
+
+fn poll_for_file(file: &Path, deadline: Instant) -> bool {
+    loop {
+        if file.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 fn new_private_dir(prefix: &str) -> Result<PathBuf, String> {
@@ -269,14 +347,10 @@ fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, CommandErro
     log::info!("Starting elevated smartctl helper in {}", cmd_dir.display());
     launch_stub(&stub, elevate, false)?;
 
-    let ready_file = cmd_dir.join("ready");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !ready_file.exists() {
-        if Instant::now() >= deadline {
-            let _ = std::fs::remove_dir_all(&cmd_dir);
-            return Err("Elevated helper did not become ready".into());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    // Allows time for answering the UAC prompt.
+    if !wait_for_file(&cmd_dir, &cmd_dir.join("ready"), Duration::from_secs(60)) {
+        let _ = std::fs::remove_dir_all(&cmd_dir);
+        return Err("Elevated helper did not become ready".into());
     }
 
     log::info!("Elevated smartctl helper is ready");
@@ -297,13 +371,9 @@ fn send_command(helper: &ElevatedHelper, args: &[&str], exit: bool, timeout: Dur
     // Written atomically: the helper must never pick up a half-written command.
     crate::util::write_atomic(&cmd_file, &json)?;
 
-    let start = Instant::now();
-    while !res_file.exists() {
-        if start.elapsed() >= timeout {
-            let _ = std::fs::remove_file(&cmd_file);
-            return Err("Elevated helper did not respond".to_string());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    if !wait_for_file(&helper.cmd_dir, &res_file, timeout) {
+        let _ = std::fs::remove_file(&cmd_file);
+        return Err("Elevated helper did not respond".to_string());
     }
 
     let bytes = std::fs::read(&res_file).map_err(|e| format!("Failed to read helper response: {e}"))?;
@@ -437,6 +507,50 @@ mod tests {
         let bye = send_command(&helper, &[], true, Duration::from_secs(30)).unwrap();
         assert!(bye.ok);
         let _ = std::fs::remove_dir_all(&helper.cmd_dir);
+    }
+
+    #[test]
+    fn helper_answers_without_polling_delays() {
+        let exe = where_exe();
+        let helper = start_helper(&exe, false).expect("helper should start unelevated");
+        // Warm up PowerShell's first command, then time a few round trips.
+        send_command(&helper, &["--scan"], false, Duration::from_secs(30)).unwrap();
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(send_command(&helper, &["-x"], false, Duration::from_secs(30)).unwrap().error, "command not allowed: smartctl -x");
+        }
+        let per_command = start.elapsed() / 3;
+        // The old 250 ms + 100 ms polling averaged ~175 ms of pure waiting per command.
+        assert!(per_command < Duration::from_millis(150), "round trip took {per_command:?}");
+        send_command(&helper, &[], true, Duration::from_secs(30)).unwrap();
+        let _ = std::fs::remove_dir_all(&helper.cmd_dir);
+    }
+
+    #[test]
+    fn waiting_for_a_file_wakes_when_it_is_renamed_into_place_or_times_out() {
+        let dir = crate::test_support::TempDir::new("wait_for_file");
+        let target = dir.join("res_1.json");
+        let writer = std::thread::spawn({
+            let (dir, target) = (dir.path().to_path_buf(), target.clone());
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::write(dir.join("other.tmp"), b"noise").unwrap();
+                std::fs::write(dir.join("res_1.tmp"), b"{}").unwrap();
+                std::fs::rename(dir.join("res_1.tmp"), &target).unwrap();
+            }
+        });
+        let start = Instant::now();
+        assert!(wait_for_file(dir.path(), &target, Duration::from_secs(10)));
+        assert!(start.elapsed() < Duration::from_secs(2), "woke after {:?}", start.elapsed());
+        writer.join().unwrap();
+
+        let start = Instant::now();
+        assert!(!wait_for_file(dir.path(), &dir.join("never.json"), Duration::from_millis(300)));
+        assert!(start.elapsed() >= Duration::from_millis(300));
+
+        // An existing file returns at once; a missing folder falls back to polling.
+        assert!(wait_for_file(dir.path(), &target, Duration::ZERO));
+        assert!(!wait_for_file(&dir.join("gone"), &dir.join("gone").join("x"), Duration::from_millis(200)));
     }
 
     #[test]
