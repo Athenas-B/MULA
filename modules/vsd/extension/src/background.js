@@ -20,7 +20,6 @@ const MAX_POLL_FAILURES = 10;
 // ── State ───────────────────────────────────────────────────────────────────
 
 const capturedHeaders = new Map();
-const pageMetadata = new Map();
 // Playlist URL -> true (media playlist with .ts segments, or unverifiable) / false (no segments).
 const verifiedUrls = new Map();
 // Playlist URL -> in-flight verification promise, shared by concurrent detections.
@@ -170,6 +169,41 @@ function setBounded(map, key, value, max) {
   while (map.size > max) map.delete(map.keys().next().value);
 }
 
+// Page metadata reported by content scripts, by page URL. Kept in session storage (cleared when
+// the browser closes), so it survives this worker being stopped and content scripts never have
+// to re-send it; memory only where session storage is unavailable.
+const PAGE_METADATA_KEY = 'pageMetadata';
+let pageMetadataLoad = null;
+
+function loadPageMetadata() {
+  pageMetadataLoad ??= new Promise((resolve) => {
+    try {
+      if (!chrome.storage.session) return resolve(new Map());
+      chrome.storage.session.get({ [PAGE_METADATA_KEY]: [] }, (result) => {
+        resolve(new Map(Array.isArray(result?.[PAGE_METADATA_KEY]) ? result[PAGE_METADATA_KEY] : []));
+      });
+    } catch (e) {
+      resolve(new Map());
+    }
+  });
+  return pageMetadataLoad;
+}
+
+async function rememberPageMetadata(pageUrl, metadata) {
+  const map = await loadPageMetadata();
+  setBounded(map, pageUrl, metadata, MAX_PAGE_METADATA);
+  try {
+    chrome.storage.session?.set({ [PAGE_METADATA_KEY]: [...map] });
+  } catch (e) {}
+}
+
+async function forgetPageMetadata() {
+  (await loadPageMetadata()).clear();
+  try {
+    chrome.storage.session?.remove(PAGE_METADATA_KEY);
+  } catch (e) {}
+}
+
 async function hasTsSegments(url, headers) {
   try {
     const res = await fetch(url, { headers });
@@ -245,9 +279,9 @@ async function fillMissingTitles() {
 
 // ── Stream Storage ──────────────────────────────────────────────────────────
 
-function addStream(url, pageUrl, type = 'hls', title = '', headers = null) {
-  if (!url || !isM3u8(url)) return Promise.resolve();
-  const metadata = (pageUrl && pageUrl !== 'unknown') ? (pageMetadata.get(pageUrl) || null) : null;
+async function addStream(url, pageUrl, type = 'hls', title = '', headers = null) {
+  if (!url || !isM3u8(url)) return;
+  const metadata = (pageUrl && pageUrl !== 'unknown') ? ((await loadPageMetadata()).get(pageUrl) || null) : null;
   const finalHeaders = headers || capturedHeaders.get(url) || makePageHeaders(pageUrl);
 
   return updateStore((data) => {
@@ -463,12 +497,6 @@ async function pollJobs() {
 
 // ── Message Handling ────────────────────────────────────────────────────────
 
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name === 'content') {
-    port.onDisconnect.addListener(() => {});
-  }
-});
-
 function respondWith(promise, sendResponse) {
   promise
     .then(() => sendResponse({ ok: true }))
@@ -481,7 +509,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'metadata': {
       const pageUrl = message.pageUrl || sender.tab?.url;
       if (pageUrl && message.metadata) {
-        setBounded(pageMetadata, pageUrl, message.metadata, MAX_PAGE_METADATA);
+        rememberPageMetadata(pageUrl, message.metadata).catch(err => console.error('Failed to store page metadata:', err));
         updateStore(({ streams }) => {
           streams.forEach(s => {
             if (s.pageUrl === pageUrl && !s.metadata) s.metadata = message.metadata;
@@ -494,7 +522,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'detected': {
       const pageUrl = sender.tab?.url || 'unknown';
-      if (message.metadata && pageUrl !== 'unknown') setBounded(pageMetadata, pageUrl, message.metadata, MAX_PAGE_METADATA);
+      if (message.metadata && pageUrl !== 'unknown') {
+        rememberPageMetadata(pageUrl, message.metadata).catch(err => console.error('Failed to store page metadata:', err));
+      }
       if (detectionEnabled) {
         const headers = makePageHeaders(pageUrl);
         for (const s of message.streams || []) {
@@ -540,7 +570,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'clearAllData': {
       return respondWith(
-        updateStore((data) => { data.streams = []; }).then(() => storageSet({ errorLog: [] })),
+        updateStore((data) => { data.streams = []; }).then(() => storageSet({ errorLog: [] })).then(forgetPageMetadata),
         sendResponse
       );
     }

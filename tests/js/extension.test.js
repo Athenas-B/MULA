@@ -220,8 +220,8 @@ describe("config.js", () => {
 
 // ── background.js ───────────────────────────────────────────────────────────
 
-function loadBackground({ storage = {}, tabs = [], fetch, asyncStorage = false } = {}) {
-  const chrome = createFakeChrome({ storage, tabs, asyncStorage });
+function loadBackground({ storage = {}, session = {}, tabs = [], fetch, asyncStorage = false } = {}) {
+  const chrome = createFakeChrome({ storage, session, tabs, asyncStorage });
   const console = createFakeConsole();
   const timers = createFakeTimers();
   const fetchCalls = [];
@@ -941,6 +941,36 @@ describe("background.js message handling", () => {
     assert.deepEqual(bg.streams()[0].metadata, { title: "new" });
   });
 
+  it("page metadata survives the worker being stopped (session storage)", async () => {
+    const bg = loadBackground();
+    await bg.send({ type: "metadata", metadata: { title: "kept" } }, { tab: { url: "https://site/p" } });
+    await flush();
+    assert.deepEqual(plain(bg.chrome.sessionStore.pageMetadata), [["https://site/p", { title: "kept" }]]);
+
+    // A restarted worker starts from the session copy, so no content script has to re-send it.
+    const restarted = loadBackground({ session: bg.chrome.sessionStore });
+    await restarted.fn.addStream("https://cdn/x.m3u8", "https://site/p");
+    assert.deepEqual(restarted.streams()[0].metadata, { title: "kept" });
+  });
+
+  it("page metadata stays in memory when session storage is unavailable", async () => {
+    const bg = loadBackground();
+    delete bg.chrome.storage.session;
+    await bg.send({ type: "metadata", metadata: { title: "mem" } }, { tab: { url: "https://site/p" } });
+    await flush();
+    await bg.fn.addStream("https://cdn/y.m3u8", "https://site/p");
+    assert.deepEqual(bg.streams()[0].metadata, { title: "mem" });
+  });
+
+  it("clearAllData also forgets page metadata", async () => {
+    const bg = loadBackground({ session: { pageMetadata: [["https://site/p", { title: "old" }]] } });
+    await bg.send({ type: "clearAllData" });
+    await flush();
+    assert.equal(bg.chrome.sessionStore.pageMetadata, undefined);
+    await bg.fn.addStream("https://cdn/z.m3u8", "https://site/p");
+    assert.equal(bg.streams()[0].metadata, null);
+  });
+
   it("detected: verifies and adds reported streams with the page title", async () => {
     const bg = loadBackground();
     const res = await bg.send(
@@ -1191,39 +1221,26 @@ describe("content.js", () => {
     assert.equal(c.chrome.sent.some((m) => m.type === "detected"), false);
   });
 
-  it("stops all work after the port disconnects with an invalidated context", () => {
+  it("never keeps a port open to the background", () => {
+    const c = loadContent({ queryAll: { video: [{ src: "https://cdn/a.m3u8" }] } });
+    c.mutate();
+    assert.equal(c.connects.length, 0);
+    assert.equal(c.ofType("detected").length, 1);
+  });
+
+  it("stops all work on the next scan once the extension context is gone", () => {
     const c = loadContent();
-    c.mo.trigger();
     c.chrome.runtime.id = undefined;
-    c.chrome.port.onDisconnect.fire();
+    const before = c.chrome.sent.length;
+    c.document.title = "changed";
+    c.mutate();
     assert.equal(c.run("contextValid"), false);
     assert.equal(c.mo.instances[0].disconnected, true);
     assert.deepEqual(c.timers.pending(), []);
-    const before = c.chrome.sent.length;
     c.fn.scan();
     c.fn.sendMetadata();
     c.fn.scheduleScan();
     assert.equal(c.chrome.sent.length, before);
-    assert.equal(c.connects.length, 1);
-  });
-
-  it("treats an immediate disconnect as a dead context", () => {
-    const c = loadContent();
-    c.chrome.port.onDisconnect.fire();
-    assert.equal(c.run("contextValid"), false);
-    assert.equal(c.connects.length, 1);
-  });
-
-  it("reconnects and re-sends everything when only the background worker restarted", () => {
-    const c = loadContent({ queryAll: { video: [{ src: "https://cdn/a.m3u8" }] } });
-    assert.equal(c.ofType("detected").length, 1);
-    c.run("Date.now = () => 8.64e15");
-    c.chrome.port.onDisconnect.fire();
-    assert.equal(c.run("contextValid"), true);
-    assert.equal(c.connects.length, 2);
-    c.timers.runAll();
-    assert.equal(c.ofType("metadata").length, 2);
-    assert.equal(c.ofType("detected").length, 2);
   });
 
   it("treats a throwing chrome.runtime.id as an invalidated context", () => {

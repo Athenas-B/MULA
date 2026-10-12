@@ -376,8 +376,9 @@ const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)
  * still snapshot at call time), which exposes lost-update races. Every set() call is
  * recorded in `writes`.
  */
-export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undefined, asyncStorage = false } = {}) {
+export function createFakeChrome({ storage = {}, session = {}, tabs = [], onSend = () => undefined, asyncStorage = false } = {}) {
   const store = clone(storage);
+  const sessionStore = clone(session);
   const writes = [];
   const later = (fn) => (asyncStorage ? setImmediate(fn) : fn());
   const sent = [];
@@ -387,6 +388,7 @@ export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undef
 
   const chrome = {
     store,
+    sessionStore,
     writes,
     sent,
     icons,
@@ -412,6 +414,23 @@ export function createFakeChrome({ storage = {}, tabs = [], onSend = () => undef
     },
     storage: {
       onChanged: fakeEvent(),
+      // A plain in-memory area (no change events, no write log).
+      session: {
+        get(keys, cb) {
+          const result = Object.fromEntries(
+            Object.entries(keys).map(([k, d]) => [k, k in sessionStore ? clone(sessionStore[k]) : clone(d)])
+          );
+          later(() => cb(result));
+        },
+        set(obj, cb) {
+          for (const [k, v] of Object.entries(obj)) sessionStore[k] = clone(v);
+          later(() => cb?.());
+        },
+        remove(key, cb) {
+          delete sessionStore[key];
+          later(() => cb?.());
+        },
+      },
       local: {
         get(keys, cb) {
           let result;

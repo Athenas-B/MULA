@@ -53,8 +53,6 @@ function extractMetadata() {
 // ── State ───────────────────────────────────────────────────────────────────
 
 const SCAN_THROTTLE_MS = 1000;
-// A port that disconnects sooner than this after connecting is treated as a dead context.
-const MIN_PORT_LIFETIME_MS = 1000;
 
 const reportedUrls = new Set();
 let lastMetadataKey = '';
@@ -63,6 +61,11 @@ let scanTimer = null;
 let contextValid = true;
 
 // ── Context Validation ──────────────────────────────────────────────────────
+// There is deliberately no long-lived port to the background: every open tab reconnecting
+// whenever the service worker stops would keep restarting it. A reloaded/removed extension is
+// noticed lazily instead, the next time this script wants to send something (`chrome.runtime.id`
+// is gone, or sendMessage throws), and then all work stops. The background keeps what it was
+// told (streams, page metadata) in storage, so nothing has to be re-sent after it restarts.
 
 function stopAll() {
   contextValid = false;
@@ -80,32 +83,6 @@ function runtimeAlive() {
   try { return !!chrome.runtime.id; }
   catch (e) { return false; }
 }
-
-// The open port lets the background notice this tab; its disconnect tells us the
-// extension context went away (extension reloaded/removed). If the runtime is still
-// alive, only the background worker restarted: reconnect and re-send everything,
-// since the new worker has lost its in-memory page metadata.
-function connectPort() {
-  const connectedAt = Date.now();
-  try {
-    const port = chrome.runtime.connect({ name: 'content' });
-    port.onDisconnect.addListener(() => {
-      try { void chrome.runtime.lastError; } catch (e) {}
-      if (contextValid && runtimeAlive() && Date.now() - connectedAt >= MIN_PORT_LIFETIME_MS) {
-        lastMetadataKey = '';
-        reportedUrls.clear();
-        connectPort();
-        scheduleScan();
-      } else {
-        stopAll();
-      }
-    });
-  } catch (e) {
-    stopAll();
-  }
-}
-
-connectPort();
 
 function extensionContextValid() {
   if (!contextValid) return false;
