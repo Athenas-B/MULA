@@ -46,7 +46,7 @@ function buildTooltip(s) {
   const list = (v) => (Array.isArray(v) ? v.join(', ') : v);
   const fields = [
     ['title', s.title || meta.title],
-    ['comment', s.pageUrl !== 'unknown' && s.pageUrl],
+    ['comment', /^https?:\/\//i.test(s.pageUrl || '') && s.pageUrl],
     ['artist', meta.channel],
     ['genre', list(meta.categories)],
     ['keywords', list(meta.tags)],

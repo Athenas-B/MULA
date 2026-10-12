@@ -938,6 +938,22 @@ describe("background.js message handling", () => {
     assert.deepEqual(bg.streams()[0].metadata, { title: "mem" });
   });
 
+  it("a failed session write is reported, and the metadata is still used", async () => {
+    const bg = loadBackground();
+    bg.chrome.storage.session.set = (_obj, cb) => {
+      bg.chrome.runtime.lastError = { message: "QUOTA_BYTES quota exceeded" };
+      cb();
+      bg.chrome.runtime.lastError = undefined;
+    };
+    await bg.send({ type: "metadata", metadata: { title: "big" } }, { tab: { url: "https://site/p" } });
+    await flush();
+    assert.deepEqual(plain(bg.console.calls.map((c) => c.args)), [
+      ["Failed to keep page metadata in session storage:", "QUOTA_BYTES quota exceeded"],
+    ]);
+    await bg.fn.addStream("https://cdn/q.m3u8", "https://site/p");
+    assert.deepEqual(bg.streams()[0].metadata, { title: "big" });
+  });
+
   it("clearAllData also forgets page metadata", async () => {
     const bg = loadBackground({ session: { pageMetadata: [["https://site/p", { title: "old" }]] } });
     await bg.send({ type: "clearAllData" });
@@ -1331,6 +1347,11 @@ describe("popup.js helpers", () => {
   it("buildTooltip falls back to the metadata title and skips unknown pages", () => {
     const tooltip = p.fn.buildTooltip({ url: "u", pageUrl: "unknown", title: "", metadata: { title: "Meta", tags: [] } });
     assert.equal(tooltip, "Metadata saved in file:\ntitle: Meta");
+  });
+
+  it("buildTooltip only lists real page URLs as the comment, like the server", () => {
+    assert.equal(p.fn.buildTooltip({ pageUrl: "chrome-extension://abc/popup.html", title: "T" }), "Metadata saved in file:\ntitle: T");
+    assert.equal(p.fn.buildTooltip({ pageUrl: "http://site/v" }), "Metadata saved in file:\ncomment: http://site/v");
   });
 
   it("buildTooltip returns an empty string when there is nothing to show", () => {

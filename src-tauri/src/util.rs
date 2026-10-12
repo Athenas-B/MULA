@@ -22,8 +22,9 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Workers for parallel image decoding/encoding; each holds a few full-size images in memory.
-pub const IMAGE_WORKERS: usize = 4;
+/// Workers for decoding full-size images in parallel. Each holds a whole decoded source image
+/// (a 50 MP photo is ~200 MB as RGBA), so keep this small.
+pub const IMAGE_WORKERS: usize = 2;
 
 /// Computes `f(0)`..`f(count - 1)` on up to `max_workers` threads and returns the results in
 /// index order. Each worker takes the next index as soon as it is free.
@@ -57,6 +58,20 @@ pub fn parallel_map<R: Send>(count: usize, max_workers: usize, f: impl Fn(usize)
         }
     });
     results.into_iter().map(|r| r.expect("every index was computed")).collect()
+}
+
+/// A command for a console program that never opens a console window (MULA is a GUI app, so
+/// Windows would otherwise give every child process its own visible console).
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 /// Runs `command` and returns its stdout. A failure to start or a non-zero exit becomes an
@@ -399,7 +414,7 @@ mod tests {
 
     #[test]
     fn commands_return_stdout_or_a_named_error() {
-        let ok = run_command(Command::new("cmd").args(["/C", "echo hello"]), "echo").unwrap();
+        let ok = run_command(command("cmd").args(["/C", "echo hello"]), "echo").unwrap();
         assert_eq!(ok.trim(), "hello");
         let err = run_command(Command::new("cmd").args(["/C", "echo broken 1>&2 & exit 3"]), "the tool").unwrap_err();
         assert_eq!(err, "the tool failed: broken");

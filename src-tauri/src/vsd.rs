@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -230,7 +230,7 @@ fn ensure_requirements(python: &Path, working_dir: &Path) -> Result<(), String> 
     }
 
     emit_line("[Installing dependencies...]");
-    let mut pip = Command::new(python);
+    let mut pip = util::command(python);
     pip.args(["-m", "pip", "install", "--quiet", "-r"]).arg(&requirements).current_dir(working_dir);
     if let Err(e) = util::run_command(&mut pip, "pip install") {
         emit_line(format!("[{e}]"));
@@ -262,7 +262,7 @@ fn spawn_server() -> Result<(), String> {
 
     let config = load_config()?;
     SAW_IMPORT_ERROR.store(false, Ordering::SeqCst);
-    let mut child = Command::new(&python)
+    let mut child = util::command(&python)
         .arg(&script)
         .current_dir(&working_dir)
         .env("VSD_DOWNLOAD_DIR", &config.download_dir)
@@ -411,7 +411,7 @@ pub async fn vsd_install_extension(browser: String) -> CmdResult<String> {
         // The built extension talks to the port this MULA starts the server on.
         let server_url = format!("http://127.0.0.1:{}", load_config()?.port);
         util::run_command(
-            Command::new(python_command(&vsd_dir.join("extension")))
+            util::command(python_command(&vsd_dir.join("extension")))
                 .arg(&build_script)
                 .arg(&browser)
                 .args(["--server-url", &server_url]),

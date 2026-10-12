@@ -60,8 +60,11 @@ pub fn stop() -> Result<(), String> {
     Ok(())
 }
 
-/// Makes the worker re-read its settings now (e.g. the interval changed).
+/// Makes the worker re-read its settings now (e.g. the interval changed). Takes the worker lock,
+/// which the worker holds from reading the settings until it waits, so the wake-up can't fall
+/// in between and be lost.
 pub fn wake() {
+    let _worker = lock(&WORKER);
     WAKE.notify_all();
 }
 
@@ -89,11 +92,12 @@ fn run_worker(generation: u64) {
 
     let started = Instant::now();
     loop {
-        let config = settings::load();
         let worker = lock(&WORKER);
         if worker.generation != generation {
             break;
         }
+        // Read while holding the worker lock (see `wake`). Settings are served from memory.
+        let config = settings::load();
         let wait = match &config {
             Err(e) => {
                 log::error!("Wallchanger failed to load settings: {}", e);

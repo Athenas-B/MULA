@@ -57,6 +57,11 @@ export function loadScripts(files, globals) {
  * Returns the context and every module's namespace, keyed by file name without `.js`.
  */
 export function loadModules(entry, globals) {
+  if (typeof vm.SourceTextModule?.prototype.linkRequests !== "function") {
+    throw new Error(
+      `The frontend tests need Node 22.21+ or 24.8+ run with --experimental-vm-modules (this is ${process.version}); use \`npm test\`.`
+    );
+  }
   globals.window ??= globals;
   globals.self ??= globals;
   const ctx = vm.createContext(globals);

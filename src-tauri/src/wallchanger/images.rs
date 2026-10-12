@@ -73,12 +73,19 @@ fn list_dir(dir: &Path) -> Vec<(PathBuf, fs::Metadata)> {
         .unwrap_or_default()
 }
 
+/// The image's dimensions; (0, 0) when the file isn't a decodable image (cached, so it isn't
+/// decoded again), or None when it can't be read right now (e.g. locked by another program),
+/// so it is retried on the next pass.
 fn read_image_dimensions(path: &str) -> Option<(i32, i32)> {
     match image::image_dimensions(path) {
         Ok((w, h)) => Some((w as i32, h as i32)),
-        Err(e) => {
-            log::warn!("Failed to read image dimensions for {}: {}", path, e);
+        Err(image::ImageError::IoError(e)) => {
+            log::warn!("Can't read {path} right now: {e}");
             None
+        }
+        Err(e) => {
+            log::warn!("Failed to read image dimensions for {path}: {e}");
+            Some((0, 0))
         }
     }
 }
@@ -163,13 +170,16 @@ fn add_image(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let (width, height) = known
+    let cached = known
         .get(&path_str)
         .filter(|e| e.length == length && e.modified_secs == modified_secs)
-        .map(|e| (e.width, e.height))
-        .unwrap_or_else(|| read_image_dimensions(&path_str).unwrap_or((0, 0)));
+        .map(|e| (e.width, e.height));
+    let Some((width, height)) = cached.or_else(|| read_image_dimensions(&path_str)) else {
+        return;
+    };
 
-    // Unreadable files are cached as 0x0 too, so they aren't decoded (and logged) on every pass.
+    // Files that aren't images are cached as 0x0 too, so they aren't decoded (and logged) on
+    // every pass.
     cache.push(ImageCacheEntry { path: path_str.clone(), length, modified_secs, width, height });
     if width > 0 && height > 0 {
         images.push(ImageInfo { path: path_str, width, height });
@@ -298,6 +308,25 @@ mod tests {
         assert!(load(&s, &mut cache).unwrap().is_empty());
         assert_eq!(cache.len(), 1);
         assert_eq!((cache[0].width, cache[0].height), (0, 0));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn files_that_cannot_be_opened_right_now_are_retried_later() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TempDir::new("images_locked");
+        let file = write_png(&dir.join("busy.png"), 12, 6);
+        let s = settings_with(vec![source(dir.path())]);
+        let mut cache = Vec::new();
+
+        // Another program holds the file open without sharing it.
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        assert!(load(&s, &mut cache).unwrap().is_empty());
+        assert!(cache.is_empty(), "an I/O failure must not be cached as 'not an image'");
+        drop(lock);
+
+        let images = load(&s, &mut cache).unwrap();
+        assert_eq!((images[0].width, images[0].height), (12, 6));
     }
 
     #[test]

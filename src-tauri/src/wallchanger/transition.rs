@@ -14,6 +14,9 @@ use image::{imageops::FilterType, RgbImage};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Workers for blending and encoding frames (each holds a few monitor-sized images).
+const FRAME_WORKERS: usize = 4;
+
 /// One monitor's wallpaper change.
 pub struct WallpaperChange<'a> {
     pub monitor: &'a Monitor,
@@ -117,7 +120,7 @@ fn run_fades(changes: &[WallpaperChange], settings: &Settings) -> Result<(), Str
 /// Renders frames 1..=`steps` of every fade into `dir`, all in parallel, and returns each
 /// fade's frame files in order (or why they couldn't be rendered).
 fn render_frames(images: &[FadeImages], steps: usize, dir: &Path) -> Vec<Result<Vec<PathBuf>, String>> {
-    let rendered = parallel_map(images.len() * steps, IMAGE_WORKERS, |job| {
+    let rendered = parallel_map(images.len() * steps, FRAME_WORKERS, |job| {
         let fade = &images[job / steps];
         let step = job % steps + 1;
         let path = dir.join(format!("{}_{step}.jpg", crate::util::safe_file_name(&fade.monitor_id, "")));
@@ -152,9 +155,10 @@ fn play(frames: &[(String, Vec<PathBuf>)], steps: usize, step: Duration) {
 /// Loads an image and renders it at the monitor's size using the configured Fill/Fit mode, so
 /// the transition frames line up with what Windows shows once the real image is applied.
 fn load_fitted(path: &str, monitor: &Monitor, settings: &Settings) -> Result<RgbImage, String> {
+    // into_rgba8 frees the decoded original instead of keeping it next to the RGBA copy.
     let img = image::open(path)
         .map_err(|e| format!("Failed to open image for transition ({path}): {e}"))?
-        .to_rgba8();
+        .into_rgba8();
 
     let (width, height) = (monitor.width.max(1) as u32, monitor.height.max(1) as u32);
     let background = super::preview::argb_to_rgba(settings.background_color_argb);

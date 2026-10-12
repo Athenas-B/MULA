@@ -638,9 +638,11 @@ def download():
 
     title = data.get("title", "")
     headers = data.get("headers")
+    page_url = data.get("pageUrl")
     raw_metadata = {
-        "pageUrl": data.get("pageUrl", ""),
         **(data.get("metadata") or {}),
+        # Only a real page URL becomes the file's comment (not e.g. the extension's 'unknown').
+        "pageUrl": page_url if isinstance(page_url, str) and _is_http_url(page_url) else "",
     }
 
     job_id = uuid.uuid4().hex[:8]

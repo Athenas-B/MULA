@@ -3,6 +3,9 @@
   "private": true,
   "version": "2.0.0",
   "type": "module",
+  "engines": {
+    "node": "^22.21.0 || >=24.8.0"
+  },
   "scripts": {
     "tauri": "tauri",
     "test": "node --experimental-vm-modules --disable-warning=ExperimentalWarning --test \"tests/js/**/*.test.js\""

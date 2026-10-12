@@ -9,7 +9,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{LazyLock, Mutex};
 
 // ── Finding / installing smartctl ───────────────────────────────────────────
@@ -30,7 +30,7 @@ fn find_smartctl() -> Option<PathBuf> {
 /// Finds `name` on PATH: the absolute path `where` reports (the elevated helper requires
 /// one), else the bare name if it can be run.
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    if let Ok(output) = Command::new("where").arg(name).output() {
+    if let Ok(output) = util::command("where").arg(name).output() {
         let out = String::from_utf8_lossy(&output.stdout);
         if let Some(first) = out.lines().map(str::trim).find(|l| !l.is_empty()) {
             let path = PathBuf::from(first);
@@ -39,7 +39,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
             }
         }
     }
-    Command::new(name).arg("--version").output().is_ok().then(|| PathBuf::from(name))
+    util::command(name).arg("--version").output().is_ok().then(|| PathBuf::from(name))
 }
 
 /// Finds smartctl. Never installs anything by itself; only successes are cached, so a
@@ -80,7 +80,7 @@ fn install_smartctl() -> Result<PathBuf, String> {
     let winget = find_on_path("winget")
         .ok_or("winget not found. Please install smartmontools manually from https://www.smartmontools.org/")?;
     util::run_command(
-        Command::new(&winget).args([
+        util::command(&winget).args([
             "install",
             "--id",
             "smartmontools.smartmontools",
@@ -184,7 +184,7 @@ fn parse_scan_json(text: &str) -> Vec<(u32, String, String)> {
 }
 
 fn run_smartctl(smartctl: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(smartctl)
+    let output = util::command(smartctl)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -31,7 +31,7 @@ use crate::error::CommandError;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -289,7 +289,7 @@ fn launch_stub(stub: &str, elevate: bool, wait: bool) -> Result<i32, CommandErro
     ]
     .join("\n");
 
-    let output = Command::new("powershell")
+    let output = crate::util::command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encode_ps(&launcher)])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -516,12 +516,13 @@ mod tests {
         // Warm up PowerShell's first command, then time a few round trips.
         send_command(&helper, &["--scan"], false, Duration::from_secs(30)).unwrap();
         let start = Instant::now();
-        for _ in 0..3 {
+        for _ in 0..5 {
             assert_eq!(send_command(&helper, &["-x"], false, Duration::from_secs(30)).unwrap().error, "command not allowed: smartctl -x");
         }
-        let per_command = start.elapsed() / 3;
-        // The old 250 ms + 100 ms polling averaged ~175 ms of pure waiting per command.
-        assert!(per_command < Duration::from_millis(150), "round trip took {per_command:?}");
+        let total = start.elapsed();
+        // ~16 ms each now; the old 250 ms helper polling took ~260 ms each (~1.3 s for five).
+        // The bound leaves lots of room for a busy machine while still catching polling.
+        assert!(total < Duration::from_millis(750), "five round trips took {total:?}");
         send_command(&helper, &[], true, Duration::from_secs(30)).unwrap();
         let _ = std::fs::remove_dir_all(&helper.cmd_dir);
     }

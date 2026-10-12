@@ -158,7 +158,7 @@ fn render_with_overlay(original_path: &str, settings: &Settings) -> Result<Strin
 
     let mut image: RgbaImage = image::open(original_path)
         .map_err(|e| format!("Failed to open image for overlay rendering: {e}"))?
-        .to_rgba8();
+        .into_rgba8();
 
     let text = overlay_text(original_path, settings.picture_name_overlay_text_mode);
     if !text.is_empty() {

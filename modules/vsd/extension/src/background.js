@@ -189,18 +189,24 @@ function loadPageMetadata() {
   return pageMetadataLoad;
 }
 
+/** Callback for session storage writes: a failure (e.g. quota) only costs persistence. */
+function reportSessionError() {
+  const err = chrome.runtime.lastError;
+  if (err) console.warn('Failed to keep page metadata in session storage:', err.message);
+}
+
 async function rememberPageMetadata(pageUrl, metadata) {
   const map = await loadPageMetadata();
   setBounded(map, pageUrl, metadata, MAX_PAGE_METADATA);
   try {
-    chrome.storage.session?.set({ [PAGE_METADATA_KEY]: [...map] });
+    chrome.storage.session?.set({ [PAGE_METADATA_KEY]: [...map] }, reportSessionError);
   } catch (e) {}
 }
 
 async function forgetPageMetadata() {
   (await loadPageMetadata()).clear();
   try {
-    chrome.storage.session?.remove(PAGE_METADATA_KEY);
+    chrome.storage.session?.remove(PAGE_METADATA_KEY, reportSessionError);
   } catch (e) {}
 }
 

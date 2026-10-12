@@ -45,7 +45,8 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   Tauri commands run on the UI thread). `service::apply` is serialized by `APPLY_LOCK`; tray
   actions spawn blocking tasks. The interval worker is a plain thread that sleeps on a `Condvar`
   (`WORKER` state: generation, active, `last_apply`); `stop`, every apply and settings changes
-  (`service::wake`) wake it, so a manual change restarts the interval. Mutexes are taken with the
+  (`service::wake`) wake it, so a manual change restarts the interval. The worker reads its
+  settings and waits under the `WORKER` lock, which `wake` also takes, so no wake-up is lost. Mutexes are taken with the
   poison-recovering `util::lock`.
 - **Events to the UI (`events.rs`).** Event names are constants there and `events::emit` sends
   them through the `AppHandle` stored at setup: `wc-service-changed`, `wc-wallpaper-changed`,
@@ -124,7 +125,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Manual Change / Apply | Done | In tab and tray menu. |
 | Change one monitor per interval | Done | Rotates target monitor index. |
 | Picture-name overlay | Done | Filename/path text, font size, color, offset, optional backdrop; cached rendered copies. |
-| Fade transition | Done | All monitors fade together: images load, overlays render and frames blend/encode in parallel (`util::parallel_map`, `IMAGE_WORKERS`), then frames play in lockstep. |
+| Fade transition | Done | All monitors fade together: images load, overlays render and frames blend/encode in parallel (`util::parallel_map`; full-size decodes use `IMAGE_WORKERS` = 2, frames 4), then frames play in lockstep. |
 | Rendered cache cleanup | Done | Prunes by total size and file count. |
 | Windows slideshow conflict handling | Done | Detects `DSS_ENABLED` and reapplies current wallpaper to break Windows slideshow before MULA takes over. |
 | Queue preview / state UI | Done | Read-only preview with next/last/last-resort markers. |
@@ -159,7 +160,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - `src-tauri/src/wallchanger/service.rs` — Background timer service.
 - `src-tauri/src/wallchanger/monitors/windows.rs` / `linux.rs` — Monitor + wallpaper COM API wrappers (selected via `#[path]`).
 - `src-tauri/src/elevated_helper.rs` — Admin-rights execution (see Architecture notes).
-- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`/`mula_path`, `blocking`/`logged_blocking`, `lock`, `parallel_map`, `run_command`, `JsonStore`, `read_json_or_default`/`write_json`/`write_atomic`, `safe_file_name`, `stable_hash` (FNV-1a for cache names).
+- `src-tauri/src/util.rs` — Shared helpers: `mula_config_dir`/`mula_path`, `blocking`/`logged_blocking`, `lock`, `parallel_map`, `command` (child processes without console windows; use it for every spawned program), `run_command`, `JsonStore`, `read_json_or_default`/`write_json`/`write_atomic`, `safe_file_name`, `stable_hash` (FNV-1a for cache names).
 - `src-tauri/src/events.rs` — Event names and `emit`.
 - `src-tauri/src/logger.rs` — Rotating app log.
 - `src-tauri/src/wallchanger/overlay.rs` — Picture-name overlay rendering.

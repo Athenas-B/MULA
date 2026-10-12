@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 
 mod elevated_helper;
 mod error;
@@ -416,7 +415,7 @@ fn list_physical_drives_impl() -> Result<Vec<DriveInfo>, String> {
     "#;
 
     let stdout = util::run_command(
-        Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]),
+        util::command("powershell").args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]),
         "the PowerShell drive query",
     )?;
     let drives: Vec<PsDiskDrive> = serde_json::from_str(stdout.trim())

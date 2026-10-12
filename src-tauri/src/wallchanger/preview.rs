@@ -104,8 +104,8 @@ fn render_wallpaper_preview(
     background_color_argb: i32,
 ) -> Result<(i32, i32, String, RgbaImage), String> {
     let image = image::open(wallpaper_path)
-        .map_err(|e| format!("Failed to open wallpaper for preview: {e}"))?;
-    let image = image.to_rgba8();
+        .map_err(|e| format!("Failed to open wallpaper for preview: {e}"))?
+        .into_rgba8();
     let image_width = image.width();
     let image_height = image.height();
 

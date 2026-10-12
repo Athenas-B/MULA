@@ -1405,7 +1405,7 @@ class DownloadEndpointTests(_ClientMixin, unittest.TestCase):
         self.assertEqual(
             kwargs["args"],
             (job_id, body["url"], "Hello", {"Referer": "https://a.com/"},
-             {"pageUrl": "https://a.com/watch", "channel": "Chan"}),
+             {"channel": "Chan", "pageUrl": "https://a.com/watch"}),
         )
         self.thread_cls.return_value.start.assert_called_once_with()
         self.assertEqual(server._jobs[job_id]["status"], "running")
@@ -1431,6 +1431,25 @@ class DownloadEndpointTests(_ClientMixin, unittest.TestCase):
     def test_non_object_json_body_is_400(self):
         r = self.client.post("/download", json=["https://a.com/x.m3u8"])
         self.assertEqual(r.status_code, 400)
+
+
+class DownloadPageUrlTests(_ClientMixin, unittest.TestCase):
+    def test_only_real_page_urls_become_the_comment(self):
+        cases = [
+            ("unknown", ""),
+            ("https://a.com/watch", "https://a.com/watch"),
+            ("javascript:alert(1)", ""),
+            (42, ""),
+        ]
+        for page_url, expected in cases:
+            with self.subTest(page_url=page_url):
+                self.thread_cls.reset_mock()
+                r = self.client.post("/download", json={
+                    "url": "https://cdn/x.m3u8", "pageUrl": page_url, "metadata": {"pageUrl": "https://spoofed/"},
+                }, headers={"Origin": EXT_ORIGIN})
+                self.assertEqual(r.status_code, 200)
+                raw_metadata = self.thread_cls.call_args.kwargs["args"][4]
+                self.assertEqual(raw_metadata["pageUrl"], expected)
 
 
 class ProgressEndpointTests(_ClientMixin, unittest.TestCase):
