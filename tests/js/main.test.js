@@ -1,11 +1,11 @@
-// Unit tests for src/main.js (the Tauri frontend). The file is a plain browser script, so it
-// is evaluated in a node:vm context with stubbed window.__TAURI__, document, localStorage, etc.
+// Unit tests for the Tauri frontend (src/main.js and the ES modules in src/ui/). They are
+// evaluated in a node:vm context with stubbed window.__TAURI__, document, localStorage, etc.
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   MAIN_JS,
-  loadScripts,
+  loadModules,
   plain,
   flush,
   createFakeDocument,
@@ -67,10 +67,15 @@ function loadMain({ storedTheme, throwStorage = false, prefersDark = false, invo
     prompt: (msg) => state.prompt(msg),
   };
 
-  const loaded = loadScripts([MAIN_JS], globals);
+  const { ctx, modules } = loadModules(MAIN_JS, globals);
   return {
-    ...loaded,
-    fn: loaded.ctx,
+    ctx,
+    modules,
+    // Every module's exports in one object (export names are unique across modules).
+    fn: Object.assign({}, ...Object.values(modules)),
+    vsd: modules.vsd.state,
+    drives: modules.drives.state,
+    wc: modules.wallchanger.state,
     document,
     timers,
     console,
@@ -434,7 +439,7 @@ describe("appendLog", () => {
     const m = loadMain();
     const content = m.document.add("vsd-log-content");
     m.document.add("vsd-log", { scrollHeight: 0 });
-    const max = m.run("MAX_LOG_CHUNKS");
+    const max = m.fn.MAX_LOG_CHUNKS;
     for (let i = 0; i < max + 3; i++) m.fn.appendLog(`line ${i}\n`);
     assert.equal(content.childElementCount, max);
     assert.ok(content.innerHTML.startsWith('<span class="vsd-log-chunk">line 3\n</span>'), content.innerHTML.slice(0, 80));
@@ -524,7 +529,7 @@ describe("VSD server panel", () => {
     await m.fn.toggleVsd();
     await flush();
     assert.equal(m.calls("vsd_is_running").length, 1);
-    assert.equal(m.run("vsdRunning"), false);
+    assert.equal(m.vsd.running, false);
     assert.equal(btn.disabled, false);
   });
 });
@@ -537,11 +542,11 @@ describe("updateVsdUi / wcUpdateToggleUi / wcShowMessage", () => {
     assert.equal(btn.className, "running");
     assert.equal(btn.querySelector(".toggle-label").textContent, "Stop");
     assert.equal(btn.title, "Stop VSD Server");
-    assert.equal(m.run("vsdRunning"), true);
+    assert.equal(m.vsd.running, true);
     m.fn.updateVsdUi(false);
     assert.equal(btn.className, "stopped");
     assert.equal(btn.querySelector(".toggle-label").textContent, "Start");
-    assert.equal(m.run("vsdRunning"), false);
+    assert.equal(m.vsd.running, false);
   });
 
   it("wcUpdateToggleUi reflects the service state", () => {
@@ -563,13 +568,13 @@ describe("updateVsdUi / wcUpdateToggleUi / wcShowMessage", () => {
     m.fn.wcRefreshPreviews();
     await flush();
     assert.equal(m.invokeCalls.length, 0);
-    assert.equal(m.run("wcPreviewsStale"), true);
+    assert.equal(m.wc.previewsStale, true);
 
     m.document.hidden = false;
     m.fn.wcRefreshPreviews();
     await flush();
     assert.deepEqual(m.invokeCalls.map((c) => c.cmd).sort(), ["wc_get_monitor_preview", "wc_get_queue_preview"]);
-    assert.equal(m.run("wcPreviewsStale"), false);
+    assert.equal(m.wc.previewsStale, false);
   });
 
   it("wcRenderSettings fills every form field from the settings", () => {
@@ -580,7 +585,7 @@ describe("updateVsdUi / wcUpdateToggleUi / wcShowMessage", () => {
     const apiKey = m.document.add("wc-wallhaven-api-key");
     m.document.add("wc-scaling");
     m.document.add("wc-overlay-enabled");
-    m.assign("wcSettings", {
+    (m.wc.settings = {
       interval_minutes: 15,
       background_color_argb: 0xff102030 | 0,
       use_separate_monitor_queues: true,
@@ -653,7 +658,7 @@ describe("settings patches", () => {
   it("does nothing while settings are not loaded", () => {
     const m = loadMain();
     m.fn.wcQueuePatch({ interval_minutes: 5 });
-    assert.equal(m.run("wcSettings"), null);
+    assert.equal(m.wc.settings, null);
     assert.equal(m.timers.pending().length, 0);
   });
 
@@ -667,14 +672,14 @@ describe("settings patches", () => {
     m.fn.wcQueuePatch({ interval_minutes: 99999 });
     m.fn.wcQueuePatch({ maximum_source_level: 3 });
     assert.deepEqual(m.timers.pending().map((t) => t.ms), [300]);
-    assert.equal(m.run("wcSettings").interval_minutes, 99999, "edits show immediately");
+    assert.equal(m.wc.settings.interval_minutes, 99999, "edits show immediately");
 
     m.timers.runAll();
     await flush();
     const updates = m.calls("wc_update_settings");
     assert.equal(updates.length, 1);
     assert.deepEqual(plain(updates[0].args.patch), { interval_minutes: 99999, maximum_source_level: 3 });
-    assert.equal(m.run("wcSettings").interval_minutes, 1440, "the backend's normalized value wins");
+    assert.equal(m.wc.settings.interval_minutes, 1440, "the backend's normalized value wins");
     assert.equal(m.document.getElementById("wc-interval").value, 1440, "and is rendered");
   });
 
@@ -685,7 +690,7 @@ describe("settings patches", () => {
     m.fn.wcQueuePatch({ interval_minutes: 45 });
     // e.g. the tray changed the max level while the interval edit is still pending
     m.fn.wcApplySettings(versioned(1, { source_folders: [], interval_minutes: 30, maximum_source_level: 2 }));
-    const s = plain(m.run("wcSettings"));
+    const s = plain(m.wc.settings);
     assert.equal(s.interval_minutes, 45);
     assert.equal(s.maximum_source_level, 2);
   });
@@ -709,8 +714,8 @@ describe("settings patches", () => {
     setupInputs(m);
     m.fn.wcApplySettings(versioned(5, { source_folders: [], interval_minutes: 30, maximum_source_level: 3 }));
     m.fn.wcApplySettings(versioned(4, { source_folders: [], interval_minutes: 30, maximum_source_level: 10 }));
-    assert.equal(m.run("wcSettings").maximum_source_level, 3);
-    assert.equal(m.run("wcRevision"), 5);
+    assert.equal(m.wc.settings.maximum_source_level, 3);
+    assert.equal(m.wc.revision, 5);
   });
 
   it("flushes pending edits before changing the wallpaper", async () => {
@@ -749,10 +754,10 @@ describe("wcRenderSources", () => {
     const remove = m.document.add("wc-remove-source");
     const up = m.document.add("wc-move-up");
     const down = m.document.add("wc-move-down");
-    m.assign("wcSettings", { source_folders: sources });
-    m.assign("wcSelectedSourceIndex", selected);
+    (m.wc.settings = { source_folders: sources });
+    (m.wc.selectedSourceIndex = selected);
     m.fn.wcRenderSources();
-    return { m, container, remove, up, down, settings: () => plain(m.run("wcSettings")) };
+    return { m, container, remove, up, down, settings: () => plain(m.wc.settings) };
   }
 
   const folder = { path: 'C:\\Pics "x" <y> & z', enabled: true, level: 5, kind: "folder", include_subfolders: true };
@@ -813,9 +818,9 @@ describe("wcRenderSources", () => {
   it("selects a row on click, but not when an input was clicked", () => {
     const { m, container } = setup([folder, url]);
     container.children[1].dispatch("click", { target: { tagName: "INPUT" } });
-    assert.equal(m.run("wcSelectedSourceIndex"), -1);
+    assert.equal(m.wc.selectedSourceIndex, -1);
     container.children[1].dispatch("click", { target: { tagName: "DIV" } });
-    assert.equal(m.run("wcSelectedSourceIndex"), 1);
+    assert.equal(m.wc.selectedSourceIndex, 1);
     assert.ok(container.children[1].classList.contains("selected"));
   });
 
@@ -844,7 +849,7 @@ describe("wcRenderSources", () => {
     checkbox.checked = true;
     checkbox.dispatch("change");
     assert.equal(m.timers.pending().length, 1);
-    assert.equal(plain(m.run("wcSettings")).source_folders[0].enabled, true);
+    assert.equal(plain(m.wc.settings).source_folders[0].enabled, true);
   });
 
   it("sends numeric edits as entered and ignores non-numbers (the backend clamps)", () => {
@@ -884,12 +889,12 @@ describe("wcRemoveSource / wcMoveSource", () => {
   function setup(paths, selected) {
     const m = loadMain();
     for (const id of ["wc-sources", "wc-remove-source", "wc-move-up", "wc-move-down"]) m.document.add(id);
-    m.assign("wcSettings", { source_folders: paths.map((path) => ({ path, enabled: true, level: 5, kind: "folder", include_subfolders: true })) });
-    m.assign("wcSelectedSourceIndex", selected);
+    (m.wc.settings = { source_folders: paths.map((path) => ({ path, enabled: true, level: 5, kind: "folder", include_subfolders: true })) });
+    (m.wc.selectedSourceIndex = selected);
     return {
       m,
-      paths: () => plain(m.run("wcSettings")).source_folders.map((s) => s.path),
-      selected: () => m.run("wcSelectedSourceIndex"),
+      paths: () => plain(m.wc.settings).source_folders.map((s) => s.path),
+      selected: () => m.wc.selectedSourceIndex,
     };
   }
 
@@ -930,7 +935,7 @@ describe("wcRemoveSource / wcMoveSource", () => {
     const t = setup(["a", "b"], 0);
     t.m.fn.wcMoveSource(-1);
     assert.deepEqual(t.paths(), ["a", "b"]);
-    t.m.assign("wcSelectedSourceIndex", 1);
+    (t.m.wc.selectedSourceIndex = 1);
     t.m.fn.wcMoveSource(1);
     assert.deepEqual(t.paths(), ["a", "b"]);
   });
@@ -940,14 +945,14 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
   function setup(opts) {
     const m = loadMain(opts);
     for (const id of ["wc-sources", "wc-remove-source", "wc-move-up", "wc-move-down", "wc-message"]) m.document.add(id);
-    m.assign("wcSettings", { source_folders: [] });
+    (m.wc.settings = { source_folders: [] });
     return m;
   }
 
   it("rejects non-Wallhaven URLs with an error message", async () => {
     const m = setup({ prompt: () => "https://example.com/x" });
     await m.fn.wcAddWallhavenUrl();
-    assert.deepEqual(plain(m.run("wcSettings")).source_folders, []);
+    assert.deepEqual(plain(m.wc.settings).source_folders, []);
     const msg = m.document.getElementById("wc-message");
     assert.equal(msg.textContent, "Please enter a valid Wallhaven URL.");
     assert.equal(msg.className, "wallchanger-message error");
@@ -956,14 +961,14 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
   it("ignores a cancelled prompt", async () => {
     const m = setup({ prompt: () => null });
     await m.fn.wcAddWallhavenUrl();
-    assert.deepEqual(plain(m.run("wcSettings")).source_folders, []);
+    assert.deepEqual(plain(m.wc.settings).source_folders, []);
     assert.equal(m.document.getElementById("wc-message").textContent, "");
   });
 
   it("adds a trimmed Wallhaven URL source with URL defaults", async () => {
     const m = setup({ prompt: () => "  https://wallhaven.cc/search?q=cats  " });
     await m.fn.wcAddWallhavenUrl();
-    assert.deepEqual(plain(m.run("wcSettings")).source_folders, [
+    assert.deepEqual(plain(m.wc.settings).source_folders, [
       {
         path: "https://wallhaven.cc/search?q=cats",
         enabled: true,
@@ -978,7 +983,7 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
   it("adds a picked folder with subfolders enabled", async () => {
     const m = setup({ dialog: () => "D:\\Wallpapers" });
     await m.fn.wcAddFolder();
-    const [s] = plain(m.run("wcSettings")).source_folders;
+    const [s] = plain(m.wc.settings).source_folders;
     assert.equal(s.path, "D:\\Wallpapers");
     assert.equal(s.kind, "folder");
     assert.equal(s.include_subfolders, true);
@@ -988,7 +993,7 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
   it("does nothing when the folder dialog is cancelled", async () => {
     const m = setup({ dialog: () => null });
     await m.fn.wcAddFolder();
-    assert.deepEqual(plain(m.run("wcSettings")).source_folders, []);
+    assert.deepEqual(plain(m.wc.settings).source_folders, []);
   });
 });
 
@@ -1039,7 +1044,7 @@ describe("Drive Test", () => {
     }
     el.tbody = m.document.setQuery("#drive-info-table tbody", new FakeElement());
     el["drive-select"].value = selectedId;
-    m.assign("cachedDrives", drives);
+    (m.drives.drives = drives);
     return { m, el };
   }
 
@@ -1115,7 +1120,7 @@ describe("Drive Test", () => {
     assert.equal(el["drive-format-status"].textContent, "Error: diskpart failed");
     assert.equal(el["drive-format-status"].className, "drive-format-status error");
     assert.equal(el["drive-format-btn"].disabled, false);
-    assert.equal(m.run("formatTimer"), null);
+    assert.equal(m.drives.formatTimer, null);
   });
 
   it("offers the admin retry only when smartctl needs elevation", async () => {
@@ -1172,7 +1177,7 @@ describe("Drive Test", () => {
     assert.equal(el["smart-test-status"].className, "smart-test-status");
     await m.fn.pollTestStatus("PD1");
     assert.equal(el["smart-test-status"].className, "smart-test-status success");
-    assert.equal(m.run("testPollNoProgressCount"), 0);
+    assert.equal(m.drives.testPollNoProgressCount, 0);
   });
 
   it("pollTestStatus reports failed tests as errors", async () => {

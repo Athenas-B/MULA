@@ -161,7 +161,12 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - `src-tauri/src/wallchanger/overlay.rs` — Picture-name overlay rendering.
 - `src-tauri/src/wallchanger/transition.rs` — Fade transition frame generation.
 - `src-tauri/src/wallchanger/preview.rs` — Monitor-fit preview rendering; `fit_to_canvas` is shared with the fade transition.
-- `src/index.html` / `src/main.js` / `src/styles.css` — Frontend.
+- `src/index.html` / `src/styles.css` — Frontend markup and styles (served as-is, no bundler).
+- `src/main.js` — Frontend entry ES module: console forwarding to the app log, starts each tab.
+- `src/ui/*.js` — One ES module per area: `tauri.js` (the `window.__TAURI__` APIs), `dom.js`
+  (shared helpers: `errorText`, `escapeHtml`, `setRunningUi`, `setCollapsed`), `theme.js`,
+  `system.js` (tabs, System tab), `vsd.js`, `drives.js`, `wallchanger.js`. Each tab module owns
+  its event listeners and keeps its mutable state in an exported `state` object.
 
 ## Settings / Cache Paths
 
@@ -207,7 +212,7 @@ Debug bundle outputs:
 | Suite | Location | Notes |
 |---|---|---|
 | Rust | `#[cfg(test)]` modules in `src-tauri/src/**` | Shared helpers in `src-tauri/src/test_support.rs` (`TempDir`, `write_png`). Document a known bug as `#[ignore = "bug: ..."]`. |
-| JavaScript | `tests/js/*.test.js` | Loads the unmodified browser scripts in `node:vm` with stubs (`tests/js/helpers/vm-loader.js`). Document a known bug as `{ todo }`. |
+| JavaScript | `tests/js/*.test.js` | Loads the unmodified browser code in `node:vm` with stubs (`tests/js/helpers/vm-loader.js`): the extension's classic scripts with `loadScripts`, the app's ES modules with `loadModules` (fresh module instances per test; needs `--experimental-vm-modules`, set in `npm test`). Tests reach module state through the exported `state` objects (`m.wc`, `m.vsd`, `m.drives`). Document a known bug as `{ todo }`. |
 | Python | `modules/vsd/tests/` | Points `VSD_DOWNLOAD_DIR`/`VSD_LOG_DIR` at temp dirs before importing `server`. Document a known bug as `@unittest.expectedFailure`. |
 
 Unit tests never call the real wallpaper COM API, the network, ffmpeg or UAC. Two Rust tests touch

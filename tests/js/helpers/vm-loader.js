@@ -1,9 +1,10 @@
-// Shared helpers for loading the plain browser scripts (not ES modules) of MULA into a
-// node:vm context with minimal stubs, so their top-level functions can be unit-tested
-// without modifying the production sources or pulling in a fake-DOM library.
+// Shared helpers for loading MULA's browser code into a node:vm context with minimal stubs, so
+// it can be unit-tested without modifying the production sources or pulling in a fake-DOM
+// library: the extension's plain scripts (loadScripts) and the app's ES modules (loadModules,
+// which needs `node --experimental-vm-modules`; see package.json).
 
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import vm from "node:vm";
 
@@ -46,6 +47,34 @@ export function loadScripts(files, globals) {
       delete ctx.__testValue;
     },
   };
+}
+
+/**
+ * Create a vm context from `globals` (which also serves as `window`/`self`) and evaluate the ES
+ * module `entry` with everything it imports, each test getting its own module instances.
+ * Returns the context and every module's namespace, keyed by file name without `.js`.
+ */
+export function loadModules(entry, globals) {
+  globals.window ??= globals;
+  globals.self ??= globals;
+  const ctx = vm.createContext(globals);
+  const modules = new Map();
+  const load = (file) => {
+    let mod = modules.get(file);
+    if (mod) return mod;
+    mod = new vm.SourceTextModule(readFileSync(file, "utf8"), { context: ctx, identifier: pathToFileURL(file).href });
+    modules.set(file, mod);
+    mod.linkRequests(mod.moduleRequests.map(({ specifier }) => load(path.resolve(path.dirname(file), specifier))));
+    return mod;
+  };
+  const root = load(entry);
+  root.instantiate();
+  // Without top-level await, evaluation runs synchronously; the promise only reports errors.
+  root.evaluate().catch(() => {});
+  if (root.status === "errored") throw root.error;
+  const namespaces = {};
+  for (const [file, mod] of modules) namespaces[path.basename(file, ".js")] = mod.namespace;
+  return { ctx, modules: namespaces };
 }
 
 // ── Timers ──────────────────────────────────────────────────────────────────
