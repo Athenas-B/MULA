@@ -35,10 +35,7 @@ function loadMain({ storedTheme, throwStorage = false, prefersDark = false, invo
     console,
     document,
     localStorage,
-    setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout,
-    setInterval: timers.setInterval,
-    clearInterval: timers.clearInterval,
+    ...timers.globals,
     __TAURI__: {
       core: {
         invoke(cmd, args) {

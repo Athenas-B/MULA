@@ -14,6 +14,7 @@ import {
   createFakeConsole,
   createFakeDocument,
   createFakeTimers,
+  createFakeFetch,
   createFakeMutationObserver,
 } from "./helpers/vm-loader.js";
 
@@ -47,7 +48,7 @@ function loadErrorlog({ storage = {} } = {}) {
   const listeners = {};
   const globals = { chrome, console, addEventListener: (type, fn) => (listeners[type] ||= []).push(fn) };
   const loaded = loadScripts([ERRORLOG_JS], globals);
-  return { ...loaded, fn: loaded.ctx, chrome, console, listeners, log: () => chrome.store.errorLog || [] };
+  return { ...loaded, chrome, console, listeners, log: () => chrome.store.errorLog || [] };
 }
 
 describe("errorlog.js", () => {
@@ -131,20 +132,10 @@ describe("errorlog.js", () => {
 function loadConfig({ storage = {}, fetch } = {}) {
   const chrome = createFakeChrome({ storage });
   const timers = createFakeTimers();
-  const fetchCalls = [];
-  const state = { fetch: fetch || (async () => response({ ok: true })) };
-  const globals = {
-    chrome,
-    AbortController,
-    setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout,
-    fetch: (url, opts) => {
-      fetchCalls.push({ url, opts });
-      return state.fetch(url, opts);
-    },
-  };
+  const fake = createFakeFetch(fetch || (async () => response({ ok: true })));
+  const globals = { chrome, AbortController, ...timers.globals, fetch: fake.fetch };
   const loaded = loadScripts([CONFIG_JS], globals);
-  return { ...loaded, fn: loaded.ctx, chrome, timers, state, fetchCalls };
+  return { ...loaded, chrome, timers, fetchCalls: fake.calls };
 }
 
 describe("config.js", () => {
@@ -224,21 +215,8 @@ function loadBackground({ storage = {}, session = {}, tabs = [], fetch, asyncSto
   const chrome = createFakeChrome({ storage, session, tabs, asyncStorage });
   const console = createFakeConsole();
   const timers = createFakeTimers();
-  const fetchCalls = [];
-  const state = { fetch: fetch || (async () => response(MEDIA_PLAYLIST)) };
-  const globals = {
-    chrome,
-    console,
-    URL,
-    AbortController,
-    setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout,
-    fetch: (url, opts) => {
-      fetchCalls.push({ url, opts });
-      return state.fetch(url, opts);
-    },
-    addEventListener: () => {},
-  };
+  const fake = createFakeFetch(fetch || (async () => response(MEDIA_PLAYLIST)));
+  const globals = { chrome, console, URL, AbortController, ...timers.globals, fetch: fake.fetch, addEventListener: () => {} };
   const loaded = loadScripts([ERRORLOG_JS, CONFIG_JS, BACKGROUND_JS], globals);
   const send = (message, sender = {}) =>
     new Promise((resolve) => {
@@ -247,12 +225,10 @@ function loadBackground({ storage = {}, session = {}, tabs = [], fetch, asyncSto
     });
   return {
     ...loaded,
-    fn: loaded.ctx,
     chrome,
     console,
     timers,
-    state,
-    fetchCalls,
+    fetchCalls: fake.calls,
     send,
     streams: () => chrome.store.streams || [],
     onBeforeRequest: (details) => chrome.webRequest.onBeforeRequest.listeners[0](details),
@@ -1063,15 +1039,11 @@ function loadContent({ title = "Page", href = "https://site.example.com/watch/1"
     document,
     location,
     MutationObserver: mo.MutationObserver,
-    setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout,
-    setInterval: timers.setInterval,
-    clearInterval: timers.clearInterval,
+    ...timers.globals,
   };
   const loaded = loadScripts([CONTENT_JS], globals);
   return {
     ...loaded,
-    fn: loaded.ctx,
     chrome,
     console,
     timers,
@@ -1292,7 +1264,7 @@ function loadPopup({ storage = {}, search = "", onSend, chrome: sharedChrome, fe
   for (const id of ["streams", "status", "clear", "clearSaved", "copyLogs", "clearLogs", "popout", "protectActive", "detectionEnabled"]) {
     el[id] = document.add(id);
   }
-  const fetchCalls = [];
+  const fake = createFakeFetch(fetch || (async () => response({})));
   const clipboard = [];
   const globals = {
     chrome,
@@ -1303,20 +1275,14 @@ function loadPopup({ storage = {}, search = "", onSend, chrome: sharedChrome, fe
     location: { search },
     screen: { availLeft: 0, availWidth: 1920, availTop: 0 },
     navigator: { clipboard: { writeText: async (text) => clipboard.push(text) } },
-    fetch: (url, opts) => {
-      fetchCalls.push({ url, opts });
-      return (fetch || (async () => response({})))(url, opts);
-    },
+    fetch: fake.fetch,
     addEventListener: () => {},
-    setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout,
-    setInterval: timers.setInterval,
-    clearInterval: timers.clearInterval,
+    ...timers.globals,
   };
   const loaded = loadScripts([ERRORLOG_JS, CONFIG_JS, POPUP_JS], globals);
   const items = () => el.streams.children;
   const buttons = (li) => li.children.at(-1).children;
-  return { ...loaded, fn: loaded.ctx, chrome, console, timers, document, el, fetchCalls, clipboard, items, buttons };
+  return { ...loaded, chrome, console, timers, document, el, fetchCalls: fake.calls, clipboard, items, buttons };
 }
 
 describe("popup.js helpers", () => {
@@ -1640,8 +1606,7 @@ describe("popup.js + background.js", () => {
       console: createFakeConsole(),
       URL,
       AbortController,
-      setTimeout: timers.setTimeout,
-      clearTimeout: timers.clearTimeout,
+      ...timers.globals,
       fetch: async () => response({}),
       addEventListener: () => {},
     });
@@ -1670,8 +1635,7 @@ function loadOptions({ storage = {} } = {}) {
     chrome,
     document,
     console: createFakeConsole(),
-    setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout,
+    ...timers.globals,
   });
   return { chrome, timers, el };
 }

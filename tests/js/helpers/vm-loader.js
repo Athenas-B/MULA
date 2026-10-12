@@ -38,6 +38,8 @@ export function loadScripts(files, globals) {
   }
   return {
     ctx,
+    /** The scripts' top-level functions (an alias of the context, for readability). */
+    fn: ctx,
     /** Evaluate an expression in the context (useful for top-level const/let bindings). */
     run: (code) => vm.runInContext(code, ctx),
     /** Assign a top-level `let` binding (or any lvalue) from the test realm. */
@@ -112,7 +114,26 @@ export function createFakeTimers() {
       }
     },
   };
+  /** The timer functions, to spread into a script's globals. */
+  api.globals = {
+    setTimeout: api.setTimeout,
+    clearTimeout: api.clearTimeout,
+    setInterval: api.setInterval,
+    clearInterval: api.clearInterval,
+  };
   return api;
+}
+
+/** A fetch stub that records every call in `calls` and answers with `impl(url, opts)`. */
+export function createFakeFetch(impl) {
+  const calls = [];
+  return {
+    calls,
+    fetch: (url, opts) => {
+      calls.push({ url, opts });
+      return impl(url, opts);
+    },
+  };
 }
 
 export function createFakeConsole() {
