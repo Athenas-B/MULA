@@ -130,7 +130,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Manual Change / Apply | Done | In tab and tray menu. |
 | Change one monitor per interval | Done | Rotates target monitor index. |
 | Picture-name overlay | Done | Filename/path text, font size, color, offset, optional backdrop; cached rendered copies. |
-| Fade transition | Done | All monitors fade together: images load, overlays render and frames blend/encode in parallel (`util::parallel_map`; full-size decodes use `IMAGE_WORKERS` = 2, frames one worker per core up to 8), then frames play in lockstep. |
+| Fade transition | Done | All monitors fade together: images load, overlays render and frames blend/encode in parallel (`util::parallel_map`; full-size decodes use `IMAGE_WORKERS` = 2, frames one worker per core up to 8), then frames play in lockstep. Each monitor's last frame is kept (`rendered/fade_base/<monitor>.jpg`, recorded in memory by `preview::RenderKey`: file, monitor size, fit) and is the start image of its next fade while it still shows the current wallpaper (~11 ms instead of ~260 ms for a 24 MP photo on a 4K monitor); any mismatch renders from the file. |
 | Rendered cache cleanup | Done | Prunes by total size and file count. |
 | Windows slideshow conflict handling | Done | Detects `DSS_ENABLED` and reapplies current wallpaper to break Windows slideshow before MULA takes over. |
 | Queue preview / state UI | Done | Read-only preview with next/last/last-resort markers. |
@@ -185,7 +185,8 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - Service on/off: `%APPDATA%\mula\wallchanger\service.json`
 - App log: `%APPDATA%\mula\logs\mula.log` (+ `mula.log.1`)
 - Rendered overlay cache: `%APPDATA%\mula\wallchanger\rendered`
-- Fade transition frames: `%APPDATA%\mula\wallchanger\rendered\transitions`
+- Fade transition frames: `%APPDATA%\mula\wallchanger\rendered\transitions` (deleted after each change)
+- Kept last fade frame per monitor: `%APPDATA%\mula\wallchanger\rendered\fade_base`
 - Wallhaven download cache: `%APPDATA%\mula\wallchanger\wallhaven\fnv<hash>\` (+ `manifest.json`)
 - Elevated helper / one-shot script dirs: `%TEMP%\mula_smartd_*`, `%TEMP%\mula_elevated_*`
 - VSD config: `%APPDATA%\mula\vsd.json`; pip fingerprint: `%APPDATA%\mula\vsd-requirements.sha256`

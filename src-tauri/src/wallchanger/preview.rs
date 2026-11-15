@@ -25,10 +25,12 @@ pub struct MonitorPreview {
     pub preview_data_url: String,
 }
 
-/// Everything a rendered preview depends on: the same key means the same thumbnail.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct PreviewKey {
+/// Everything a wallpaper rendered for a monitor depends on: the same key means the same
+/// picture, whether it is a preview thumbnail or a kept fade frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub(super) struct RenderKey {
     path: String,
+    /// The file's size and modification time; None when it doesn't exist.
     file: Option<(u64, SystemTime)>,
     width: i32,
     height: i32,
@@ -36,8 +38,22 @@ struct PreviewKey {
     background_color_argb: i32,
 }
 
+impl RenderKey {
+    pub(super) fn new(wallpaper_path: &str, monitor: &super::monitors::Monitor, settings: &Settings) -> Self {
+        let file = std::fs::metadata(wallpaper_path).ok().filter(|m| m.is_file()).and_then(|m| Some((m.len(), m.modified().ok()?)));
+        Self {
+            path: wallpaper_path.to_string(),
+            file,
+            width: monitor.width,
+            height: monitor.height,
+            fill: matches!(settings.scaling_mode, ScalingMode::Fill),
+            background_color_argb: settings.background_color_argb,
+        }
+    }
+}
+
 /// The previews of the last build, so unchanged monitors aren't decoded and re-encoded again.
-static PREVIEW_CACHE: Mutex<Option<HashMap<PreviewKey, MonitorPreview>>> = Mutex::new(None);
+static PREVIEW_CACHE: Mutex<Option<HashMap<RenderKey, MonitorPreview>>> = Mutex::new(None);
 
 pub fn build_monitor_previews(settings: &Settings) -> Result<Vec<MonitorPreview>, String> {
     let monitors = get_monitors()?;
@@ -49,16 +65,7 @@ pub fn build_monitor_previews(settings: &Settings) -> Result<Vec<MonitorPreview>
     let mut current = HashMap::new();
     let mut previews = Vec::new();
     for (index, monitor) in monitors.iter().enumerate() {
-        let wallpaper_path = get_current_wallpaper(&monitor.id).unwrap_or_default();
-        let file = std::fs::metadata(&wallpaper_path).ok().filter(|m| m.is_file()).and_then(|m| Some((m.len(), m.modified().ok()?)));
-        let key = PreviewKey {
-            path: wallpaper_path,
-            file,
-            width: monitor.width,
-            height: monitor.height,
-            fill: matches!(settings.scaling_mode, ScalingMode::Fill),
-            background_color_argb: settings.background_color_argb,
-        };
+        let key = RenderKey::new(&get_current_wallpaper(&monitor.id).unwrap_or_default(), monitor, settings);
         let preview = match previous.remove(&key) {
             Some(cached) => cached,
             None => render_monitor_preview(&key, &monitor.id, settings)?,
@@ -71,7 +78,7 @@ pub fn build_monitor_previews(settings: &Settings) -> Result<Vec<MonitorPreview>
     Ok(previews)
 }
 
-fn render_monitor_preview(key: &PreviewKey, monitor_id: &str, settings: &Settings) -> Result<MonitorPreview, String> {
+fn render_monitor_preview(key: &RenderKey, monitor_id: &str, settings: &Settings) -> Result<MonitorPreview, String> {
     let placeholder =
         |fit: &str| (0, 0, fit.to_string(), render_placeholder(key.width, key.height, settings.background_color_argb));
     let (image_width, image_height, fit, preview) = if key.file.is_none() {
