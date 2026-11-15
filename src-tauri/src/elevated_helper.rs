@@ -101,6 +101,15 @@ function Write-Response([string]$id, $res) {
 
 if (-not (Test-DirIsSafe)) { exit 3 }
 
+# The process that started this helper. Holding the object (not just its id) means a later
+# process that gets the same id is never mistaken for it.
+$parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+if (-not $parent) { exit 0 }
+try {
+    $parent.EnableRaisingEvents = $true
+    $null = Register-ObjectEvent -InputObject $parent -EventName Exited -SourceIdentifier 'MulaParentExited'
+} catch {}
+
 # New command files wake the loop through a watcher. Its events are only a wake-up signal: the
 # loop always lists and validates the folder itself, so a missed or spurious event costs at most
 # a rescan. Events raised while commands run stay queued, so none is lost between scans.
@@ -113,7 +122,7 @@ $watcher.EnableRaisingEvents = $true
 [IO.File]::WriteAllText((Join-Path $Dir 'ready'), '', $utf8)
 
 while ($true) {
-    if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+    if ($parent.HasExited) { break }
     $files = Get-ChildItem -LiteralPath $Dir -Filter 'cmd_*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime
     foreach ($f in $files) {
         $id = $f.BaseName.Substring(4)
@@ -147,8 +156,9 @@ while ($true) {
         Write-Response $id $res
         if ($exitAfter) { exit 0 }
     }
-    # Sleep until a command file appears, or 2 s pass so the helper notices MULA exiting.
-    $null = Wait-Event -Timeout 2
+    # Sleep until a command file appears or the parent exits. The timeout is only a safety net
+    # in case the exit event could not be registered.
+    $null = Wait-Event -Timeout 30
     Get-Event | Remove-Event
 }
 "#;
@@ -329,6 +339,11 @@ fn check_exe_is_protected(exe: &Path) -> Result<(), String> {
 }
 
 fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, CommandError> {
+    start_helper_for(exe, elevate, std::process::id())
+}
+
+/// Starts a helper that lives as long as the process `parent_pid`.
+fn start_helper_for(exe: &Path, elevate: bool, parent_pid: u32) -> Result<ElevatedHelper, CommandError> {
     check_exe_is_protected(exe)?;
 
     let cmd_dir = new_private_dir("mula_smartd")?;
@@ -339,7 +354,7 @@ fn start_helper(exe: &Path, elevate: bool) -> Result<ElevatedHelper, CommandErro
             ("Dir", &cmd_dir.to_string_lossy()),
             ("Exe", &exe.to_string_lossy()),
             ("Token", &token),
-            ("ParentPid", &std::process::id().to_string()),
+            ("ParentPid", &parent_pid.to_string()),
         ],
     );
     let stub = write_script_with_stub(&cmd_dir, &script)?;
@@ -562,10 +577,26 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_script_reports_message_and_exit_code() {
-        let ok = run_script("[IO.File]::WriteAllText($ResultPath, 'it''s done'); exit 0", &[], false);
-        assert_eq!(ok.unwrap(), "it's done");
+    fn helper_exits_when_its_parent_does() {
+        let exe = where_exe();
+        // A stand-in parent that lives for about two seconds.
+        let mut parent = crate::util::command("ping").args(["-n", "3", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
+        let helper = start_helper_for(&exe, false, parent.id()).expect("helper should start");
+        assert!(send_command(&helper, &["--scan"], false, Duration::from_secs(30)).unwrap().ok);
 
+        parent.wait().unwrap();
+        // The exit event ends the helper at once, so nobody answers any more.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            send_command(&helper, &["--scan"], false, Duration::from_secs(2)).err().as_deref(),
+            Some("Elevated helper did not respond")
+        );
+        let _ = std::fs::remove_dir_all(&helper.cmd_dir);
+    }
+
+    // A script's message on success is covered by `script_variables_are_passed_literally`.
+    #[test]
+    fn one_shot_script_reports_its_message_as_the_error_on_failure() {
         let failed = run_script("[IO.File]::WriteAllText($ResultPath, 'boom'); exit 1", &[], false);
         assert_eq!(failed.unwrap_err(), CommandError::from("boom"));
     }

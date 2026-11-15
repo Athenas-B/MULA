@@ -26,7 +26,8 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
 
 - **Wall Changer data model (`wallchanger/settings.rs`).** Two separate types and files:
   `Settings` (user configuration, `settings.json`) and `RuntimeState` (queues, image cache, show
-  stats, next monitor — `state.json`, written only by `service::apply` via `save_state`). The
+  stats, next monitor — `state.json`, written by `service::apply` via `save_state`; the queue
+  preview only adds image sizes it had to read, via `save_image_cache`). The
   service on/off flag has its own `service.json` (`service_running` / `set_service_running`). Sources are typed: `Source { path, enabled, level,
   kind }` with `SourceKind::Folder { include_subfolders }` / `SourceKind::Wallhaven { page_limit,
   purity: Purity { sfw, sketchy, nsfw } }` (serialized with a `"kind"` tag). Unreadable files
@@ -36,8 +37,10 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   while MULA runs are not picked up). `vsd.json` is still read on demand, so a hand-edited
   `port` applies on the next server start.
 - **Backend-owned settings.** The UI sends partial updates (`wc_update_settings(patch)` → normalized
-  `Settings`) and renders from the result or the `wc-settings-changed` event, which every change
-  (UI or tray) emits via `wallchanger::on_settings_changed`. Unknown keys are rejected. Each form
+  `Settings`) and renders from the result or the `wc-settings-changed` event. Settings are only
+  written through `wc_update_settings` and `wallchanger::update_settings` (the store's writers are
+  private to the module), and both end in `on_settings_changed`: tray menu sync, worker wake-up
+  and the event, so a new writer can't forget them. Unknown keys are rejected. Each form
   change sends only its own setting; responses and events carry a `revision` and older ones are
   ignored. The UI keeps not-yet-sent edits when settings arrive (`wcApplySettings`) and does no
   clamping itself. JSON files that can't be read (other than missing) are errors, never defaults.
@@ -73,10 +76,11 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   `-EncodedCommand` stub that verifies the SHA-256 of the script before running it; it only runs
   the smartctl path fixed at launch (must be outside the user profile) with an allowlist of
   argument shapes (optionally prefixed by `--json=o`), requires a per-session token, names its
-  own response files, and exits when MULA's PID disappears. Neither side polls: the helper sleeps
-  in `Wait-Event` on a `FileSystemWatcher` (events only wake it; it still lists and validates the
+  own response files, and exits when MULA exits (it holds MULA's process object and reacts to its
+  `Exited` event, so a reused PID can't keep it alive). Neither side polls: the helper sleeps in
+  `Wait-Event` on a `FileSystemWatcher` (events only wake it; it still lists and validates the
   folder) and MULA waits with `FindFirstChangeNotificationW` (`wait_for_file`), so a round trip
-  takes ~16 ms instead of ~260 ms and the idle helper wakes every 2 s instead of 4×/s. Files are
+  takes ~16 ms instead of ~260 ms and the idle helper only wakes for a 30 s safety check. Files are
   kept over a named pipe on purpose: a UAC-started process can't inherit handles, and a pipe name
   chosen up front could be claimed first by another same-user process (pipe squatting). Script inputs are always passed as
   PowerShell variables declared as single-quoted literals (`ps_script`) — no text placeholders.
@@ -99,7 +103,8 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   read-modify-write goes through `updateStore`. webRequest listeners only see `*.m3u*` URLs. The
   popup renders from `storage.onChanged` (no timers); its tooltip lists the same ffmpeg metadata
   keys as `server.py`'s `METADATA_KEYS`. Detected playlists are verified once and cached; the content script uses a
-  MutationObserver and sends metadata only when it changes. Content scripts keep no port open
+  MutationObserver and sends metadata only when it changes. A page URL is an http(s) URL or the empty string everywhere (`vsdHttpUrl` in `config.js`; streams
+  are normalized when stored). Content scripts keep no port open
   to the background (every tab reconnecting whenever the MV3 worker stopped kept restarting it
   and re-verifying playlists); page metadata lives in `chrome.storage.session` (memory where
   unavailable, e.g. Firefox < 115), and a removed/reloaded extension is noticed on the next
@@ -117,7 +122,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Wallhaven URL sources | Done | Accepts `https://wallhaven.cc/search?...` or `/api/v1/search` URLs; per-source page limit (0 = unlimited) and SFW/Sketchy/NSFW purity toggles; API key support for NSFW. Cached under `%APPDATA%\mula\wallchanger\wallhaven`. |
 | Monitor detection | Done | Uses `IDesktopWallpaper`; skips monitors whose `GetMonitorRECT` fails. |
 | Monitor preview block | Done | Shows each monitor frame and how the current Windows wallpaper is fitted (Fill / FitInsideScreen); thumbnails are reused while file, monitor and fit settings are unchanged. |
-| Image dimension caching | Done | Cached in `state.json` with size + mtime (unreadable files as 0×0). |
+| Image dimension caching | Done | Cached in `state.json` with size + mtime. Files that open but don't decode (wrong content, cut off, empty) are cached as 0×0; files that can't be opened right now are retried. |
 | Shared / per-monitor queues | Done | Separate queues, exclusive queue membership, fallback queues. |
 | Rotation modes | Done | Random and Sequence; Sequence index persists across restarts. |
 | Scaling modes | Done | Fill and FitInsideScreen with configurable background color. |
@@ -125,7 +130,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Manual Change / Apply | Done | In tab and tray menu. |
 | Change one monitor per interval | Done | Rotates target monitor index. |
 | Picture-name overlay | Done | Filename/path text, font size, color, offset, optional backdrop; cached rendered copies. |
-| Fade transition | Done | All monitors fade together: images load, overlays render and frames blend/encode in parallel (`util::parallel_map`; full-size decodes use `IMAGE_WORKERS` = 2, frames 4), then frames play in lockstep. |
+| Fade transition | Done | All monitors fade together: images load, overlays render and frames blend/encode in parallel (`util::parallel_map`; full-size decodes use `IMAGE_WORKERS` = 2, frames one worker per core up to 8), then frames play in lockstep. |
 | Rendered cache cleanup | Done | Prunes by total size and file count. |
 | Windows slideshow conflict handling | Done | Detects `DSS_ENABLED` and reapplies current wallpaper to break Windows slideshow before MULA takes over. |
 | Queue preview / state UI | Done | Read-only preview with next/last/last-resort markers. |
@@ -193,6 +198,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 # Quick Rust checks
 cd src-tauri
 cargo check
+cargo clippy --all-targets   # must stay clean; clippy.toml forbids Command::new outside util::command
 cargo test --lib   # includes helper protocol tests that run PowerShell unelevated (no UAC)
 
 # Frontend + browser extension (Node built-in test runner, no npm deps)
@@ -244,7 +250,7 @@ Recorded so they aren't re-investigated without new facts.
   SSD): the first pass, which reads every image's dimensions, took ~500 ms; every later
   `load_images` took **~19 ms**, of which the folder walk itself was ~14 ms. It is cheap
   because the walk uses the metadata the directory listing already returns (no per-file open
-  or stat on Windows) and dimensions are cached by size + mtime in `state.json` (unreadable
+  or stat on Windows) and dimensions are cached by size + mtime in `state.json` (undecodable
   files too, as 0×0). The scan runs at most once per wallpaper change (interval ≥ 1 min,
   30 min by default) and when the queue preview loads, so an index would save ~15–20 ms per
   change. The cost would be a new dependency, watchers created/dropped whenever sources

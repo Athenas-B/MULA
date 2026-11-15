@@ -62,6 +62,7 @@ pub fn parallel_map<R: Send>(count: usize, max_workers: usize, f: impl Fn(usize)
 
 /// A command for a console program that never opens a console window (MULA is a GUI app, so
 /// Windows would otherwise give every child process its own visible console).
+#[allow(clippy::disallowed_methods)] // the one place allowed to call Command::new (see clippy.toml)
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new(program);
@@ -231,12 +232,13 @@ impl<T: Default + Clone + serde::Serialize + serde::de::DeserializeOwned> JsonSt
 
     fn write(&self, value: &T) -> Result<(), String> {
         let path = self.path()?;
-        let text = match self.format {
-            JsonFormat::Pretty => serde_json::to_string_pretty(value),
-            JsonFormat::Compact => serde_json::to_string(value),
+        match self.format {
+            JsonFormat::Pretty => write_json(&path, value),
+            JsonFormat::Compact => {
+                let text = serde_json::to_string(value).map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
+                write_atomic(&path, &text)
+            }
         }
-        .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
-        write_atomic(&path, &text)
     }
 
     /// Runs `f` on the current value.
@@ -416,9 +418,9 @@ mod tests {
     fn commands_return_stdout_or_a_named_error() {
         let ok = run_command(command("cmd").args(["/C", "echo hello"]), "echo").unwrap();
         assert_eq!(ok.trim(), "hello");
-        let err = run_command(Command::new("cmd").args(["/C", "echo broken 1>&2 & exit 3"]), "the tool").unwrap_err();
+        let err = run_command(command("cmd").args(["/C", "echo broken 1>&2 & exit 3"]), "the tool").unwrap_err();
         assert_eq!(err, "the tool failed: broken");
-        assert!(run_command(&mut Command::new("mula-no-such-program"), "x").unwrap_err().starts_with("Failed to run x"));
+        assert!(run_command(&mut command("mula-no-such-program"), "x").unwrap_err().starts_with("Failed to run x"));
     }
 
     #[test]

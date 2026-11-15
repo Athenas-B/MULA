@@ -673,7 +673,7 @@ pub fn run() {
                 .items(&max_level_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<_>).collect::<Vec<_>>())
                 .build()?;
             app.manage(wallchanger::MaxLevelMenuState(
-                (1..=10).zip(max_level_items.into_iter()).collect(),
+                (1..=10).zip(max_level_items).collect(),
             ));
 
             let wallchanger_submenu = SubmenuBuilder::new(app, "Wall Changer")
@@ -724,10 +724,8 @@ pub fn run() {
                     }
                     id if id.starts_with("max_level_") => {
                         if let Ok(level) = id.trim_start_matches("max_level_").parse::<i32>() {
-                            let result = wallchanger::settings::update(|s| s.maximum_source_level = level);
-                            match result {
-                                Ok(versioned) => wallchanger::on_settings_changed(app, &versioned),
-                                Err(e) => log::error!("Failed to update max source level: {e}"),
+                            if let Err(e) = wallchanger::update_settings(app, |s| s.maximum_source_level = level) {
+                                log::error!("Failed to update max source level: {e}");
                             }
                         }
                     }

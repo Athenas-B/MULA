@@ -6,6 +6,15 @@
 
 const VSD_DEFAULT_SERVER = 'http://127.0.0.1:8765';
 
+/**
+ * `url` when it is an http(s) URL, else ''. Page URLs come from tabs and web requests and can be
+ * missing, an extension page or `about:blank`; everything that stores or uses one goes through
+ * this, so "no page" is always the empty string.
+ */
+function vsdHttpUrl(url) {
+  return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : '';
+}
+
 /** The companion server base URL from storage (without trailing slashes), or the default. */
 function vsdGetServerUrl() {
   return new Promise((resolve) => {

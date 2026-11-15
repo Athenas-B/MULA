@@ -204,7 +204,7 @@ pub struct QueueState {
     pub ordered_image_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImageCacheEntry {
     #[serde(default)]
     pub path: String,
@@ -253,10 +253,8 @@ fn default_fade_steps() -> i32 { 12 }
 
 static SETTINGS: JsonStore<Settings> = JsonStore::new("wallchanger/settings.json", JsonFormat::Pretty, normalize);
 /// Compact: it can hold thousands of paths.
-static STATE: JsonStore<RuntimeState> = JsonStore::new("wallchanger/state.json", JsonFormat::Compact, keep::<RuntimeState>);
-static SERVICE: JsonStore<ServiceFlag> = JsonStore::new("wallchanger/service.json", JsonFormat::Pretty, keep::<ServiceFlag>);
-
-fn keep<T>(_: &mut T) {}
+static STATE: JsonStore<RuntimeState> = JsonStore::new("wallchanger/state.json", JsonFormat::Compact, |_| {});
+static SERVICE: JsonStore<ServiceFlag> = JsonStore::new("wallchanger/service.json", JsonFormat::Pretty, |_| {});
 
 /// Bumped on every settings change (while the store is locked), so the UI can ignore responses
 /// and events that are older than what it already shows.
@@ -283,7 +281,8 @@ pub fn load_versioned() -> Result<Versioned, String> {
 }
 
 /// Changes the settings through `f`, normalizes and saves them, without racing other writers.
-pub fn update(f: impl FnOnce(&mut Settings)) -> Result<Versioned, String> {
+/// Callers outside this module go through [`super::update_settings`], which also notifies.
+pub(super) fn update(f: impl FnOnce(&mut Settings)) -> Result<Versioned, String> {
     SETTINGS.update(|settings| {
         f(settings);
         normalize(settings);
@@ -292,7 +291,7 @@ pub fn update(f: impl FnOnce(&mut Settings)) -> Result<Versioned, String> {
 }
 
 /// Applies a partial update: each top-level key of `patch` replaces that setting.
-pub fn update_with_patch(patch: serde_json::Value) -> Result<Versioned, String> {
+pub(super) fn update_with_patch(patch: serde_json::Value) -> Result<Versioned, String> {
     SETTINGS.update(|settings| {
         *settings = apply_patch(settings, patch)?;
         Ok(versioned(settings))
@@ -329,6 +328,18 @@ pub fn save_state(state: RuntimeState) -> Result<(), String> {
     STATE.set(state)
 }
 
+/// Stores a refreshed image dimension cache on its own (queues and statistics stay as they
+/// are), so image sizes a preview had to read aren't read again. Does nothing when unchanged.
+pub fn save_image_cache(entries: &[ImageCacheEntry]) -> Result<(), String> {
+    if STATE.read(|state| state.image_cache_entries == entries)? {
+        return Ok(());
+    }
+    STATE.update(|state| {
+        state.image_cache_entries = entries.to_vec();
+        Ok(())
+    })
+}
+
 /// Whether the interval service is switched on; stored on its own in `service.json`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct ServiceFlag {
@@ -344,7 +355,7 @@ pub fn set_service_running(running: bool) -> Result<(), String> {
     SERVICE.set(ServiceFlag { running })
 }
 
-pub fn normalize(settings: &mut Settings) {
+fn normalize(settings: &mut Settings) {
     settings.interval_minutes = settings.interval_minutes.clamp(1, 1440);
     settings.maximum_source_level = settings.maximum_source_level.clamp(1, 10);
     settings.wallhaven_api_key = settings.wallhaven_api_key.trim().to_string();

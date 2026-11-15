@@ -88,9 +88,9 @@ chrome.storage.onChanged.addListener((changes) => {
 
 // ── Storage ─────────────────────────────────────────────────────────────────
 
-function storageGet(defaults) {
+function storageGet(defaults, area = chrome.storage.local) {
   return new Promise((resolve, reject) => {
-    chrome.storage.local.get(defaults, (result) => {
+    area.get(defaults, (result) => {
       const err = chrome.runtime.lastError;
       if (err) reject(new Error(err.message));
       else resolve(result || {});
@@ -98,9 +98,9 @@ function storageGet(defaults) {
   });
 }
 
-function storageSet(items) {
+function storageSet(items, area = chrome.storage.local) {
   return new Promise((resolve, reject) => {
-    chrome.storage.local.set(items, () => {
+    area.set(items, () => {
       const err = chrome.runtime.lastError;
       if (err) reject(new Error(err.message));
       else resolve();
@@ -155,7 +155,7 @@ function isExtensionUrl(url) {
 }
 
 function makePageHeaders(pageUrl) {
-  if (!pageUrl || pageUrl === 'unknown' || !pageUrl.startsWith('http')) return null;
+  if (!vsdHttpUrl(pageUrl)) return null;
   try {
     return { Referer: pageUrl, Origin: new URL(pageUrl).origin, Accept: 'application/vnd.apple.mpegurl, video/*, */*' };
   } catch (e) {
@@ -175,39 +175,34 @@ function setBounded(map, key, value, max) {
 const PAGE_METADATA_KEY = 'pageMetadata';
 let pageMetadataLoad = null;
 
+/** The map of page URL -> metadata; never rejects (an unreadable copy just starts empty). */
 function loadPageMetadata() {
-  pageMetadataLoad ??= new Promise((resolve) => {
-    try {
-      if (!chrome.storage.session) return resolve(new Map());
-      chrome.storage.session.get({ [PAGE_METADATA_KEY]: [] }, (result) => {
-        resolve(new Map(Array.isArray(result?.[PAGE_METADATA_KEY]) ? result[PAGE_METADATA_KEY] : []));
-      });
-    } catch (e) {
-      resolve(new Map());
-    }
-  });
+  pageMetadataLoad ??= Promise.resolve()
+    .then(() => (chrome.storage.session ? storageGet({ [PAGE_METADATA_KEY]: [] }, chrome.storage.session) : {}))
+    .catch(() => ({}))
+    .then((result) => new Map(Array.isArray(result[PAGE_METADATA_KEY]) ? result[PAGE_METADATA_KEY] : []));
   return pageMetadataLoad;
 }
 
-/** Callback for session storage writes: a failure (e.g. quota) only costs persistence. */
-function reportSessionError() {
-  const err = chrome.runtime.lastError;
-  if (err) console.warn('Failed to keep page metadata in session storage:', err.message);
+/** Writes the map to session storage. Never rejects: a failure (e.g. quota) only costs persistence. */
+function savePageMetadata(map) {
+  if (!chrome.storage.session) return Promise.resolve();
+  return storageSet({ [PAGE_METADATA_KEY]: [...map] }, chrome.storage.session)
+    .catch(err => console.warn('Failed to keep page metadata in session storage:', err.message));
 }
 
+/** Remembers a page's metadata; content scripts re-send it often, so unchanged data isn't rewritten. */
 async function rememberPageMetadata(pageUrl, metadata) {
   const map = await loadPageMetadata();
+  const unchanged = JSON.stringify(map.get(pageUrl)) === JSON.stringify(metadata);
   setBounded(map, pageUrl, metadata, MAX_PAGE_METADATA);
-  try {
-    chrome.storage.session?.set({ [PAGE_METADATA_KEY]: [...map] }, reportSessionError);
-  } catch (e) {}
+  if (!unchanged) await savePageMetadata(map);
 }
 
 async function forgetPageMetadata() {
-  (await loadPageMetadata()).clear();
-  try {
-    chrome.storage.session?.remove(PAGE_METADATA_KEY, reportSessionError);
-  } catch (e) {}
+  const map = await loadPageMetadata();
+  map.clear();
+  await savePageMetadata(map);
 }
 
 async function hasTsSegments(url, headers) {
@@ -247,7 +242,7 @@ function queryTabs() {
 
 /** Title of an open tab showing pageUrl (or another page of the same origin). */
 function titleFromTabs(tabs, pageUrl) {
-  if (!pageUrl || pageUrl === 'unknown' || isExtensionUrl(pageUrl)) return '';
+  if (!vsdHttpUrl(pageUrl)) return '';
   try {
     const origin = new URL(pageUrl).origin;
     const tab = tabs.find(t => t.url && !isExtensionUrl(t.url) && (t.url === pageUrl || t.url.startsWith(origin + '/')));
@@ -287,7 +282,8 @@ async function fillMissingTitles() {
 
 async function addStream(url, pageUrl, type = 'hls', title = '', headers = null) {
   if (!url || !isM3u8(url)) return;
-  const metadata = (pageUrl && pageUrl !== 'unknown') ? ((await loadPageMetadata()).get(pageUrl) || null) : null;
+  pageUrl = vsdHttpUrl(pageUrl); // stored streams have a real page URL or ''
+  const metadata = pageUrl ? ((await loadPageMetadata()).get(pageUrl) || null) : null;
   const finalHeaders = headers || capturedHeaders.get(url) || makePageHeaders(pageUrl);
 
   return updateStore((data) => {
@@ -335,7 +331,7 @@ function handleRequest(details) {
   if (!detectionEnabled || !isM3u8(details.url) || isMasterPlaylistUrl(details.url)) return;
   if (verifiedUrls.get(details.url) === false) return;
 
-  const fallbackPageUrl = details.documentUrl || details.initiator || 'unknown';
+  const fallbackPageUrl = details.documentUrl || details.initiator || '';
   if (isExtensionUrl(fallbackPageUrl)) return;
 
   if (details.tabId && details.tabId > 0) {
@@ -362,8 +358,7 @@ const headerExtraInfo = typeof browser !== 'undefined' ? ['requestHeaders'] : ['
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (!isM3u8(details.url)) return;
-    const pageUrl = details.initiator || details.documentUrl || 'unknown';
-    if (isExtensionUrl(pageUrl)) return;
+    if (isExtensionUrl(details.initiator || details.documentUrl)) return;
 
     const h = {};
     details.requestHeaders.forEach(({ name, value }) => {
@@ -393,9 +388,9 @@ async function startDownload(url) {
   startingDownloads.add(url);
   try {
     let title = stream.title || '';
-    if (!title && stream.pageUrl) title = await findTabTitle(stream.pageUrl);
-    const pageUrl = stream.pageUrl || '';
-    const headers = stream.headers || makePageHeaders(pageUrl || 'unknown');
+    const pageUrl = vsdHttpUrl(stream.pageUrl);
+    if (!title && pageUrl) title = await findTabTitle(pageUrl);
+    const headers = stream.headers || makePageHeaders(pageUrl);
     const data = await vsdServerJson('/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -513,9 +508,9 @@ function respondWith(promise, sendResponse) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message.type) {
     case 'metadata': {
-      const pageUrl = message.pageUrl || sender.tab?.url;
+      const pageUrl = vsdHttpUrl(message.pageUrl) || vsdHttpUrl(sender.tab?.url);
       if (pageUrl && message.metadata) {
-        rememberPageMetadata(pageUrl, message.metadata).catch(err => console.error('Failed to store page metadata:', err));
+        rememberPageMetadata(pageUrl, message.metadata);
         updateStore(({ streams }) => {
           streams.forEach(s => {
             if (s.pageUrl === pageUrl && !s.metadata) s.metadata = message.metadata;
@@ -527,10 +522,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     case 'detected': {
-      const pageUrl = sender.tab?.url || 'unknown';
-      if (message.metadata && pageUrl !== 'unknown') {
-        rememberPageMetadata(pageUrl, message.metadata).catch(err => console.error('Failed to store page metadata:', err));
-      }
+      const pageUrl = vsdHttpUrl(sender.tab?.url);
+      if (message.metadata && pageUrl) rememberPageMetadata(pageUrl, message.metadata);
       if (detectionEnabled) {
         const headers = makePageHeaders(pageUrl);
         for (const s of message.streams || []) {

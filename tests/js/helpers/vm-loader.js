@@ -42,12 +42,6 @@ export function loadScripts(files, globals) {
     fn: ctx,
     /** Evaluate an expression in the context (useful for top-level const/let bindings). */
     run: (code) => vm.runInContext(code, ctx),
-    /** Assign a top-level `let` binding (or any lvalue) from the test realm. */
-    assign: (lvalue, value) => {
-      ctx.__testValue = value;
-      vm.runInContext(`${lvalue} = __testValue`, ctx);
-      delete ctx.__testValue;
-    },
   };
 }
 
@@ -58,8 +52,9 @@ export function loadScripts(files, globals) {
  */
 export function loadModules(entry, globals) {
   if (typeof vm.SourceTextModule?.prototype.linkRequests !== "function") {
+    const { engines } = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
     throw new Error(
-      `The frontend tests need Node 22.21+ or 24.8+ run with --experimental-vm-modules (this is ${process.version}); use \`npm test\`.`
+      `The frontend tests need Node ${engines.node} run with --experimental-vm-modules (this is ${process.version}); use \`npm test\`.`
     );
   }
   globals.window ??= globals;
@@ -410,7 +405,6 @@ export function createFakeChrome({ storage = {}, session = {}, tabs = [], onSend
   const sent = [];
   const icons = [];
   const created = [];
-  const port = { name: "content", onDisconnect: fakeEvent() };
 
   const chrome = {
     store,
@@ -419,7 +413,6 @@ export function createFakeChrome({ storage = {}, session = {}, tabs = [], onSend
     sent,
     icons,
     created,
-    port,
     tabsList: tabs,
     onSend,
     runtime: {
@@ -427,11 +420,6 @@ export function createFakeChrome({ storage = {}, session = {}, tabs = [], onSend
       lastError: undefined,
       getURL: (p) => `chrome-extension://test-extension-id/${p}`,
       onMessage: fakeEvent(),
-      onConnect: fakeEvent(),
-      connect: (info) => {
-        port.name = info?.name;
-        return port;
-      },
       sendMessage(msg, cb) {
         sent.push(clone(msg));
         const res = chrome.onSend(msg);
@@ -450,10 +438,6 @@ export function createFakeChrome({ storage = {}, session = {}, tabs = [], onSend
         },
         set(obj, cb) {
           for (const [k, v] of Object.entries(obj)) sessionStore[k] = clone(v);
-          later(() => cb?.());
-        },
-        remove(key, cb) {
-          delete sessionStore[key];
           later(() => cb?.());
         },
       },

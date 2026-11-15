@@ -67,7 +67,6 @@ function loadMain({ storedTheme, throwStorage = false, prefersDark = false, invo
   const { ctx, modules } = loadModules(MAIN_JS, globals);
   return {
     ctx,
-    modules,
     // Every module's exports in one object (export names are unique across modules).
     fn: Object.assign({}, ...Object.values(modules)),
     vsd: modules.vsd.state,
@@ -484,12 +483,32 @@ describe("invokeSmart", () => {
 });
 
 describe("VSD server panel", () => {
-  it("only reflects the autostart setting; the backend starts the server", async () => {
+  it("a setting checkbox shows the stored value and saves changes", async () => {
     const m = loadMain({ invoke: (cmd) => (cmd === "vsd_get_autostart" ? true : undefined) });
     const checkbox = m.document.add("vsd-autostart");
-    await m.fn.loadAutostart();
+    await m.fn.bindSettingCheckbox(checkbox, "vsd_get_autostart", "vsd_set_autostart");
     assert.equal(checkbox.checked, true);
+    // Only the setting is shown; the backend starts the server.
     assert.equal(m.calls("vsd_start").length, 0);
+
+    checkbox.checked = false;
+    await Promise.all(checkbox.dispatch("change"));
+    assert.deepEqual(plain(m.calls("vsd_set_autostart").map((c) => c.args)), [{ enabled: false }]);
+    assert.equal(checkbox.checked, false);
+  });
+
+  it("a setting checkbox goes back when the change can't be saved", async () => {
+    const m = loadMain({
+      invoke: (cmd) => {
+        if (cmd === "set_autostart") throw { kind: "other", message: "registry is read-only" };
+        return false;
+      },
+    });
+    const checkbox = m.document.add("app-autostart");
+    await m.fn.bindSettingCheckbox(checkbox, "get_autostart", "set_autostart");
+    checkbox.checked = true;
+    await Promise.all(checkbox.dispatch("change"));
+    assert.equal(checkbox.checked, false);
   });
 
   it("shows the backlog, then live lines, without duplicates or gaps", async () => {
@@ -582,13 +601,13 @@ describe("updateVsdUi / wcUpdateToggleUi / wcShowMessage", () => {
     const apiKey = m.document.add("wc-wallhaven-api-key");
     m.document.add("wc-scaling");
     m.document.add("wc-overlay-enabled");
-    (m.wc.settings = {
+    m.wc.settings = {
       interval_minutes: 15,
       background_color_argb: 0xff102030 | 0,
       use_separate_monitor_queues: true,
       wallhaven_api_key: null,
       scaling_mode: "Fill",
-    });
+    };
     m.fn.wcRenderSettings();
     assert.equal(interval.value, 15);
     assert.equal(color.value, "#102030");
@@ -751,8 +770,8 @@ describe("wcRenderSources", () => {
     const remove = m.document.add("wc-remove-source");
     const up = m.document.add("wc-move-up");
     const down = m.document.add("wc-move-down");
-    (m.wc.settings = { source_folders: sources });
-    (m.wc.selectedSourceIndex = selected);
+    m.wc.settings = { source_folders: sources };
+    m.wc.selectedSourceIndex = selected;
     m.fn.wcRenderSources();
     return { m, container, remove, up, down, settings: () => plain(m.wc.settings) };
   }
@@ -886,8 +905,8 @@ describe("wcRemoveSource / wcMoveSource", () => {
   function setup(paths, selected) {
     const m = loadMain();
     for (const id of ["wc-sources", "wc-remove-source", "wc-move-up", "wc-move-down"]) m.document.add(id);
-    (m.wc.settings = { source_folders: paths.map((path) => ({ path, enabled: true, level: 5, kind: "folder", include_subfolders: true })) });
-    (m.wc.selectedSourceIndex = selected);
+    m.wc.settings = { source_folders: paths.map((path) => ({ path, enabled: true, level: 5, kind: "folder", include_subfolders: true })) };
+    m.wc.selectedSourceIndex = selected;
     return {
       m,
       paths: () => plain(m.wc.settings).source_folders.map((s) => s.path),
@@ -932,7 +951,7 @@ describe("wcRemoveSource / wcMoveSource", () => {
     const t = setup(["a", "b"], 0);
     t.m.fn.wcMoveSource(-1);
     assert.deepEqual(t.paths(), ["a", "b"]);
-    (t.m.wc.selectedSourceIndex = 1);
+    t.m.wc.selectedSourceIndex = 1;
     t.m.fn.wcMoveSource(1);
     assert.deepEqual(t.paths(), ["a", "b"]);
   });
@@ -942,7 +961,7 @@ describe("wcAddWallhavenUrl / wcAddFolder", () => {
   function setup(opts) {
     const m = loadMain(opts);
     for (const id of ["wc-sources", "wc-remove-source", "wc-move-up", "wc-move-down", "wc-message"]) m.document.add(id);
-    (m.wc.settings = { source_folders: [] });
+    m.wc.settings = { source_folders: [] };
     return m;
   }
 
@@ -1041,7 +1060,7 @@ describe("Drive Test", () => {
     }
     el.tbody = m.document.setQuery("#drive-info-table tbody", new FakeElement());
     el["drive-select"].value = selectedId;
-    (m.drives.drives = drives);
+    m.drives.drives = drives;
     return { m, el };
   }
 

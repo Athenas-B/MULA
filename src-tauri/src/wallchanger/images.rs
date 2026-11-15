@@ -73,18 +73,21 @@ fn list_dir(dir: &Path) -> Vec<(PathBuf, fs::Metadata)> {
         .unwrap_or_default()
 }
 
-/// The image's dimensions; (0, 0) when the file isn't a decodable image (cached, so it isn't
-/// decoded again), or None when it can't be read right now (e.g. locked by another program),
-/// so it is retried on the next pass.
+/// The image's dimensions; (0, 0) when the file opens but isn't a decodable image (wrong
+/// content, cut off, empty: cached, so it isn't decoded again), or None when it can't be opened
+/// right now (e.g. locked by another program), so it is retried on the next pass.
 fn read_image_dimensions(path: &str) -> Option<(i32, i32)> {
-    match image::image_dimensions(path) {
-        Ok((w, h)) => Some((w as i32, h as i32)),
-        Err(image::ImageError::IoError(e)) => {
-            log::warn!("Can't read {path} right now: {e}");
-            None
-        }
+    let reader = match image::ImageReader::open(path) {
+        Ok(reader) => reader,
         Err(e) => {
-            log::warn!("Failed to read image dimensions for {path}: {e}");
+            log::warn!("Can't open {path} right now: {e}");
+            return None;
+        }
+    };
+    match reader.with_guessed_format().map_err(image::ImageError::IoError).and_then(|r| r.into_dimensions()) {
+        Ok((w, h)) => Some((w as i32, h as i32)),
+        Err(e) => {
+            log::warn!("Not a usable image: {path}: {e}");
             Some((0, 0))
         }
     }
@@ -249,10 +252,10 @@ mod tests {
         let mut s = settings_with(vec![source(dir.path())]);
         let mut cache = Vec::new();
         let images = load(&s, &mut cache).unwrap();
-        assert_eq!(names(&images), ["deep.png", "top.png"], "unreadable and non-image files are skipped");
+        assert_eq!(names(&images), ["deep.png", "top.png"], "undecodable and non-image files are skipped");
         let top = images.iter().find(|i| i.path.ends_with("top.png")).unwrap();
         assert_eq!((top.width, top.height), (40, 20));
-        assert_eq!(cache.len(), 3, "dimensions are cached for every image file, readable or not");
+        assert_eq!(cache.len(), 3, "dimensions are cached for every image file, decodable or not");
 
         s.source_folders[0].kind = SourceKind::Folder { include_subfolders: false };
         assert_eq!(names(&load(&s, &mut cache).unwrap()), ["top.png"]);
@@ -299,15 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_files_are_cached_but_not_offered() {
+    fn undecodable_files_are_cached_but_not_offered() {
         let dir = TempDir::new("images_broken");
         std::fs::write(dir.join("broken.png"), b"not a png").unwrap();
+        std::fs::write(dir.join("empty.png"), b"").unwrap();
+        // A real image cut off after its first bytes.
+        let whole = std::fs::read(write_png(&dir.join("whole.png"), 16, 16)).unwrap();
+        std::fs::write(dir.join("truncated.png"), &whole[..20]).unwrap();
+        std::fs::remove_file(dir.join("whole.png")).unwrap();
         let s = settings_with(vec![source(dir.path())]);
         let mut cache = Vec::new();
 
         assert!(load(&s, &mut cache).unwrap().is_empty());
-        assert_eq!(cache.len(), 1);
-        assert_eq!((cache[0].width, cache[0].height), (0, 0));
+        assert_eq!(cache.len(), 3);
+        assert!(cache.iter().all(|e| (e.width, e.height) == (0, 0)));
     }
 
     #[cfg(target_os = "windows")]

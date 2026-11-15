@@ -1,6 +1,7 @@
 // Tab switching and the System tab (app info, start with Windows, config folder).
 
 import { invoke, listen, revealItemInDir } from "./tauri.js";
+import { bindSettingCheckbox } from "./dom.js";
 
 // Tab switching
 export function initTabs() {
@@ -31,26 +32,6 @@ async function loadAppInfo() {
   }
 }
 
-async function loadAppAutostart() {
-  try {
-    const enabled = await invoke("get_autostart");
-    document.getElementById("app-autostart").checked = enabled;
-  } catch (e) {
-    console.error("Failed to load autostart setting:", e);
-  }
-}
-
-async function toggleAppAutostart() {
-  const checkbox = document.getElementById("app-autostart");
-  const enabled = checkbox.checked;
-  try {
-    await invoke("set_autostart", { enabled });
-  } catch (e) {
-    checkbox.checked = !enabled;
-    console.error("Failed to update autostart setting:", e);
-  }
-}
-
 // Open config directory in file explorer
 async function openConfigDir(e) {
   e.preventDefault();
@@ -64,13 +45,14 @@ async function openConfigDir(e) {
 
 export function initSystem() {
   loadAppInfo();
-  loadAppAutostart();
   document.getElementById("app-config-path").addEventListener("click", openConfigDir);
-  document.getElementById("app-autostart")?.addEventListener("change", toggleAppAutostart);
 
-  // Keep the checkbox in sync when autostart is toggled from the tray menu.
-  listen("autostart-changed", (event) => {
-    const checkbox = document.getElementById("app-autostart");
-    if (checkbox) checkbox.checked = event.payload;
-  });
+  const autostart = document.getElementById("app-autostart");
+  if (autostart) {
+    bindSettingCheckbox(autostart, "get_autostart", "set_autostart");
+    // Keep the checkbox in sync when autostart is toggled from the tray menu.
+    listen("autostart-changed", (event) => {
+      autostart.checked = event.payload;
+    });
+  }
 }

@@ -474,7 +474,8 @@ mod helper_tests {
             crate::test_support::write_png(&dir.join(name), 2, 2);
         }
         let urls: Vec<String> = ["c.png", "a.png", "b.png"].iter().map(|n| format!("https://w.wallhaven.cc/full/{n}")).collect();
-        let agent = ureq::AgentBuilder::new().timeout(Duration::from_millis(1)).build();
+        // Without a connect timeout, the refused connection below takes ~2 s on Windows.
+        let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_millis(50)).timeout(Duration::from_millis(50)).build();
         let files = download_all(&agent, &urls, dir.path());
         assert_eq!(files, vec![dir.join("c.png"), dir.join("a.png"), dir.join("b.png")]);
 

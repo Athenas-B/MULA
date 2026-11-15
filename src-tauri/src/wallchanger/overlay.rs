@@ -156,9 +156,7 @@ fn render_with_overlay(original_path: &str, settings: &Settings) -> Result<Strin
     let font = FontRef::try_from_slice(&font_bytes)
         .map_err(|e| format!("Failed to parse system font: {e}"))?;
 
-    let mut image: RgbaImage = image::open(original_path)
-        .map_err(|e| format!("Failed to open image for overlay rendering: {e}"))?
-        .into_rgba8();
+    let mut image = super::preview::open_rgba(original_path)?;
 
     let text = overlay_text(original_path, settings.picture_name_overlay_text_mode);
     if !text.is_empty() {
@@ -243,12 +241,10 @@ mod tests {
         std::fs::write(&newer, b"new").unwrap();
 
         // Force eviction down to a single file, regardless of byte size.
-        prune_directory(&dir, u64::MAX, 1).unwrap();
+        prune_directory(dir, u64::MAX, 1).unwrap();
 
         assert!(!older.exists(), "the older file should have been evicted first");
         assert!(newer.exists(), "the newer file should have been kept");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -284,7 +280,8 @@ mod helper_tests {
         assert_eq!(key, cache_key("a.jpg", &base), "keys are deterministic");
         assert_ne!(key, cache_key("b.jpg", &base));
 
-        let variants: Vec<Box<dyn Fn(&mut Settings)>> = vec![
+        type Change = Box<dyn Fn(&mut Settings)>;
+        let variants: Vec<Change> = vec![
             Box::new(|s| s.picture_name_overlay_font_size += 1),
             Box::new(|s| s.picture_name_overlay_text_color_argb = 0x00FF_0000),
             Box::new(|s| s.picture_name_overlay_offset_x = 5),

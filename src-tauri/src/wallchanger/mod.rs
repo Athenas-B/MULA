@@ -70,9 +70,17 @@ pub fn sync_max_level_menu(app: &tauri::AppHandle, level: i32) {
     }
 }
 
-/// Every settings change (UI or tray) ends here: the tray's "Max source level" items are synced
-/// and the Wall Changer tab re-renders from the `wc-settings-changed` event.
-pub fn on_settings_changed(app: &tauri::AppHandle, versioned: &settings::Versioned) {
+/// Changes the settings through `f` and tells everyone. Settings can only be written through
+/// this function and `wc_update_settings`, so no change can skip the notifications.
+pub fn update_settings(app: &tauri::AppHandle, f: impl FnOnce(&mut settings::Settings)) -> Result<settings::Versioned, String> {
+    let saved = settings::update(f)?;
+    on_settings_changed(app, &saved);
+    Ok(saved)
+}
+
+/// Every settings change (UI or tray) ends here: the tray's "Max source level" items are synced,
+/// the interval worker re-plans and the Wall Changer tab re-renders from `wc-settings-changed`.
+fn on_settings_changed(app: &tauri::AppHandle, versioned: &settings::Versioned) {
     sync_max_level_menu(app, versioned.settings.maximum_source_level);
     service::wake();
     crate::events::emit(crate::events::WC_SETTINGS_CHANGED, versioned);
@@ -133,6 +141,11 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
     let mut runtime = settings::load_state()?;
     // The preview must stay cheap: only use Wallhaven images that are already downloaded.
     let images = images::load_images(&settings, &mut runtime.image_cache_entries, images::NetworkPolicy::CacheOnly)?;
+    // Keep any image sizes this had to read, or every preview would read them again until the
+    // next wallpaper change saves the state.
+    if let Err(e) = settings::save_image_cache(&runtime.image_cache_entries) {
+        log::warn!("Failed to save the image size cache: {e}");
+    }
     let monitors = monitors::get_monitors().unwrap_or_default();
     let queues = queue::build_queues(&images, &monitors, &settings);
 

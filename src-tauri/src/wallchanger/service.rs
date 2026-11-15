@@ -27,10 +27,10 @@ static APPLY_LOCK: Mutex<()> = Mutex::new(());
 /// How long to wait before retrying when the settings can't be read.
 const SETTINGS_RETRY: Duration = Duration::from_secs(60);
 
-/// Whether the interval has elapsed since the later of the worker's start and the last change.
-fn is_change_due(worker_started: Instant, last_apply: Option<Instant>, interval: Duration, now: Instant) -> bool {
-    let since = last_apply.map_or(worker_started, |t| t.max(worker_started));
-    now.saturating_duration_since(since) >= interval
+/// When the next change is due: one interval after the later of the worker's start and the
+/// last change.
+fn next_change_at(worker_started: Instant, last_apply: Option<Instant>, interval: Duration) -> Instant {
+    last_apply.map_or(worker_started, |t| t.max(worker_started)) + interval
 }
 
 pub fn start() -> Result<(), String> {
@@ -105,16 +105,16 @@ fn run_worker(generation: u64) {
             }
             Ok(config) => {
                 let interval = Duration::from_secs(config.interval_minutes.max(1) as u64 * 60);
+                let due = next_change_at(started, worker.last_apply, interval);
                 let now = Instant::now();
-                if is_change_due(started, worker.last_apply, interval, now) {
+                if now >= due {
                     drop(worker);
                     if let Err(e) = apply(config.change_one_monitor_per_interval) {
                         log::error!("Wallchanger apply failed: {}", e);
                     }
                     continue;
                 }
-                let since = worker.last_apply.map_or(started, |t| t.max(started));
-                (since + interval).saturating_duration_since(now)
+                due - now
             }
         };
         // Sleep until the next change is due, or until something re-plans the schedule.
@@ -234,11 +234,11 @@ fn apply_with(settings: &Settings, runtime: &mut RuntimeState, change_one_monito
     ))
 }
 
-fn select_target_monitors<'a>(
-    monitors: &'a [super::monitors::Monitor],
+fn select_target_monitors(
+    monitors: &[super::monitors::Monitor],
     next_monitor_index: i32,
     change_one_monitor_only: bool,
-) -> (Vec<&'a super::monitors::Monitor>, Option<i32>) {
+) -> (Vec<&super::monitors::Monitor>, Option<i32>) {
     if change_one_monitor_only && monitors.len() > 1 {
         let index = (next_monitor_index.max(0) as usize) % monitors.len();
         let next = ((index + 1) % monitors.len()) as i32;
@@ -283,7 +283,7 @@ mod tests {
     use crate::wallchanger::monitors::Monitor;
 
     fn monitors(n: usize) -> Vec<Monitor> {
-        (0..n).map(|i| Monitor { id: format!("M{i}"), width: 1920, height: 1080, ..Default::default() }).collect()
+        (0..n).map(|i| Monitor { id: format!("M{i}"), width: 1920, height: 1080 }).collect()
     }
 
     fn ids(targets: &[&Monitor]) -> Vec<String> {
@@ -334,16 +334,14 @@ mod tests {
         let minute = Duration::from_secs(60);
         let at = |secs| start + Duration::from_secs(secs);
 
-        assert!(!is_change_due(start, None, minute, at(59)));
-        assert!(is_change_due(start, None, minute, at(60)));
+        assert_eq!(next_change_at(start, None, minute), at(60));
 
         // A manual change 50 s in restarts the interval.
-        assert!(!is_change_due(start, Some(at(50)), minute, at(100)));
-        assert!(is_change_due(start, Some(at(50)), minute, at(110)));
+        assert_eq!(next_change_at(start, Some(at(50)), minute), at(110));
 
         // A change from before the worker started (previous run) doesn't shorten the wait.
         let earlier = Instant::now();
-        assert!(!is_change_due(at(10), Some(earlier), minute, at(30)));
+        assert_eq!(next_change_at(at(10), Some(earlier), minute), at(70));
     }
 
     #[test]

@@ -26,7 +26,7 @@ A cross-platform companion app built with Tauri (Rust + Web frontend) that manag
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (1.70+)
-- [Node.js](https://nodejs.org/) 22.21+ or 24.8+ (the frontend tests load the ES modules through `node:vm`)
+- [Node.js](https://nodejs.org/); `npm test` needs the version in `engines` of `package.json` (the frontend tests load the ES modules through `node:vm`)
 - [Python](https://python.org/) (3.10+)
 - [ffmpeg](https://ffmpeg.org/) (on PATH or configured in .env)
 - Platform-specific:

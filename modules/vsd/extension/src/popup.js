@@ -46,7 +46,7 @@ function buildTooltip(s) {
   const list = (v) => (Array.isArray(v) ? v.join(', ') : v);
   const fields = [
     ['title', s.title || meta.title],
-    ['comment', /^https?:\/\//i.test(s.pageUrl || '') && s.pageUrl],
+    ['comment', vsdHttpUrl(s.pageUrl)],
     ['artist', meta.channel],
     ['genre', list(meta.categories)],
     ['keywords', list(meta.tags)],
@@ -218,7 +218,8 @@ async function startDownload(url) {
 }
 
 function openPage(s) {
-  if (s?.pageUrl && s.pageUrl !== 'unknown') chrome.tabs.create({ url: s.pageUrl });
+  const url = vsdHttpUrl(s?.pageUrl);
+  if (url) chrome.tabs.create({ url });
 }
 
 function openFile(s) {

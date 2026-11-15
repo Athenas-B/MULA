@@ -79,14 +79,12 @@ function stopAll() {
   }
 }
 
-function runtimeAlive() {
-  try { return !!chrome.runtime.id; }
-  catch (e) { return false; }
-}
-
+/** Whether the extension is still there; stops all work the first time it is not. */
 function extensionContextValid() {
   if (!contextValid) return false;
-  if (runtimeAlive()) return true;
+  try {
+    if (chrome.runtime.id) return true;
+  } catch (e) {}
   stopAll();
   return false;
 }
@@ -109,20 +107,21 @@ function sendMessageSafe(msg) {
 
 // ── Detection ───────────────────────────────────────────────────────────────
 
-/** Send page metadata, but only when it (or the page URL) changed since the last send. */
+/** Send page metadata, but only when it (or the page URL) changed since the last send. Returns it. */
 function sendMetadata() {
-  if (!extensionContextValid()) return;
   const metadata = extractMetadata();
   const key = JSON.stringify([location.href, metadata]);
-  if (key === lastMetadataKey) return;
-  lastMetadataKey = key;
-  sendMessageSafe({ type: 'metadata', pageUrl: location.href, metadata });
+  if (key !== lastMetadataKey) {
+    lastMetadataKey = key;
+    sendMessageSafe({ type: 'metadata', pageUrl: location.href, metadata });
+  }
+  return metadata;
 }
 
 /** Report HLS <video> sources that were not reported yet. */
 function scan() {
   if (!extensionContextValid()) return;
-  sendMetadata();
+  const metadata = sendMetadata();
   const streams = [];
   document.querySelectorAll('video').forEach(v => {
     const src = v.src;
@@ -132,7 +131,7 @@ function scan() {
     }
   });
   if (streams.length) {
-    sendMessageSafe({ type: 'detected', streams, title: document.title || '', metadata: extractMetadata() });
+    sendMessageSafe({ type: 'detected', streams, title: document.title || '', metadata });
   }
 }
 
@@ -149,7 +148,7 @@ function scheduleScan() {
 // was off were ignored by the background).
 try {
   chrome.storage.onChanged.addListener((changes) => {
-    if (changes.detectionEnabled && changes.detectionEnabled.newValue && contextValid) {
+    if (changes.detectionEnabled && changes.detectionEnabled.newValue) {
       reportedUrls.clear();
       scheduleScan();
     }

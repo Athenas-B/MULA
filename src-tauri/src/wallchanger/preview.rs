@@ -103,9 +103,7 @@ fn render_wallpaper_preview(
     scaling_mode: &ScalingMode,
     background_color_argb: i32,
 ) -> Result<(i32, i32, String, RgbaImage), String> {
-    let image = image::open(wallpaper_path)
-        .map_err(|e| format!("Failed to open wallpaper for preview: {e}"))?
-        .into_rgba8();
+    let image = open_rgba(wallpaper_path)?;
     let image_width = image.width();
     let image_height = image.height();
 
@@ -120,6 +118,12 @@ fn render_wallpaper_preview(
     };
 
     Ok((image_width as i32, image_height as i32, fit.to_string(), canvas))
+}
+
+/// Decodes an image file to RGBA. `into_rgba8` consumes the decoded original, so a large photo
+/// isn't held in memory twice.
+pub(super) fn open_rgba(path: &str) -> Result<RgbaImage, String> {
+    Ok(image::open(path).map_err(|e| format!("Failed to open image {path}: {e}"))?.into_rgba8())
 }
 
 /// Renders `image` onto a `width` x `height` canvas the way Windows applies `scaling_mode`:

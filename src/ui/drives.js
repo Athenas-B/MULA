@@ -1,7 +1,7 @@
 // Drive Test tab: drive inventory, SMART data and self-tests, and full format.
 
 import { invoke } from "./tauri.js";
-import { errorText, escapeHtml, setCollapsed } from "./dom.js";
+import { errorText, escapeHtml, setCollapsed, setStatus } from "./dom.js";
 
 export const state = {
   drives: [],
@@ -119,10 +119,7 @@ function startFormatTimer(statusEl) {
     const elapsed = Math.floor((Date.now() - start) / 1000);
     const m = Math.floor(elapsed / 60).toString().padStart(2, "0");
     const s = (elapsed % 60).toString().padStart(2, "0");
-    if (statusEl) {
-      statusEl.textContent = `Formatting... (elapsed ${m}:${s}). Do not close the app.`;
-      statusEl.className = "drive-format-status";
-    }
+    setStatus(statusEl, "drive-format-status", `Formatting... (elapsed ${m}:${s}). Do not close the app.`);
   }, 1000);
 }
 
@@ -199,19 +196,13 @@ export async function onRunDriveTest() {
   const types = Array.from(testCheckboxes).map((cb) => cb.value);
 
   if (!id || types.length === 0) {
-    if (testStatus) {
-      testStatus.textContent = "Select at least one test type to run";
-      testStatus.className = "smart-test-status error";
-    }
+    setStatus(testStatus, "smart-test-status", "Select at least one test type to run", "error");
     return;
   }
 
   stopTestProgressPolling();
 
-  if (testStatus) {
-    testStatus.textContent = "Starting tests with administrator privileges...";
-    testStatus.className = "smart-test-status";
-  }
+  setStatus(testStatus, "smart-test-status", "Starting tests with administrator privileges...");
   if (runBtn) runBtn.disabled = true;
 
   const lines = [];
@@ -250,10 +241,7 @@ export async function onRunDriveTest() {
     }
   } catch (err) {
     console.error(err);
-    if (testStatus) {
-      testStatus.textContent = `Error: ${errorText(err)}`;
-      testStatus.className = "smart-test-status error";
-    }
+    setStatus(testStatus, "smart-test-status", `Error: ${errorText(err)}`, "error");
   } finally {
     if (runBtn) runBtn.disabled = false;
   }
@@ -272,10 +260,7 @@ export function formatSelfTestStatus(status) {
 function startTestProgressPolling(id) {
   stopTestProgressPolling();
   const testStatus = document.getElementById("smart-test-status");
-  if (testStatus) {
-    testStatus.textContent = "Monitoring self-test progress...";
-    testStatus.className = "smart-test-status";
-  }
+  setStatus(testStatus, "smart-test-status", "Monitoring self-test progress...");
   pollTestStatus(id);
   state.testPollInterval = setInterval(() => pollTestStatus(id), 10000);
 }
@@ -303,10 +288,7 @@ export async function pollTestStatus(id) {
       header = "Self-test finished";
     }
 
-    if (testStatus) {
-      testStatus.textContent = `${header}\n\n${formatSelfTestStatus(status)}`;
-      testStatus.className = status.failed ? "smart-test-status error" : "smart-test-status";
-    }
+    setStatus(testStatus, "smart-test-status", `${header}\n\n${formatSelfTestStatus(status)}`, status.failed && "error");
 
     if (status.failed) {
       stopTestProgressPolling();
@@ -324,10 +306,7 @@ export async function pollTestStatus(id) {
     }
   } catch (err) {
     console.error(err);
-    if (testStatus) {
-      testStatus.textContent = `Error checking status: ${errorText(err)}`;
-      testStatus.className = "smart-test-status error";
-    }
+    setStatus(testStatus, "smart-test-status", `Error checking status: ${errorText(err)}`, "error");
     stopTestProgressPolling();
   }
 }
@@ -339,28 +318,16 @@ async function onCheckDriveTestStatus() {
   const id = select.value;
   if (!id) return;
 
-  if (testStatus) {
-    testStatus.textContent = "Checking test status with administrator privileges...";
-    testStatus.className = "smart-test-status";
-  }
+  setStatus(testStatus, "smart-test-status", "Checking test status with administrator privileges...");
   if (checkBtn) checkBtn.disabled = true;
 
   try {
     const status = await invokeSmart("get_drive_self_test_status", { id });
-    if (testStatus) {
-      testStatus.textContent = formatSelfTestStatus(status);
-      testStatus.className = status.failed
-        ? "smart-test-status error"
-        : status.in_progress
-          ? "smart-test-status"
-          : "smart-test-status success";
-    }
+    const kind = status.failed ? "error" : status.in_progress ? "" : "success";
+    setStatus(testStatus, "smart-test-status", formatSelfTestStatus(status), kind);
   } catch (err) {
     console.error(err);
-    if (testStatus) {
-      testStatus.textContent = `Error: ${errorText(err)}`;
-      testStatus.className = "smart-test-status error";
-    }
+    setStatus(testStatus, "smart-test-status", `Error: ${errorText(err)}`, "error");
   } finally {
     if (checkBtn) checkBtn.disabled = false;
   }
@@ -397,17 +364,11 @@ export async function onFormatDrive() {
     await loadDrives();
     if (select) select.value = id;
     onDriveSelect();
-    if (formatStatus) {
-      formatStatus.textContent = result;
-      formatStatus.className = "drive-format-status success";
-    }
+    setStatus(formatStatus, "drive-format-status", result, "success");
   } catch (err) {
     stopFormatTimer();
     console.error(err);
-    if (formatStatus) {
-      formatStatus.textContent = `Error: ${errorText(err)}`;
-      formatStatus.className = "drive-format-status error";
-    }
+    setStatus(formatStatus, "drive-format-status", `Error: ${errorText(err)}`, "error");
   } finally {
     if (formatBtn) formatBtn.disabled = !!state.drives.find((d) => d.device_id === id)?.is_system;
   }
@@ -488,12 +449,8 @@ export function onDriveSelect() {
     formatSection.classList.remove("hidden");
     const formatBtn = document.getElementById("drive-format-btn");
     if (formatBtn) formatBtn.disabled = !!drive.is_system;
-    if (formatStatus) {
-      formatStatus.textContent = drive.is_system
-        ? "This disk holds the running Windows installation and cannot be formatted."
-        : "";
-      formatStatus.className = "drive-format-status";
-    }
+    const note = drive.is_system ? "This disk holds the running Windows installation and cannot be formatted." : "";
+    setStatus(formatStatus, "drive-format-status", note);
   }
   if (runBtn) runBtn.disabled = false;
   if (checkBtn) checkBtn.disabled = false;

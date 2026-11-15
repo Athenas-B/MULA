@@ -2,7 +2,7 @@
 // browser extension build.
 
 import { invoke, listen, openDialog, revealItemInDir } from "./tauri.js";
-import { errorText, escapeHtml, setRunningUi } from "./dom.js";
+import { bindSettingCheckbox, errorText, escapeHtml, setRunningUi } from "./dom.js";
 
 export const state = {
   running: false,
@@ -17,7 +17,6 @@ export async function initVsd() {
   document.getElementById("vsd-download-dir").addEventListener("click", changeDownloadDir);
   document.getElementById("vsd-install-chrome").addEventListener("click", () => installExtension("chrome"));
   document.getElementById("vsd-install-firefox").addEventListener("click", () => installExtension("firefox"));
-  document.getElementById("vsd-autostart").addEventListener("change", toggleAutostart);
 
   // The backend pushes server output and running/stopped changes (it also handles autostart).
   listen("vsd-log", (event) => onVsdLogLine(event.payload));
@@ -26,15 +25,8 @@ export async function initVsd() {
   checkVsdStatus();
   loadVsdLogBacklog();
   loadDownloadDir();
-  loadAutostart();
-}
-
-export async function loadAutostart() {
-  try {
-    document.getElementById("vsd-autostart").checked = await invoke("vsd_get_autostart");
-  } catch (e) {
-    console.error("Failed to load autostart setting:", e);
-  }
+  // The backend starts the server at launch when this is set; the box only shows the setting.
+  bindSettingCheckbox(document.getElementById("vsd-autostart"), "vsd_get_autostart", "vsd_set_autostart");
 }
 
 export function onVsdLogLine(line) {
@@ -60,15 +52,6 @@ export async function loadVsdLogBacklog() {
     const pending = state.logPending || [];
     state.logPending = null;
     showVsdLogLines(pending);
-  }
-}
-
-async function toggleAutostart() {
-  const enabled = document.getElementById("vsd-autostart").checked;
-  try {
-    await invoke("vsd_set_autostart", { enabled });
-  } catch (e) {
-    console.error("Failed to save autostart setting:", e);
   }
 }
 
@@ -224,13 +207,13 @@ export function ansiToHtml(text) {
   return html;
 }
 
-// The VSD log is append-only; keep the view bounded (each chunk is ~1 s of output).
+// The VSD log is append-only; keep the view bounded (a chunk is one server line or the backlog).
 export const MAX_LOG_CHUNKS = 500;
 
 export function appendLog(text) {
   const logEl = document.getElementById("vsd-log-content");
   // insertAdjacentHTML appends without re-parsing everything already shown
-  // (`innerHTML +=` re-serializes the whole log on every poll).
+  // (`innerHTML +=` would re-serialize the whole log for every line).
   logEl.insertAdjacentHTML("beforeend", `<span class="vsd-log-chunk">${ansiToHtml(text)}</span>`);
   while (logEl.childElementCount > MAX_LOG_CHUNKS) {
     logEl.firstElementChild.remove();

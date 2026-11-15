@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import {
+  REPO_ROOT,
   EXT_SRC,
   loadScripts,
   plain,
@@ -211,8 +212,8 @@ describe("config.js", () => {
 
 // ── background.js ───────────────────────────────────────────────────────────
 
-function loadBackground({ storage = {}, session = {}, tabs = [], fetch, asyncStorage = false } = {}) {
-  const chrome = createFakeChrome({ storage, session, tabs, asyncStorage });
+function loadBackground({ storage = {}, session = {}, tabs = [], fetch, asyncStorage = false, chrome: sharedChrome } = {}) {
+  const chrome = sharedChrome || createFakeChrome({ storage, session, tabs, asyncStorage });
   const console = createFakeConsole();
   const timers = createFakeTimers();
   const fake = createFakeFetch(fetch || (async () => response(MEDIA_PLAYLIST)));
@@ -954,11 +955,39 @@ describe("background.js message handling", () => {
     assert.deepEqual(bg.streams()[0].metadata, { title: "big" });
   });
 
+  it("unchanged page metadata is not written to session storage again", async () => {
+    const bg = loadBackground();
+    let writes = 0;
+    const set = bg.chrome.storage.session.set;
+    bg.chrome.storage.session.set = (obj, cb) => {
+      writes++;
+      set(obj, cb);
+    };
+    const sender = { tab: { url: "https://site/p" } };
+    await bg.send({ type: "metadata", metadata: { title: "T", tags: ["a"] } }, sender);
+    await bg.send({ type: "metadata", metadata: { title: "T", tags: ["a"] } }, sender);
+    await bg.send({ type: "detected", streams: [], metadata: { title: "T", tags: ["a"] } }, sender);
+    await flush();
+    assert.equal(writes, 1);
+    await bg.send({ type: "metadata", metadata: { title: "T2", tags: ["a"] } }, sender);
+    await flush();
+    assert.equal(writes, 2);
+  });
+
+  it("streams are stored with a real page URL or none", async () => {
+    const bg = loadBackground();
+    await bg.fn.addStream("https://cdn/1.m3u8", "about:blank");
+    await bg.fn.addStream("https://cdn/2.m3u8", "chrome-extension://abc/popup.html");
+    await bg.fn.addStream("https://cdn/3.m3u8", undefined);
+    await bg.fn.addStream("https://cdn/4.m3u8", "https://site/watch");
+    assert.deepEqual(bg.streams().map((s) => s.pageUrl), ["https://site/watch", "", "", ""]);
+  });
+
   it("clearAllData also forgets page metadata", async () => {
     const bg = loadBackground({ session: { pageMetadata: [["https://site/p", { title: "old" }]] } });
     await bg.send({ type: "clearAllData" });
     await flush();
-    assert.equal(bg.chrome.sessionStore.pageMetadata, undefined);
+    assert.deepEqual(plain(bg.chrome.sessionStore.pageMetadata), []);
     await bg.fn.addStream("https://cdn/z.m3u8", "https://site/p");
     assert.equal(bg.streams()[0].metadata, null);
   });
@@ -1042,11 +1071,10 @@ function loadContent({ title = "Page", href = "https://site.example.com/watch/1"
   document.title = title;
   for (const [sel, el] of Object.entries(queries)) document.setQuery(sel, el);
   for (const [sel, list] of Object.entries(queryAll)) document.setQueryAll(sel, list);
+  // Nothing may open a port any more (see content.js); this records any attempt.
   const connects = [];
-  const connect = chrome.runtime.connect;
   chrome.runtime.connect = (info) => {
     connects.push(info);
-    return connect(info);
   };
   const location = { href };
   const globals = {
@@ -1120,9 +1148,8 @@ describe("content.js", () => {
     });
   });
 
-  it("connects the port, sends metadata once on load and observes the DOM instead of polling", () => {
+  it("sends metadata once on load and observes the DOM instead of polling", () => {
     const c = loadContent();
-    assert.equal(c.chrome.port.name, "content");
     assert.equal(c.chrome.sent.length, 1);
     assert.equal(c.chrome.sent[0].type, "metadata");
     assert.equal(c.chrome.sent[0].pageUrl, "https://site.example.com/watch/1");
@@ -1352,6 +1379,20 @@ describe("popup.js helpers", () => {
   it("buildTooltip only lists real page URLs as the comment, like the server", () => {
     assert.equal(p.fn.buildTooltip({ pageUrl: "chrome-extension://abc/popup.html", title: "T" }), "Metadata saved in file:\ntitle: T");
     assert.equal(p.fn.buildTooltip({ pageUrl: "http://site/v" }), "Metadata saved in file:\ncomment: http://site/v");
+  });
+
+  it("buildTooltip lists exactly the metadata keys the server writes", () => {
+    // server.py: METADATA_KEYS = { "requestKey": "ffmpegKey", ... } plus the title.
+    const server = readFileSync(path.join(REPO_ROOT, "modules", "vsd", "server.py"), "utf8");
+    const block = server.match(/^METADATA_KEYS = \{([^}]*)\}/m)[1];
+    const serverKeys = ["title", ...[...block.matchAll(/"\w+": "(\w+)"/g)].map((m) => m[1])];
+    const tooltip = p.fn.buildTooltip({
+      title: "T",
+      pageUrl: "https://site/v",
+      metadata: { channel: "C", categories: ["c"], tags: ["t"], actors: ["a"], uploadDate: "2024" },
+    });
+    const tooltipKeys = tooltip.split("\n").slice(1).map((line) => line.split(":")[0]);
+    assert.deepEqual(tooltipKeys, serverKeys);
   });
 
   it("buildTooltip returns an empty string when there is nothing to show", () => {
@@ -1621,16 +1662,7 @@ describe("popup.js + background.js", () => {
       chrome.runtime.onMessage.fire(msg, {}, () => {});
       return { ok: true };
     };
-    const timers = createFakeTimers();
-    loadScripts([ERRORLOG_JS, CONFIG_JS, BACKGROUND_JS], {
-      chrome,
-      console: createFakeConsole(),
-      URL,
-      AbortController,
-      ...timers.globals,
-      fetch: async () => response({}),
-      addEventListener: () => {},
-    });
+    loadBackground({ chrome, fetch: async () => response({}) });
     const p = loadPopup({ chrome });
     assert.equal(p.items().length, 3);
     p.el.clearSaved.onclick();

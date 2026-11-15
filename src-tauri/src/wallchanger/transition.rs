@@ -14,8 +14,11 @@ use image::{imageops::FilterType, RgbImage};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Workers for blending and encoding frames (each holds a few monitor-sized images).
-const FRAME_WORKERS: usize = 4;
+/// Workers for blending and encoding frames: one per core, up to 8 (each holds one
+/// monitor-sized frame, about 25 MB at 4K).
+fn frame_workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).min(8)
+}
 
 /// One monitor's wallpaper change.
 pub struct WallpaperChange<'a> {
@@ -120,16 +123,23 @@ fn run_fades(changes: &[WallpaperChange], settings: &Settings) -> Result<(), Str
 /// Renders frames 1..=`steps` of every fade into `dir`, all in parallel, and returns each
 /// fade's frame files in order (or why they couldn't be rendered).
 fn render_frames(images: &[FadeImages], steps: usize, dir: &Path) -> Vec<Result<Vec<PathBuf>, String>> {
-    let rendered = parallel_map(images.len() * steps, FRAME_WORKERS, |job| {
+    let mut rendered = parallel_map(images.len() * steps, frame_workers(), |job| {
         let fade = &images[job / steps];
         let step = job % steps + 1;
         let path = dir.join(format!("{}_{step}.jpg", crate::util::safe_file_name(&fade.monitor_id, "")));
-        blend(&fade.from, &fade.to, step as f32 / steps as f32)
-            .save(&path)
-            .map_err(|e| format!("Failed to save transition frame: {e}"))?;
+        let blended;
+        // The last frame is the new image itself.
+        let frame = if step == steps {
+            &fade.to
+        } else {
+            blended = blend(&fade.from, &fade.to, step as f32 / steps as f32);
+            &blended
+        };
+        frame.save(&path).map_err(|e| format!("Failed to save transition frame: {e}"))?;
         Ok(path)
-    });
-    rendered.chunks(steps.max(1)).map(|frames| frames.iter().cloned().collect()).collect()
+    })
+    .into_iter();
+    images.iter().map(|_| rendered.by_ref().take(steps).collect()).collect()
 }
 
 /// Shows frame `i` of every monitor, waits `step`, and so on. A monitor whose frame can't be set
@@ -155,10 +165,7 @@ fn play(frames: &[(String, Vec<PathBuf>)], steps: usize, step: Duration) {
 /// Loads an image and renders it at the monitor's size using the configured Fill/Fit mode, so
 /// the transition frames line up with what Windows shows once the real image is applied.
 fn load_fitted(path: &str, monitor: &Monitor, settings: &Settings) -> Result<RgbImage, String> {
-    // into_rgba8 frees the decoded original instead of keeping it next to the RGBA copy.
-    let img = image::open(path)
-        .map_err(|e| format!("Failed to open image for transition ({path}): {e}"))?
-        .into_rgba8();
+    let img = super::preview::open_rgba(path)?;
 
     let (width, height) = (monitor.width.max(1) as u32, monitor.height.max(1) as u32);
     let background = super::preview::argb_to_rgba(settings.background_color_argb);
@@ -166,19 +173,23 @@ fn load_fitted(path: &str, monitor: &Monitor, settings: &Settings) -> Result<Rgb
     Ok(image::DynamicImage::ImageRgba8(fitted).to_rgb8())
 }
 
+/// Mixes two same-sized images: `alpha` 0 gives `from`, 1 gives `to`.
 fn blend(from: &RgbImage, to: &RgbImage, alpha: f32) -> RgbImage {
+    let weight = (alpha.clamp(0.0, 1.0) * 256.0).round() as u32;
     let (width, height) = from.dimensions();
     let mixed = from
         .as_raw()
         .iter()
         .zip(to.as_raw())
-        .map(|(&a, &b)| lerp(a, b, alpha))
+        .map(|(&a, &b)| lerp(a, b, weight))
         .collect();
     RgbImage::from_raw(width, height, mixed).expect("both frames have the monitor's size")
 }
 
-fn lerp(a: u8, b: u8, alpha: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * alpha).round().clamp(0.0, 255.0) as u8
+/// `a` moved towards `b` by `weight`/256. Integer math: this runs for every byte of every
+/// frame, where per-byte float rounding was ten times slower.
+fn lerp(a: u8, b: u8, weight: u32) -> u8 {
+    ((a as u32 * (256 - weight) + b as u32 * weight + 128) >> 8) as u8
 }
 
 #[cfg(test)]
@@ -187,9 +198,11 @@ mod tests {
 
     #[test]
     fn lerp_interpolates_between_endpoints() {
-        assert_eq!(lerp(0, 100, 0.0), 0);
-        assert_eq!(lerp(0, 100, 1.0), 100);
-        assert_eq!(lerp(0, 100, 0.5), 50);
+        assert_eq!(lerp(0, 100, 0), 0);
+        assert_eq!(lerp(0, 100, 256), 100);
+        assert_eq!(lerp(0, 100, 128), 50);
+        assert_eq!(lerp(255, 255, 77), 255);
+        assert_eq!(lerp(255, 0, 256), 0);
     }
 
     #[test]

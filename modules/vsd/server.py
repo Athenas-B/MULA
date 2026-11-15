@@ -641,7 +641,7 @@ def download():
     page_url = data.get("pageUrl")
     raw_metadata = {
         **(data.get("metadata") or {}),
-        # Only a real page URL becomes the file's comment (not e.g. the extension's 'unknown').
+        # Only a real page URL becomes the file's comment.
         "pageUrl": page_url if isinstance(page_url, str) and _is_http_url(page_url) else "",
     }
 

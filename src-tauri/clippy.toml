@@ -1,0 +1,4 @@
+# Child processes must not open console windows: build them with util::command.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "use util::command (no console window)" },
+]

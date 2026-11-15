@@ -966,7 +966,8 @@ class LoopbackHttpTests(_ServerStateMixin, unittest.TestCase):
         httpd.connections = 0
         httpd.requests = []
         self.httpd = httpd
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        # The default 0.5 s poll interval is how long every shutdown() below would block.
+        threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
         self.base = f"http://127.0.0.1:{httpd.server_address[1]}"

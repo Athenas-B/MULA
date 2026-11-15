@@ -3,7 +3,7 @@
 // `wc-settings-changed` event (e.g. from the tray).
 
 import { invoke, listen, openDialog } from "./tauri.js";
-import { errorText, escapeHtml, setRunningUi } from "./dom.js";
+import { errorText, escapeHtml, setRunningUi, setStatus } from "./dom.js";
 
 export const state = {
   settings: null,
@@ -473,7 +473,5 @@ export function wcRenderMonitorPreview(p) {
 }
 
 export function wcShowMessage(text, kind) {
-  const el = document.getElementById("wc-message");
-  el.textContent = text;
-  el.className = `wallchanger-message${kind ? " " + kind : ""}`;
+  setStatus(document.getElementById("wc-message"), "wallchanger-message", text, kind);
 }
