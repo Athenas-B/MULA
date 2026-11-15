@@ -104,13 +104,16 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   one poll loop updates them and resumes when the service worker starts; every storage
   read-modify-write goes through `updateStore`. webRequest listeners only see `*.m3u*` URLs. The
   popup renders from `storage.onChanged` (no timers); its tooltip lists the same ffmpeg metadata
-  keys as `server.py`'s `METADATA_KEYS`. Detected playlists are verified once and cached; the content script uses a
-  MutationObserver and sends metadata only when it changes. A page URL is an http(s) URL or the empty string everywhere (`vsdHttpUrl` in `config.js`; streams
-  are normalized when stored). Content scripts keep no port open
-  to the background (every tab reconnecting whenever the MV3 worker stopped kept restarting it
-  and re-verifying playlists); page metadata lives in `chrome.storage.session` (memory where
-  unavailable, e.g. Firefox < 115), and a removed/reloaded extension is noticed on the next
-  scan.
+  keys as `server.py`'s `METADATA_KEYS`. Detected playlists are verified once and cached. A page URL is an http(s) URL or the empty
+  string everywhere (`vsdHttpUrl` in `config.js`; streams are normalized when stored).
+  The content script watches the DOM (MutationObserver) for HLS `<video>` sources and reports
+  them with the page's metadata. Streams found through network requests are stored without
+  metadata; the content script of their page sees them in the stored stream list (on load and
+  through `storage.onChanged`) and then sends its metadata once per stream (`metadata` message).
+  Pages without a stream send nothing, so ordinary browsing never wakes the background, and the
+  background keeps no page metadata of its own. Content scripts keep no port open to the
+  background (every tab reconnecting whenever the MV3 worker stopped kept restarting it and
+  re-verifying playlists), and a removed/reloaded extension is noticed on the next scan.
 
 ## Wall Changer Port Status
 

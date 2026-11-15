@@ -55,7 +55,8 @@ function extractMetadata() {
 const SCAN_THROTTLE_MS = 1000;
 
 const reportedUrls = new Set();
-let lastMetadataKey = '';
+// Stored streams this page already sent its metadata for (so a refused answer isn't repeated).
+const answeredStreams = new Set();
 let observer = null;
 let scanTimer = null;
 let contextValid = true;
@@ -64,8 +65,8 @@ let contextValid = true;
 // There is deliberately no long-lived port to the background: every open tab reconnecting
 // whenever the service worker stops would keep restarting it. A reloaded/removed extension is
 // noticed lazily instead, the next time this script wants to send something (`chrome.runtime.id`
-// is gone, or sendMessage throws), and then all work stops. The background keeps what it was
-// told (streams, page metadata) in storage, so nothing has to be re-sent after it restarts.
+// is gone, or sendMessage throws), and then all work stops. Everything the background knows is
+// in storage (the stream list), so nothing has to be re-sent after it restarts.
 
 function stopAll() {
   contextValid = false;
@@ -107,21 +108,24 @@ function sendMessageSafe(msg) {
 
 // ── Detection ───────────────────────────────────────────────────────────────
 
-/** Send page metadata, but only when it (or the page URL) changed since the last send. Returns it. */
-function sendMetadata() {
-  const metadata = extractMetadata();
-  const key = JSON.stringify([location.href, metadata]);
-  if (key !== lastMetadataKey) {
-    lastMetadataKey = key;
-    sendMessageSafe({ type: 'metadata', pageUrl: location.href, metadata });
-  }
-  return metadata;
+/**
+ * Sends this page's metadata when the background has stored a stream for this page that has
+ * none yet (streams found through network requests arrive without). `streams` is the stored
+ * stream list. Pages without such a stream send nothing, so ordinary browsing never wakes the
+ * background.
+ */
+function offerMetadata(streams) {
+  if (!contextValid || !Array.isArray(streams)) return;
+  const pageUrl = location.href;
+  const waiting = streams.filter(s => s && s.pageUrl === pageUrl && !s.metadata && !answeredStreams.has(s.url));
+  if (!waiting.length) return;
+  waiting.forEach(s => answeredStreams.add(s.url));
+  sendMessageSafe({ type: 'metadata', pageUrl, metadata: extractMetadata() });
 }
 
 /** Report HLS <video> sources that were not reported yet. */
 function scan() {
   if (!extensionContextValid()) return;
-  const metadata = sendMetadata();
   const streams = [];
   document.querySelectorAll('video').forEach(v => {
     const src = v.src;
@@ -131,7 +135,7 @@ function scan() {
     }
   });
   if (streams.length) {
-    sendMessageSafe({ type: 'detected', streams, title: document.title || '', metadata });
+    sendMessageSafe({ type: 'detected', streams, title: document.title || '', metadata: extractMetadata() });
   }
 }
 
@@ -144,14 +148,21 @@ function scheduleScan() {
   }, SCAN_THROTTLE_MS);
 }
 
-// Re-report everything when detection is switched back on (reports made while it
-// was off were ignored by the background).
 try {
   chrome.storage.onChanged.addListener((changes) => {
+    // Re-report everything when detection is switched back on (reports made while it was off
+    // were ignored by the background).
     if (changes.detectionEnabled && changes.detectionEnabled.newValue) {
       reportedUrls.clear();
       scheduleScan();
     }
+    if (changes.streams) offerMetadata(changes.streams.newValue);
+  });
+  // A stream may have been stored before this script started (requests made while the page
+  // was still loading).
+  chrome.storage.local.get({ streams: [] }, (data) => {
+    try { void chrome.runtime.lastError; } catch (e) {}
+    offerMetadata(data && data.streams);
   });
 } catch (e) {}
 

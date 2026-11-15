@@ -212,8 +212,8 @@ describe("config.js", () => {
 
 // ── background.js ───────────────────────────────────────────────────────────
 
-function loadBackground({ storage = {}, session = {}, tabs = [], fetch, asyncStorage = false, chrome: sharedChrome } = {}) {
-  const chrome = sharedChrome || createFakeChrome({ storage, session, tabs, asyncStorage });
+function loadBackground({ storage = {}, tabs = [], fetch, asyncStorage = false, chrome: sharedChrome } = {}) {
+  const chrome = sharedChrome || createFakeChrome({ storage, tabs, asyncStorage });
   const console = createFakeConsole();
   const timers = createFakeTimers();
   const fake = createFakeFetch(fetch || (async () => response(MEDIA_PLAYLIST)));
@@ -899,7 +899,7 @@ describe("background.js job polling", () => {
 });
 
 describe("background.js message handling", () => {
-  it("metadata: stores page metadata and backfills existing streams", async () => {
+  it("metadata: fills the page's streams that have none yet", async () => {
     const bg = loadBackground({
       storage: {
         streams: [
@@ -909,69 +909,33 @@ describe("background.js message handling", () => {
         ],
       },
     });
-    const res = await bg.send({ type: "metadata", metadata: { title: "new" } }, { tab: { url: "https://site/p" } });
+    const res = await bg.send({ type: "metadata", pageUrl: "https://site/p", metadata: { title: "new" } }, { tab: { url: "https://site/other" } });
     await flush();
     assert.deepEqual(plain(res), { ok: true });
     assert.deepEqual(bg.streams().map((s) => s.metadata?.title ?? null), ["new", "old", null]);
-    // New streams for the same page pick the metadata up as well.
+  });
+
+  it("metadata: uses the sender's tab when the message names no page, and ignores non-pages", async () => {
+    const bg = loadBackground({ storage: { streams: [{ url: "a.m3u8", pageUrl: "https://site/p" }] } });
+    await bg.send({ type: "metadata", pageUrl: "about:blank", metadata: { title: "no" } }, {});
+    await flush();
+    assert.equal(bg.streams()[0].metadata, undefined);
+    assert.equal(bg.chrome.writes.length, 0);
+
+    await bg.send({ type: "metadata", metadata: { title: "tab" } }, { tab: { url: "https://site/p" } });
+    await flush();
+    assert.deepEqual(bg.streams()[0].metadata, { title: "tab" });
+  });
+
+  it("the background keeps no page metadata of its own", async () => {
+    const bg = loadBackground();
+    await bg.send({ type: "metadata", pageUrl: "https://site/p", metadata: { title: "T" } }, {});
+    await flush();
+    // Nothing is stored for a page without streams, and a later stream starts without metadata
+    // (its page sends it when it sees the stream).
+    assert.equal(bg.chrome.writes.length, 0);
     await bg.fn.addStream("https://cdn/d.m3u8", "https://site/p");
-    assert.deepEqual(bg.streams()[0].metadata, { title: "new" });
-  });
-
-  it("page metadata survives the worker being stopped (session storage)", async () => {
-    const bg = loadBackground();
-    await bg.send({ type: "metadata", metadata: { title: "kept" } }, { tab: { url: "https://site/p" } });
-    await flush();
-    assert.deepEqual(plain(bg.chrome.sessionStore.pageMetadata), [["https://site/p", { title: "kept" }]]);
-
-    // A restarted worker starts from the session copy, so no content script has to re-send it.
-    const restarted = loadBackground({ session: bg.chrome.sessionStore });
-    await restarted.fn.addStream("https://cdn/x.m3u8", "https://site/p");
-    assert.deepEqual(restarted.streams()[0].metadata, { title: "kept" });
-  });
-
-  it("page metadata stays in memory when session storage is unavailable", async () => {
-    const bg = loadBackground();
-    delete bg.chrome.storage.session;
-    await bg.send({ type: "metadata", metadata: { title: "mem" } }, { tab: { url: "https://site/p" } });
-    await flush();
-    await bg.fn.addStream("https://cdn/y.m3u8", "https://site/p");
-    assert.deepEqual(bg.streams()[0].metadata, { title: "mem" });
-  });
-
-  it("a failed session write is reported, and the metadata is still used", async () => {
-    const bg = loadBackground();
-    bg.chrome.storage.session.set = (_obj, cb) => {
-      bg.chrome.runtime.lastError = { message: "QUOTA_BYTES quota exceeded" };
-      cb();
-      bg.chrome.runtime.lastError = undefined;
-    };
-    await bg.send({ type: "metadata", metadata: { title: "big" } }, { tab: { url: "https://site/p" } });
-    await flush();
-    assert.deepEqual(plain(bg.console.calls.map((c) => c.args)), [
-      ["Failed to keep page metadata in session storage:", "QUOTA_BYTES quota exceeded"],
-    ]);
-    await bg.fn.addStream("https://cdn/q.m3u8", "https://site/p");
-    assert.deepEqual(bg.streams()[0].metadata, { title: "big" });
-  });
-
-  it("unchanged page metadata is not written to session storage again", async () => {
-    const bg = loadBackground();
-    let writes = 0;
-    const set = bg.chrome.storage.session.set;
-    bg.chrome.storage.session.set = (obj, cb) => {
-      writes++;
-      set(obj, cb);
-    };
-    const sender = { tab: { url: "https://site/p" } };
-    await bg.send({ type: "metadata", metadata: { title: "T", tags: ["a"] } }, sender);
-    await bg.send({ type: "metadata", metadata: { title: "T", tags: ["a"] } }, sender);
-    await bg.send({ type: "detected", streams: [], metadata: { title: "T", tags: ["a"] } }, sender);
-    await flush();
-    assert.equal(writes, 1);
-    await bg.send({ type: "metadata", metadata: { title: "T2", tags: ["a"] } }, sender);
-    await flush();
-    assert.equal(writes, 2);
+    assert.equal(bg.streams()[0].metadata, null);
   });
 
   it("streams are stored with a real page URL or none", async () => {
@@ -983,13 +947,14 @@ describe("background.js message handling", () => {
     assert.deepEqual(bg.streams().map((s) => s.pageUrl), ["https://site/watch", "", "", ""]);
   });
 
-  it("clearAllData also forgets page metadata", async () => {
-    const bg = loadBackground({ session: { pageMetadata: [["https://site/p", { title: "old" }]] } });
-    await bg.send({ type: "clearAllData" });
+  it("detected: stores the page's metadata with the stream", async () => {
+    const bg = loadBackground();
+    await bg.send(
+      { type: "detected", streams: [{ url: "https://cdn/m.m3u8", type: "hls" }], metadata: { channel: "C" } },
+      { tab: { url: "https://site/v" } }
+    );
     await flush();
-    assert.deepEqual(plain(bg.chrome.sessionStore.pageMetadata), []);
-    await bg.fn.addStream("https://cdn/z.m3u8", "https://site/p");
-    assert.equal(bg.streams()[0].metadata, null);
+    assert.deepEqual(bg.streams()[0].metadata, { channel: "C" });
   });
 
   it("detected: verifies and adds reported streams with the page title", async () => {
@@ -1062,8 +1027,8 @@ describe("background.js message handling", () => {
 
 // ── content.js ──────────────────────────────────────────────────────────────
 
-function loadContent({ title = "Page", href = "https://site.example.com/watch/1", queries = {}, queryAll = {} } = {}) {
-  const chrome = createFakeChrome();
+function loadContent({ title = "Page", href = "https://site.example.com/watch/1", queries = {}, queryAll = {}, storage = {}, chrome: sharedChrome } = {}) {
+  const chrome = sharedChrome || createFakeChrome({ storage });
   const console = createFakeConsole();
   const timers = createFakeTimers();
   const document = createFakeDocument();
@@ -1148,11 +1113,12 @@ describe("content.js", () => {
     });
   });
 
-  it("sends metadata once on load and observes the DOM instead of polling", () => {
+  it("sends nothing on an ordinary page and observes the DOM instead of polling", () => {
     const c = loadContent();
-    assert.equal(c.chrome.sent.length, 1);
-    assert.equal(c.chrome.sent[0].type, "metadata");
-    assert.equal(c.chrome.sent[0].pageUrl, "https://site.example.com/watch/1");
+    c.mutate();
+    c.document.title = "changed";
+    c.mutate();
+    assert.equal(c.chrome.sent.length, 0);
     assert.deepEqual(c.timers.pending(), []);
     assert.equal(c.mo.instances.length, 1);
     const [{ target, options }] = c.mo.instances[0].targets;
@@ -1161,22 +1127,80 @@ describe("content.js", () => {
     assert.equal(options.childList, true);
   });
 
-  it("sends metadata only when it changed", () => {
-    const c = loadContent({ title: "One" });
-    c.mutate();
-    c.mutate();
+  const PAGE = "https://site.example.com/watch/1";
+
+  it("sends its metadata when a stream of this page is stored without any", () => {
+    const c = loadContent({ title: "Watch" });
+    // Streams of other pages, or with metadata, need nothing from this page.
+    c.chrome.storage.local.set({
+      streams: [
+        { url: "o.m3u8", pageUrl: "https://other/" },
+        { url: "m.m3u8", pageUrl: PAGE, metadata: { title: "has" } },
+      ],
+    });
+    assert.equal(c.chrome.sent.length, 0);
+
+    c.chrome.storage.local.set({ streams: [{ url: "a.m3u8", pageUrl: PAGE }] });
+    const [message] = c.ofType("metadata");
+    assert.equal(message.pageUrl, PAGE);
+    assert.equal(message.metadata.title, "Watch");
+
+    // The list changes again (e.g. download progress) before or without the answer landing:
+    // no repeat for the same stream, but a second stream of the page is answered too.
+    c.chrome.storage.local.set({ streams: [{ url: "a.m3u8", pageUrl: PAGE, job: { status: "running" } }] });
     assert.equal(c.ofType("metadata").length, 1);
-    c.document.title = "Two";
-    c.mutate();
+    c.chrome.storage.local.set({ streams: [{ url: "b.m3u8", pageUrl: PAGE }, { url: "a.m3u8", pageUrl: PAGE }] });
     assert.equal(c.ofType("metadata").length, 2);
-    assert.equal(c.ofType("metadata")[1].metadata.title, "Two");
-    c.mutate();
-    assert.equal(c.ofType("metadata").length, 2);
-    // A SPA navigation (new URL, same metadata) is reported as well.
+  });
+
+  it("answers for a stream that was stored before the page finished loading", () => {
+    const c = loadContent({ title: "Early", storage: { streams: [{ url: "a.m3u8", pageUrl: PAGE }] } });
+    const [message] = c.ofType("metadata");
+    assert.equal(message.metadata.title, "Early");
+    assert.equal(c.chrome.sent.length, 1);
+  });
+
+  // The real background and content scripts on one fake browser, wired like the real one:
+  // storage changes reach both, and the page's messages reach the background.
+  function loadBackgroundAndPage({ loadPageFirst }) {
+    const chrome = createFakeChrome({ tabs: [{ id: 7, url: PAGE, title: "Tab title" }] });
+    chrome.onSend = (message) => {
+      chrome.runtime.onMessage.fire(message, { tab: { id: 7, url: PAGE } }, () => {});
+      return { ok: true };
+    };
+    const page = () => loadContent({ chrome, title: "Watch", queries: { ".channel-name": { textContent: "Chan" } } });
+    const bg = loadBackground({ chrome });
+    return { chrome, bg, page: loadPageFirst ? page() : null, loadPage: page };
+  }
+
+  it("a stream found through a network request ends up with its page's metadata", async () => {
+    const { chrome, bg } = loadBackgroundAndPage({ loadPageFirst: true });
+    bg.onBeforeRequest({ url: "https://cdn.example.com/a/index.m3u8", tabId: 7, initiator: "https://site.example.com" });
+    await flush();
+    const [stream] = chrome.store.streams;
+    assert.equal(stream.pageUrl, PAGE);
+    assert.equal(stream.metadata.channel, "Chan");
+    assert.equal(chrome.sent.filter((m) => m.type === "metadata").length, 1, "one message, although storage changed twice");
+  });
+
+  it("also when the request comes before the page's script has started", async () => {
+    const { chrome, bg, loadPage } = loadBackgroundAndPage({ loadPageFirst: false });
+    bg.onBeforeRequest({ url: "https://cdn.example.com/a/index.m3u8", tabId: 7, initiator: "https://site.example.com" });
+    await flush();
+    assert.equal(chrome.store.streams[0].metadata, null);
+
+    loadPage();
+    await flush();
+    assert.equal(chrome.store.streams[0].metadata.channel, "Chan");
+  });
+
+  it("matches streams against the current URL after an in-page navigation", () => {
+    const c = loadContent();
     c.location.href = "https://site.example.com/watch/2";
-    c.mutate();
-    assert.equal(c.ofType("metadata").length, 3);
-    assert.equal(c.ofType("metadata")[2].pageUrl, "https://site.example.com/watch/2");
+    c.chrome.storage.local.set({ streams: [{ url: "a.m3u8", pageUrl: PAGE }] });
+    assert.equal(c.chrome.sent.length, 0);
+    c.chrome.storage.local.set({ streams: [{ url: "b.m3u8", pageUrl: "https://site.example.com/watch/2" }] });
+    assert.equal(c.ofType("metadata")[0].pageUrl, "https://site.example.com/watch/2");
   });
 
   it("throttles mutation-triggered scans", () => {
@@ -1246,16 +1270,14 @@ describe("content.js", () => {
   it("stops all work on the next scan once the extension context is gone", () => {
     const c = loadContent();
     c.chrome.runtime.id = undefined;
-    const before = c.chrome.sent.length;
-    c.document.title = "changed";
     c.mutate();
     assert.equal(c.run("contextValid"), false);
     assert.equal(c.mo.instances[0].disconnected, true);
     assert.deepEqual(c.timers.pending(), []);
     c.fn.scan();
-    c.fn.sendMetadata();
     c.fn.scheduleScan();
-    assert.equal(c.chrome.sent.length, before);
+    c.chrome.storage.local.set({ streams: [{ url: "a.m3u8", pageUrl: PAGE }] });
+    assert.equal(c.chrome.sent.length, 0);
   });
 
   it("treats a throwing chrome.runtime.id as an invalidated context", () => {
@@ -1265,10 +1287,8 @@ describe("content.js", () => {
         throw new Error("Extension context invalidated.");
       },
     });
-    const before = c.chrome.sent.length;
-    c.document.title = "changed";
-    c.fn.sendMetadata();
-    assert.equal(c.chrome.sent.length, before);
+    c.chrome.storage.local.set({ streams: [{ url: "a.m3u8", pageUrl: PAGE }] });
+    assert.equal(c.chrome.sent.length, 0);
     assert.equal(c.run("contextValid"), false);
     assert.equal(c.mo.instances[0].disconnected, true);
   });
