@@ -221,14 +221,6 @@ pub struct ImageCacheEntry {
     pub height: i32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ImageShowStat {
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
-    pub shown_count: i64,
-}
-
 /// State the wallpaper service maintains, stored in `state.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeState {
@@ -236,8 +228,9 @@ pub struct RuntimeState {
     pub next_monitor_change_index: i32,
     #[serde(default)]
     pub queue_states: Vec<QueueState>,
+    /// How often each image was shown, by path (kept for a history view; nothing reads it yet).
     #[serde(default)]
-    pub image_show_stats: Vec<ImageShowStat>,
+    pub show_counts: std::collections::BTreeMap<String, u64>,
 }
 
 fn default_true() -> bool { true }
@@ -252,7 +245,7 @@ fn default_fade_duration() -> i32 { 600 }
 fn default_fade_steps() -> i32 { 12 }
 
 static SETTINGS: JsonStore<Settings> = JsonStore::new("wallchanger/settings.json", JsonFormat::Pretty, normalize);
-/// Compact: the show statistics hold one entry per image shown so far.
+/// Compact: the show counts hold one entry per image shown so far.
 static STATE: JsonStore<RuntimeState> = JsonStore::new("wallchanger/state.json", JsonFormat::Compact, |_| {});
 /// The sizes of the images in the sources, so files aren't opened again on every scan. Kept
 /// apart from the state: it is large (one entry per image) and only changes when files do.

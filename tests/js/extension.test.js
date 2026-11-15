@@ -622,6 +622,16 @@ describe("background.js request interception (onBeforeRequest)", () => {
     assert.equal(bg.fetchCalls.length, 0);
   });
 
+  it("uses the request's own page when the tab shows something that isn't a web page", async () => {
+    const bg = loadBackground({ tabs: [{ id: 7, url: "file:///C:/player.html", title: "Local player" }] });
+    bg.onBeforeRequest({ url: URL_A, tabId: 7, initiator: "https://site.example.com" });
+    await flush();
+    const [s] = bg.streams();
+    assert.equal(s.pageUrl, "https://site.example.com");
+    assert.equal(s.headers.Origin, "https://site.example.com");
+    assert.equal(s.title, "Local player");
+  });
+
   it("ignores non-HLS requests and requests from extension pages", async () => {
     const bg = loadBackground();
     bg.onBeforeRequest({ url: "https://cdn/video.mp4", tabId: -1, initiator: "https://site" });

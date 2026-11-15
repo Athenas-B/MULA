@@ -118,6 +118,10 @@ fn run_fades(changes: &[WallpaperChange], settings: &Settings) -> Result<(), Str
         fades.iter().map(|(change, _)| kept.remove(&change.monitor.id)).collect()
     };
 
+    // What each new image is, noted before it is loaded: if its file is replaced meanwhile,
+    // the record no longer matches the file and the kept frame isn't reused for it.
+    let to_keys: Vec<RenderKey> = fades.iter().map(|(change, _)| RenderKey::new(&change.path, change.monitor, settings)).collect();
+
     // Load both images of every fade in parallel: job 2k is fade k's previous image, 2k+1 its next.
     let mut loaded = parallel_map(fades.len() * 2, IMAGE_WORKERS, |job| {
         let (change, previous) = &fades[job / 2];
@@ -129,9 +133,7 @@ fn run_fades(changes: &[WallpaperChange], settings: &Settings) -> Result<(), Str
     })
     .into_iter();
     let mut images = Vec::new();
-    for (change, _) in &fades {
-        // Taken before the load: if the file changes meanwhile, the record no longer matches it.
-        let to_key = RenderKey::new(&change.path, change.monitor, settings);
+    for ((change, _), to_key) in fades.iter().zip(to_keys) {
         match (loaded.next().expect("two loads per fade"), loaded.next().expect("two loads per fade")) {
             (Ok(from), Ok(to)) => images.push(FadeImages { monitor_id: change.monitor.id.clone(), from, to, to_key }),
             (Err(e), _) | (_, Err(e)) => log::warn!("No fade for monitor {}: {e}", change.monitor.id),

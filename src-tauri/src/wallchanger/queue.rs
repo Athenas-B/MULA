@@ -190,34 +190,74 @@ fn next_sequence_index(queue: &[RankedImage], state: &QueueState) -> usize {
     }
 }
 
-/// The image `choose_from_queue` would pick next in `RotationMode::Sequence`, without changing
-/// `state`. Random rotation has no fixed "next" image.
-pub fn peek_next_sequence_path<'a>(queue: &'a [RankedImage], state: &QueueState) -> Option<&'a str> {
-    (!queue.is_empty()).then(|| queue[next_sequence_index(queue, state)].image.path.as_str())
-}
-
-/// Picks the next image and records it in `state` as the last shown one.
-pub fn choose_from_queue(queue: &[RankedImage], rotation_mode: RotationMode, state: &mut QueueState) -> Option<RankedImage> {
+/// Picks the next image and records it in `state` as the last shown one. Images in `shown`
+/// (what other monitors show) are passed over while the queue has others, and last-resort images
+/// are only picked at random when nothing else exists.
+pub fn choose_from_queue(queue: &[RankedImage], rotation_mode: RotationMode, state: &mut QueueState, shown: &[String]) -> Option<RankedImage> {
     if queue.is_empty() {
         return None;
     }
+    let unshown = |&i: &usize| !shown.contains(&queue[i].image.path);
 
     let index = match rotation_mode {
         RotationMode::Random => {
-            // Last-resort images are only used when nothing else exists.
-            let candidates: Vec<usize> = (0..queue.len()).filter(|&i| !queue[i].last_resort).collect();
-            let mut rng = rand::thread_rng();
-            if candidates.is_empty() {
-                rng.gen_range(0..queue.len())
-            } else {
-                candidates[rng.gen_range(0..candidates.len())]
-            }
+            let regular: Vec<usize> = (0..queue.len()).filter(|&i| !queue[i].last_resort).collect();
+            let pool = if regular.is_empty() { (0..queue.len()).collect() } else { regular };
+            let fresh: Vec<usize> = pool.iter().copied().filter(unshown).collect();
+            let pool = if fresh.is_empty() { pool } else { fresh };
+            pool[rand::thread_rng().gen_range(0..pool.len())]
         }
-        RotationMode::Sequence => next_sequence_index(queue, state),
+        RotationMode::Sequence => {
+            let start = next_sequence_index(queue, state);
+            (0..queue.len()).map(|offset| (start + offset) % queue.len()).find(unshown).unwrap_or(start)
+        }
     };
     state.last_image_path = queue[index].image.path.clone();
     state.last_index = index;
     Some(queue[index].clone())
+}
+
+/// Picks the next image for each monitor in `order`, one after the other, recording the picks
+/// in `runtime`. A monitor never gets an image another monitor shows (the last pick of each
+/// monitor's queue, including the picks just made) while its queue has others; without that,
+/// monitors with identically ordered queues would always show the same picture. A monitor whose
+/// queue is empty picks from a queue of all images. Returns each pick with its queue key.
+pub fn choose_for_monitors(
+    order: &[&Monitor],
+    monitors: &[Monitor],
+    images: &[ImageInfo],
+    queues: &HashMap<String, Vec<RankedImage>>,
+    settings: &Settings,
+    runtime: &mut RuntimeState,
+) -> Result<Vec<(String, String)>, String> {
+    let key_of = |monitor: &Monitor, fallback: bool| get_queue_key(settings, monitors.len(), &monitor.id, fallback);
+    let mut picks: Vec<(String, String)> = Vec::new();
+
+    for &monitor in order {
+        let fallback_queue;
+        let (key, queue): (String, &[RankedImage]) = match queues.get(&key_of(monitor, false)) {
+            Some(queue) if !queue.is_empty() => (key_of(monitor, false), queue),
+            _ => {
+                fallback_queue = rank_images_for_monitor(images, monitor, settings);
+                (key_of(monitor, true), &fallback_queue)
+            }
+        };
+
+        let mut shown: Vec<String> = picks.iter().map(|(_, path)| path.clone()).collect();
+        let current_keys: Vec<String> = monitors.iter().flat_map(|m| [key_of(m, false), key_of(m, true)]).collect();
+        shown.extend(
+            runtime
+                .queue_states
+                .iter()
+                .filter(|s| current_keys.contains(&s.queue_key) && !s.last_image_path.is_empty())
+                .map(|s| s.last_image_path.clone()),
+        );
+
+        let chosen = choose_from_queue(queue, settings.rotation_mode, ensure_queue_state(runtime, &key), &shown)
+            .ok_or_else(|| "No suitable wallpaper found".to_string())?;
+        picks.push((key, chosen.image.path));
+    }
+    Ok(picks)
 }
 
 #[cfg(test)]
@@ -247,7 +287,7 @@ mod tests {
     }
 
     fn pick(queue: &[RankedImage], state: &mut QueueState) -> String {
-        choose_from_queue(queue, RotationMode::Sequence, state).unwrap().image.path
+        choose_from_queue(queue, RotationMode::Sequence, state, &[]).unwrap().image.path
     }
 
     #[test]
@@ -420,7 +460,7 @@ mod tests {
     fn sequence_rotation_continues_after_a_random_pick() {
         let queue = queue_of(&["a.jpg", "b.jpg", "c.jpg"]);
         let mut state = QueueState::default();
-        let random = choose_from_queue(&queue, RotationMode::Random, &mut state).unwrap().image.path;
+        let random = choose_from_queue(&queue, RotationMode::Random, &mut state, &[]).unwrap().image.path;
         assert_eq!(state.last_image_path, random, "every pick is recorded as the last shown image");
 
         let position = queue.iter().position(|r| r.image.path == random).unwrap();
@@ -440,35 +480,87 @@ mod tests {
         let mut state = QueueState::default();
 
         for _ in 0..100 {
-            let picked = choose_from_queue(&queue, RotationMode::Random, &mut state).unwrap();
+            let picked = choose_from_queue(&queue, RotationMode::Random, &mut state, &[]).unwrap();
             assert_ne!(picked.image.path, "tiny.jpg");
         }
 
         let only_tiny = rank_images_for_monitor(&[image("tiny.jpg", 100, 50)], &m, &s);
-        let picked = choose_from_queue(&only_tiny, RotationMode::Random, &mut QueueState::default()).unwrap();
+        let picked = choose_from_queue(&only_tiny, RotationMode::Random, &mut QueueState::default(), &[]).unwrap();
         assert_eq!(picked.image.path, "tiny.jpg", "last resort images are used when nothing else exists");
     }
 
     #[test]
     fn empty_queues_yield_nothing() {
         let mut state = QueueState::default();
-        assert!(choose_from_queue(&[], RotationMode::Sequence, &mut state).is_none());
-        assert!(choose_from_queue(&[], RotationMode::Random, &mut state).is_none());
-        assert!(peek_next_sequence_path(&[], &state).is_none());
+        assert!(choose_from_queue(&[], RotationMode::Sequence, &mut state, &[]).is_none());
+        assert!(choose_from_queue(&[], RotationMode::Random, &mut state, &[]).is_none());
     }
 
     #[test]
-    fn peek_predicts_the_next_sequence_pick_without_advancing() {
-        let all = queue_of(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
-        let mut state = QueueState::default();
-        assert_eq!(peek_next_sequence_path(&all, &state), Some("a.jpg"));
-        pick(&all, &mut state);
-        pick(&all, &mut state);
+    fn images_other_monitors_show_are_passed_over() {
+        let queue = queue_of(&["a.jpg", "b.jpg", "c.jpg"]);
+        let shown = ["a.jpg".to_string(), "b.jpg".to_string()];
 
-        // "b" (the last shown image) was deleted since.
-        let queue = queue_of(&["a.jpg", "c.jpg", "d.jpg"]);
-        let peeked = peek_next_sequence_path(&queue, &state).map(str::to_string);
-        assert_eq!(state.last_image_path, "b.jpg", "peek must not change the state");
-        assert_eq!(peeked.as_deref(), Some(pick(&queue, &mut state).as_str()));
+        let mut state = QueueState::default();
+        assert_eq!(choose_from_queue(&queue, RotationMode::Sequence, &mut state, &shown).unwrap().image.path, "c.jpg");
+        for _ in 0..50 {
+            let random = choose_from_queue(&queue, RotationMode::Random, &mut QueueState::default(), &shown).unwrap();
+            assert_eq!(random.image.path, "c.jpg");
+        }
+
+        // With nothing else left, a shown image is better than none.
+        let all: Vec<String> = ["a.jpg", "b.jpg", "c.jpg"].map(String::from).to_vec();
+        let mut state = QueueState::default();
+        assert_eq!(choose_from_queue(&queue, RotationMode::Sequence, &mut state, &all).unwrap().image.path, "a.jpg");
+        assert!(choose_from_queue(&queue, RotationMode::Random, &mut state, &all).is_some());
+    }
+
+    /// Two same-sized monitors with their own queues of all images, in Sequence mode.
+    fn twin_monitors() -> (Vec<Monitor>, Vec<ImageInfo>, Settings) {
+        let monitors = vec![monitor("A", 100, 100), monitor("B", 100, 100)];
+        let images: Vec<ImageInfo> = ["a", "b", "c", "d", "e", "f"].iter().map(|n| image(&format!("{n}.jpg"), 100, 100)).collect();
+        let mut s = settings();
+        s.rotation_mode = RotationMode::Sequence;
+        (monitors, images, s)
+    }
+
+    fn picked(picks: Vec<(String, String)>) -> Vec<String> {
+        picks.into_iter().map(|(_, path)| path).collect()
+    }
+
+    #[test]
+    fn monitors_with_the_same_queue_never_show_the_same_image() {
+        let (monitors, images, s) = twin_monitors();
+        let queues = build_queues(&images, &monitors, &s);
+        let order: Vec<&Monitor> = monitors.iter().collect();
+        let mut runtime = RuntimeState::default();
+
+        let rounds: Vec<Vec<String>> =
+            (0..3).map(|_| picked(choose_for_monitors(&order, &monitors, &images, &queues, &s, &mut runtime).unwrap())).collect();
+        assert_eq!(rounds, [["a.jpg", "b.jpg"], ["c.jpg", "d.jpg"], ["e.jpg", "f.jpg"]]);
+
+        // Changing one monitor at a time: the monitor that keeps its image is respected too.
+        let mut runtime = RuntimeState::default();
+        let turns: Vec<String> = (0..4)
+            .flat_map(|turn| picked(choose_for_monitors(&[&monitors[turn % 2]], &monitors, &images, &queues, &s, &mut runtime).unwrap()))
+            .collect();
+        assert_eq!(turns, ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+    }
+
+    #[test]
+    fn monitors_on_a_shared_queue_get_consecutive_images_and_empty_queues_fall_back() {
+        let (monitors, images, mut s) = twin_monitors();
+        s.use_separate_monitor_queues = false;
+        let queues = build_queues(&images, &monitors, &s);
+        let order: Vec<&Monitor> = monitors.iter().collect();
+        let mut runtime = RuntimeState::default();
+        let picks = choose_for_monitors(&order, &monitors, &images, &queues, &s, &mut runtime).unwrap();
+        assert_eq!(picks, [("shared".to_string(), "a.jpg".to_string()), ("shared".to_string(), "b.jpg".to_string())]);
+
+        // No queue for a monitor: it picks from all images under its fallback key.
+        let (monitors, images, s) = twin_monitors();
+        let picks = choose_for_monitors(&[&monitors[0]], &monitors, &images, &HashMap::new(), &s, &mut RuntimeState::default()).unwrap();
+        assert_eq!(picks, [("fallback:A".to_string(), "a.jpg".to_string())]);
+        assert!(choose_for_monitors(&[&monitors[0]], &monitors, &[], &HashMap::new(), &s, &mut RuntimeState::default()).is_err());
     }
 }

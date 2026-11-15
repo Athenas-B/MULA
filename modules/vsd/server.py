@@ -639,8 +639,11 @@ def download():
     title = data.get("title", "")
     headers = data.get("headers")
     page_url = data.get("pageUrl")
+    metadata = data.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return jsonify({"error": "'metadata' must be an object"}), 400
     raw_metadata = {
-        **(data.get("metadata") or {}),
+        **metadata,
         # Only a real page URL becomes the file's comment.
         "pageUrl": page_url if isinstance(page_url, str) and _is_http_url(page_url) else "",
     }

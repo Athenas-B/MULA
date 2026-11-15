@@ -29,7 +29,11 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   stats, next monitor — `state.json`, written by `service::apply` via `save_state`). The image
   size cache has its own `image_cache.json`: every scan goes through `images::load_images_cached`,
   which only writes the file when the scan changed it. Queues are rebuilt from the sources each
-  time; a `QueueState` only remembers the last shown image and where it was. The
+  time; a `QueueState` only remembers the last shown image and where it was. All picking goes
+  through `queue::choose_for_monitors` (the service, and the preview's "Next" on a copy of the
+  state): a monitor never gets an image another monitor shows while its queue has others, so
+  monitors with identically ordered queues don't mirror each other. Show counts are a
+  path → count map (`show_counts`). The
   service on/off flag has its own `service.json` (`service_running` / `set_service_running`). Sources are typed: `Source { path, enabled, level,
   kind }` with `SourceKind::Folder { include_subfolders }` / `SourceKind::Wallhaven { page_limit,
   purity: Purity { sfw, sketchy, nsfw } }` (serialized with a `"kind"` tag). Unreadable files
@@ -127,7 +131,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Wallhaven URL sources | Done | Accepts `https://wallhaven.cc/search?...` or `/api/v1/search` URLs; per-source page limit (0 = unlimited) and SFW/Sketchy/NSFW purity toggles; API key support for NSFW. Cached under `%APPDATA%\mula\wallchanger\wallhaven`. |
 | Monitor detection | Done | Uses `IDesktopWallpaper`; skips monitors whose `GetMonitorRECT` fails. |
 | Monitor preview block | Done | Shows each monitor frame and how the current Windows wallpaper is fitted (Fill / FitInsideScreen); thumbnails are reused while file, monitor and fit settings are unchanged. |
-| Image dimension caching | Done | Cached in `image_cache.json` with size + mtime. Files that open but don't decode (wrong content, cut off, empty) are cached as 0×0; files that can't be opened right now are retried. |
+| Image dimension caching | Done | Cached in `image_cache.json` with size + mtime. Files whose content doesn't decode (wrong content, cut off, empty) are cached as 0×0; files that can't be opened or read right now (locked, cloud file not downloaded, share dropped) are retried. |
 | Shared / per-monitor queues | Done | Separate queues, exclusive queue membership, fallback queues. |
 | Rotation modes | Done | Random and Sequence. Sequence shows the image after the last shown one in the current queue (remembered across restarts), so added images are reached in turn; if the last shown image is gone, it continues with the one now in its place. |
 | Scaling modes | Done | Fill and FitInsideScreen with configurable background color. |
@@ -151,7 +155,7 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Wallpaper-change notifications | Setting only | `show_wallpaper_change_notifications` exists in `Settings` but is never fired. |
 | Change wallpaper on startup | Setting only | `change_on_start` exists but is not acted on. |
 | Random source order | Setting only | `use_random_source_order` exists but is not implemented. |
-| Image show history / stats | Partial | `image_show_stats` is tracked in `service.rs`, but no UI exposes it. |
+| Image show history / stats | Partial | `show_counts` (path → count in `state.json`) is tracked in `service.rs`, but no UI exposes it. |
 | Wallhaven cache management | Partial | Images are cached and skipped if present, but there is no explicit “clear / re-download all” UI. |
 | Multi-tab settings dialog | N/A | Replaced by single Wall Changer tab by design. |
 | Standalone process | N/A | Integrated into MULA by design. |
@@ -271,7 +275,7 @@ Recorded so they aren't re-investigated without new facts.
 1. **Wallpaper-change notifications** — wire `show_wallpaper_change_notifications` to a Windows toast / Tauri notification.
 2. **Change on start** — read `change_on_start` on app startup and trigger one wallpaper apply.
 3. **Random source order** — implement `use_random_source_order` when building the image pool.
-4. **Image show history UI** — expose `image_show_stats` in the Wall Changer tab.
+4. **Image show history UI** — expose `show_counts` in the Wall Changer tab.
 5. **Wallhaven cache management UI** — add a “Clear Wallhaven cache” / “Re-download” button.
 6. **Manual verification still needed** (cannot be covered by unit tests): the real UAC flow of
    the smartctl helper and of Format (on a spare drive), smartctl's JSON on real ATA/NVMe drives,

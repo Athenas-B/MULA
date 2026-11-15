@@ -157,11 +157,26 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
             .collect()
     };
 
+    // What Sequence mode shows next depends on what the other monitors show by then, so run the
+    // real picker on a copy of the state, in the order the interval service changes the monitors.
+    let mut next: std::collections::HashMap<String, String> = Default::default();
+    if settings.rotation_mode == settings::RotationMode::Sequence && !monitors.is_empty() {
+        let first = match settings.change_one_monitor_per_interval {
+            true => runtime.next_monitor_change_index.max(0) as usize % monitors.len(),
+            false => 0,
+        };
+        let order: Vec<&Monitor> = monitors[first..].iter().chain(&monitors[..first]).collect();
+        let picks = queue::choose_for_monitors(&order, &monitors, &images, &queues, &settings, &mut runtime.clone());
+        for (key, path) in picks.unwrap_or_default() {
+            next.entry(key).or_insert(path);
+        }
+    }
+
     Ok(labelled
         .into_iter()
         .filter_map(|(key, label)| {
             let queue = queues.get(&key)?;
-            Some(build_queue_preview(&runtime, settings.rotation_mode, &key, label, queue))
+            Some(build_queue_preview(&runtime, settings.rotation_mode, &key, label, queue, next.get(&key).map(String::as_str)))
         })
         .collect())
 }
@@ -172,15 +187,9 @@ fn build_queue_preview(
     key: &str,
     label: String,
     queue: &[queue::RankedImage],
+    next_path: Option<&str>,
 ) -> QueuePreview {
-    // A queue nothing was shown from yet has no remembered place.
-    let unused = settings::QueueState::default();
-    let state = runtime.queue_states.iter().find(|s| s.queue_key == key).unwrap_or(&unused);
-    let next_path = match rotation_mode {
-        settings::RotationMode::Sequence => queue::peek_next_sequence_path(queue, state),
-        settings::RotationMode::Random => None,
-    };
-    let last_shown = Some(state.last_image_path.as_str()).filter(|p| !p.is_empty());
+    let last_shown = runtime.queue_states.iter().find(|s| s.queue_key == key).map(|s| s.last_image_path.as_str()).filter(|p| !p.is_empty());
 
     let images = queue
         .iter()

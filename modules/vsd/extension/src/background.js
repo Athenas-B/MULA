@@ -308,7 +308,7 @@ function handleRequest(details) {
         detectStreamSafe(details.url, fallbackPageUrl, 'hls', '', makePageHeaders(fallbackPageUrl));
         return;
       }
-      const pageUrl = tab.url || fallbackPageUrl;
+      const pageUrl = vsdHttpUrl(tab.url) || fallbackPageUrl;
       detectStreamSafe(details.url, pageUrl, 'hls', tab.title || '', makePageHeaders(pageUrl));
     });
   } else {

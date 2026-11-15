@@ -1,7 +1,7 @@
 use super::images::{is_eligible_source, load_images_cached, NetworkPolicy};
 use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, try_disable_windows_slideshow};
 use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
-use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor, RankedImage};
+use super::queue::{build_queues, choose_for_monitors};
 use super::transition::{apply_wallpapers, WallpaperChange};
 use super::settings::{self, RuntimeState, Settings};
 use crate::util::{lock, parallel_map, IMAGE_WORKERS};
@@ -177,26 +177,12 @@ fn apply_with(settings: &Settings, runtime: &mut RuntimeState, change_one_monito
         runtime.next_monitor_change_index = idx;
     }
 
-    let rotation_mode = settings.rotation_mode;
     // Pick every monitor's image first (this advances the queues), then prepare and set them
     // all together.
-    let mut applied = Vec::new();
-    for &monitor in &targets {
-        let key = get_queue_key(settings, monitors.len(), &monitor.id, false);
-        let fallback_queue;
-        let (queue, fallback): (&[RankedImage], bool) = match queues.get(&key) {
-            Some(queue) if !queue.is_empty() => (queue, false),
-            _ => {
-                fallback_queue = rank_images_for_monitor(&images, monitor, settings);
-                (&fallback_queue, true)
-            }
-        };
-
-        let fallback_key = get_queue_key(settings, monitors.len(), &monitor.id, fallback);
-        let selected = choose_from_queue(queue, rotation_mode, ensure_queue_state(runtime, &fallback_key))
-            .ok_or_else(|| "No suitable wallpaper found".to_string())?;
-        applied.push(selected.image.path);
-    }
+    let applied: Vec<String> = choose_for_monitors(&targets, &monitors, &images, &queues, settings, runtime)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
 
     // Overlay renders are independent; each distinct image is rendered once (two monitors may
     // show the same one, and its render is cached under one file name).
@@ -261,14 +247,7 @@ fn handle_windows_slideshow_conflict(settings: &Settings) {
 }
 
 fn record_image_shown(runtime: &mut RuntimeState, path: &str) {
-    if let Some(stat) = runtime.image_show_stats.iter_mut().find(|s| s.path == path) {
-        stat.shown_count += 1;
-    } else {
-        runtime.image_show_stats.push(super::settings::ImageShowStat {
-            path: path.to_string(),
-            shown_count: 1,
-        });
-    }
+    *runtime.show_counts.entry(path.to_string()).or_insert(0) += 1;
 }
 
 #[cfg(test)]
@@ -344,9 +323,9 @@ mod tests {
         record_image_shown(&mut s, "a.jpg");
         record_image_shown(&mut s, "b.jpg");
         record_image_shown(&mut s, "a.jpg");
-        let count = |p: &str| s.image_show_stats.iter().find(|x| x.path == p).map(|x| x.shown_count);
-        assert_eq!(count("a.jpg"), Some(2));
-        assert_eq!(count("b.jpg"), Some(1));
-        assert_eq!(s.image_show_stats.len(), 2);
+        assert_eq!(s.show_counts.get("a.jpg"), Some(&2));
+        assert_eq!(s.show_counts.get("b.jpg"), Some(&1));
+        assert_eq!(s.show_counts.len(), 2);
+        assert_eq!(serde_json::to_value(&s.show_counts).unwrap(), serde_json::json!({ "a.jpg": 2, "b.jpg": 1 }));
     }
 }

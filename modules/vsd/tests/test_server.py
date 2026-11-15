@@ -1434,6 +1434,24 @@ class DownloadEndpointTests(_ClientMixin, unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class DownloadMetadataTests(_ClientMixin, unittest.TestCase):
+    def test_metadata_must_be_an_object(self):
+        for metadata in (["a"], "text", 5):
+            with self.subTest(metadata=metadata):
+                r = self.client.post("/download", json={"url": "https://cdn/x.m3u8", "metadata": metadata},
+                                     headers={"Origin": EXT_ORIGIN})
+                self.assertEqual(r.status_code, 400)
+                self.assertEqual(r.get_json(), {"error": "'metadata' must be an object"})
+        self.thread_cls.assert_not_called()
+        self.assertEqual(server._jobs, {})
+
+    def test_missing_or_null_metadata_is_fine(self):
+        for body in ({"url": "https://cdn/x.m3u8"}, {"url": "https://cdn/x.m3u8", "metadata": None}):
+            with self.subTest(body=body):
+                r = self.client.post("/download", json=body, headers={"Origin": EXT_ORIGIN})
+                self.assertEqual(r.status_code, 200)
+
+
 class DownloadPageUrlTests(_ClientMixin, unittest.TestCase):
     def test_only_real_page_urls_become_the_comment(self):
         cases = [

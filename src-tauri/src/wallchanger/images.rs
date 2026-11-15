@@ -73,19 +73,22 @@ fn list_dir(dir: &Path) -> Vec<(PathBuf, fs::Metadata)> {
         .unwrap_or_default()
 }
 
-/// The image's dimensions; (0, 0) when the file opens but isn't a decodable image (wrong
-/// content, cut off, empty: cached, so it isn't decoded again), or None when it can't be opened
-/// right now (e.g. locked by another program), so it is retried on the next pass.
+/// The image's dimensions; (0, 0) when the file's content isn't a decodable image (wrong
+/// content, cut off, empty: cached, so it isn't decoded again), or None when the file can't be
+/// read right now (locked by another program, a cloud file that isn't downloaded, a network
+/// share that dropped), so it is retried on the next pass.
 fn read_image_dimensions(path: &str) -> Option<(i32, i32)> {
-    let reader = match image::ImageReader::open(path) {
-        Ok(reader) => reader,
-        Err(e) => {
-            log::warn!("Can't open {path} right now: {e}");
-            return None;
-        }
-    };
-    match reader.with_guessed_format().map_err(image::ImageError::IoError).and_then(|r| r.into_dimensions()) {
+    let dimensions = image::ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(image::ImageError::IoError)
+        .and_then(|reader| reader.into_dimensions());
+    match dimensions {
         Ok((w, h)) => Some((w as i32, h as i32)),
+        // Running out of bytes is about the content; every other I/O error is about access.
+        Err(image::ImageError::IoError(e)) if e.kind() != std::io::ErrorKind::UnexpectedEof => {
+            log::warn!("Can't read {path} right now: {e}");
+            None
+        }
         Err(e) => {
             log::warn!("Not a usable image: {path}: {e}");
             Some((0, 0))
@@ -346,6 +349,16 @@ mod tests {
 
         let images = load(&s, &mut cache).unwrap();
         assert_eq!((images[0].width, images[0].height), (12, 6));
+
+        // The file opens but can't be read (here: another handle holds a lock on its bytes, like
+        // a cloud file that can't be downloaded): also not a statement about its content.
+        let locked = std::fs::File::open(&file).unwrap();
+        locked.lock().unwrap();
+        cache.clear();
+        assert!(load(&s, &mut cache).unwrap().is_empty());
+        assert!(cache.is_empty(), "a read failure must not be cached as 'not an image'");
+        locked.unlock().unwrap();
+        assert_eq!(load(&s, &mut cache).unwrap().len(), 1);
     }
 
     #[test]

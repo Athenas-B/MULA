@@ -579,12 +579,16 @@ mod tests {
     #[test]
     fn helper_exits_when_its_parent_does() {
         let exe = where_exe();
-        // A stand-in parent that lives for about two seconds.
-        let mut parent = crate::util::command("ping").args(["-n", "3", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
-        let helper = start_helper_for(&exe, false, parent.id()).expect("helper should start");
-        assert!(send_command(&helper, &["--scan"], false, Duration::from_secs(30)).unwrap().ok);
-
+        // A stand-in parent that lives until this test ends it (however long the helper takes
+        // to start).
+        let mut parent = crate::util::command("ping").args(["-n", "120", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
+        let helper = start_helper_for(&exe, false, parent.id());
+        let answered = helper.as_ref().ok().map(|h| send_command(h, &["--scan"], false, Duration::from_secs(30)));
+        parent.kill().unwrap();
         parent.wait().unwrap();
+        let helper = helper.expect("helper should start");
+        assert!(answered.expect("helper started").unwrap().ok);
+
         // The exit event ends the helper at once, so nobody answers any more.
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(
