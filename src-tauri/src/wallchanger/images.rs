@@ -124,10 +124,21 @@ fn source_files(source: &Source, settings: &Settings, network: NetworkPolicy) ->
     }
 }
 
+/// Collects every image of the eligible sources, using and updating the stored image size
+/// cache (see [`load_images`]).
+pub fn load_images_cached(settings: &Settings, network: NetworkPolicy) -> Result<Vec<ImageInfo>, String> {
+    let mut cache = super::settings::load_image_cache()?;
+    let images = load_images(settings, &mut cache, network)?;
+    if let Err(e) = super::settings::save_image_cache(&cache) {
+        log::warn!("Failed to save the image size cache: {e}");
+    }
+    Ok(images)
+}
+
 /// Collects every image of the eligible sources, using and refreshing the dimension `cache`.
 /// A source that fails (folder can't be expanded, Wallhaven unreachable, ...) is skipped with a
 /// warning; only when no source produced any image is the error returned.
-pub fn load_images(
+fn load_images(
     settings: &Settings,
     cache: &mut Vec<ImageCacheEntry>,
     network: NetworkPolicy,

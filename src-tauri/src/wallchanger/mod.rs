@@ -138,14 +138,9 @@ pub async fn wc_get_monitor_preview() -> CmdResult<Vec<preview::MonitorPreview>>
 
 fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
     let settings = settings::load()?;
-    let mut runtime = settings::load_state()?;
+    let runtime = settings::load_state()?;
     // The preview must stay cheap: only use Wallhaven images that are already downloaded.
-    let images = images::load_images(&settings, &mut runtime.image_cache_entries, images::NetworkPolicy::CacheOnly)?;
-    // Keep any image sizes this had to read, or every preview would read them again until the
-    // next wallpaper change saves the state.
-    if let Err(e) = settings::save_image_cache(&runtime.image_cache_entries) {
-        log::warn!("Failed to save the image size cache: {e}");
-    }
+    let images = images::load_images_cached(&settings, images::NetworkPolicy::CacheOnly)?;
     let monitors = monitors::get_monitors().unwrap_or_default();
     let queues = queue::build_queues(&images, &monitors, &settings);
 
@@ -166,19 +161,21 @@ fn build_queue_previews() -> Result<Vec<QueuePreview>, String> {
         .into_iter()
         .filter_map(|(key, label)| {
             let queue = queues.get(&key)?;
-            Some(build_queue_preview(&mut runtime, settings.rotation_mode, &key, label, queue))
+            Some(build_queue_preview(&runtime, settings.rotation_mode, &key, label, queue))
         })
         .collect())
 }
 
 fn build_queue_preview(
-    runtime: &mut settings::RuntimeState,
+    runtime: &settings::RuntimeState,
     rotation_mode: settings::RotationMode,
     key: &str,
     label: String,
     queue: &[queue::RankedImage],
 ) -> QueuePreview {
-    let state = queue::ensure_queue_state(runtime, key, queue);
+    // A queue nothing was shown from yet has no remembered place.
+    let unused = settings::QueueState::default();
+    let state = runtime.queue_states.iter().find(|s| s.queue_key == key).unwrap_or(&unused);
     let next_path = match rotation_mode {
         settings::RotationMode::Sequence => queue::peek_next_sequence_path(queue, state),
         settings::RotationMode::Random => None,
@@ -195,7 +192,7 @@ fn build_queue_preview(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| ranked.image.path.clone()),
             last_resort: ranked.last_resort,
-            is_next: next_path.as_deref() == Some(ranked.image.path.as_str()),
+            is_next: next_path == Some(ranked.image.path.as_str()),
             is_last_shown: last_shown == Some(ranked.image.path.as_str()),
         })
         .collect();

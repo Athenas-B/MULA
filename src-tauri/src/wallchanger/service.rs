@@ -1,4 +1,4 @@
-use super::images::{is_eligible_source, load_images, NetworkPolicy};
+use super::images::{is_eligible_source, load_images_cached, NetworkPolicy};
 use super::monitors::{apply_display_settings, get_monitors, is_windows_slideshow_enabled, try_disable_windows_slideshow};
 use super::overlay::{cleanup_rendered_cache, resolve_wallpaper_path};
 use super::queue::{build_queues, choose_from_queue, ensure_queue_state, get_queue_key, rank_images_for_monitor, RankedImage};
@@ -157,7 +157,7 @@ fn apply_with(settings: &Settings, runtime: &mut RuntimeState, change_one_monito
         return Err("No eligible wallpaper sources found".to_string());
     }
 
-    let images = load_images(settings, &mut runtime.image_cache_entries, NetworkPolicy::RefreshWhenStale)?;
+    let images = load_images_cached(settings, NetworkPolicy::RefreshWhenStale)?;
     if images.is_empty() {
         return Err("No wallpaper images found in enabled sources".to_string());
     }
@@ -193,15 +193,9 @@ fn apply_with(settings: &Settings, runtime: &mut RuntimeState, change_one_monito
         };
 
         let fallback_key = get_queue_key(settings, monitors.len(), &monitor.id, fallback);
-        let selected = {
-            let state = ensure_queue_state(runtime, &fallback_key, queue);
-            let chosen = choose_from_queue(queue, rotation_mode, state)
-                .ok_or_else(|| "No suitable wallpaper found".to_string())?;
-            state.last_image_path = chosen.image.path.clone();
-            chosen
-        };
-
-        applied.push(selected.image.path.clone());
+        let selected = choose_from_queue(queue, rotation_mode, ensure_queue_state(runtime, &fallback_key))
+            .ok_or_else(|| "No suitable wallpaper found".to_string())?;
+        applied.push(selected.image.path);
     }
 
     // Overlay renders are independent; each distinct image is rendered once (two monitors may

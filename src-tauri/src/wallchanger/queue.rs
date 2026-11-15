@@ -3,7 +3,7 @@ use super::monitors::Monitor;
 use super::settings::{PictureSizeHandling, QueueState, RotationMode, RuntimeState, Settings};
 use rand::Rng;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct RankedImage {
@@ -165,78 +165,59 @@ fn rank_sort(a: &RankedImage, b: &RankedImage) -> std::cmp::Ordering {
         .then(a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
 }
 
-pub fn ensure_queue_state<'a>(
-    runtime: &'a mut RuntimeState,
-    queue_key: &str,
-    queue: &[RankedImage],
-) -> &'a mut QueueState {
-    if let Some(pos) = runtime.queue_states.iter().position(|s| s.queue_key == queue_key) {
-        return &mut runtime.queue_states[pos];
-    }
-
-    let paths: Vec<String> = queue.iter().map(|r| r.image.path.clone()).collect();
-    let state = QueueState {
-        queue_key: queue_key.to_string(),
-        ordered_image_paths: paths,
-        ..Default::default()
+/// The remembered place in the queue `queue_key`, created on first use.
+pub fn ensure_queue_state<'a>(runtime: &'a mut RuntimeState, queue_key: &str) -> &'a mut QueueState {
+    let pos = match runtime.queue_states.iter().position(|s| s.queue_key == queue_key) {
+        Some(pos) => pos,
+        None => {
+            runtime.queue_states.push(QueueState { queue_key: queue_key.to_string(), ..Default::default() });
+            runtime.queue_states.len() - 1
+        }
     };
-    runtime.queue_states.push(state);
-    runtime.queue_states.last_mut().unwrap()
+    &mut runtime.queue_states[pos]
 }
 
-/// Returns the image path that `choose_from_queue` would pick next for `RotationMode::Sequence`,
-/// without mutating `state`. Random rotation has no fixed "next" image, so this only applies to
-/// Sequence mode; callers should treat a `None` result for Random mode as "picked at random".
-pub fn peek_next_sequence_path(queue: &[RankedImage], state: &QueueState) -> Option<String> {
-    if queue.is_empty() || state.ordered_image_paths.is_empty() {
-        return None;
+/// Index of the image `RotationMode::Sequence` shows next in a non-empty `queue`: the one after
+/// the image shown last, or, when that image is no longer in the queue, the one now in its place.
+/// Images added since simply take their ranked position and are reached in turn.
+fn next_sequence_index(queue: &[RankedImage], state: &QueueState) -> usize {
+    if state.last_image_path.is_empty() {
+        return 0;
     }
-
-    let available: HashSet<&String> = queue.iter().map(|r| &r.image.path).collect();
-    let ordered: Vec<&String> = state
-        .ordered_image_paths
-        .iter()
-        .filter(|p| available.contains(p))
-        .collect();
-
-    if ordered.is_empty() {
-        return None;
+    match queue.iter().position(|r| r.image.path == state.last_image_path) {
+        Some(pos) => (pos + 1) % queue.len(),
+        None => state.last_index % queue.len(),
     }
-
-    let idx = (state.next_index as usize) % ordered.len();
-    Some(ordered[idx].clone())
 }
 
+/// The image `choose_from_queue` would pick next in `RotationMode::Sequence`, without changing
+/// `state`. Random rotation has no fixed "next" image.
+pub fn peek_next_sequence_path<'a>(queue: &'a [RankedImage], state: &QueueState) -> Option<&'a str> {
+    (!queue.is_empty()).then(|| queue[next_sequence_index(queue, state)].image.path.as_str())
+}
+
+/// Picks the next image and records it in `state` as the last shown one.
 pub fn choose_from_queue(queue: &[RankedImage], rotation_mode: RotationMode, state: &mut QueueState) -> Option<RankedImage> {
     if queue.is_empty() {
         return None;
     }
 
-    // Rebuild ordered paths if missing or mismatched; otherwise drop missing paths but keep order.
-    let available: HashSet<&str> = queue.iter().map(|r| r.image.path.as_str()).collect();
-    if !state.ordered_image_paths.iter().any(|p| available.contains(p.as_str())) {
-        state.ordered_image_paths = queue.iter().map(|r| r.image.path.clone()).collect();
-        state.next_index = 0;
-    } else {
-        state.ordered_image_paths.retain(|p| available.contains(p.as_str()));
-    }
-
-    match rotation_mode {
+    let index = match rotation_mode {
         RotationMode::Random => {
-            let candidates: Vec<&RankedImage> = queue.iter().filter(|r| !r.last_resort).collect();
-            let pool = if candidates.is_empty() { queue.iter().collect() } else { candidates };
-            let index = rand::thread_rng().gen_range(0..pool.len());
-            Some(pool[index].clone())
-        }
-        RotationMode::Sequence => {
-            if state.next_index >= state.ordered_image_paths.len() as i32 {
-                state.next_index = 0;
+            // Last-resort images are only used when nothing else exists.
+            let candidates: Vec<usize> = (0..queue.len()).filter(|&i| !queue[i].last_resort).collect();
+            let mut rng = rand::thread_rng();
+            if candidates.is_empty() {
+                rng.gen_range(0..queue.len())
+            } else {
+                candidates[rng.gen_range(0..candidates.len())]
             }
-            let path = state.ordered_image_paths[state.next_index as usize].clone();
-            state.next_index += 1;
-            queue.iter().find(|r| r.image.path == path).cloned()
         }
-    }
+        RotationMode::Sequence => next_sequence_index(queue, state),
+    };
+    state.last_image_path = queue[index].image.path.clone();
+    state.last_index = index;
+    Some(queue[index].clone())
 }
 
 #[cfg(test)]
@@ -259,8 +240,14 @@ mod tests {
         queue.iter().map(|r| r.image.path.as_str()).collect()
     }
 
-    fn sequence_state(queue: &[RankedImage]) -> QueueState {
-        QueueState { ordered_image_paths: queue.iter().map(|r| r.image.path.clone()).collect(), ..Default::default() }
+    /// A queue of equally ranked images on a 100x100 monitor, in the given order.
+    fn queue_of(names: &[&str]) -> Vec<RankedImage> {
+        let images: Vec<ImageInfo> = names.iter().map(|name| image(name, 100, 100)).collect();
+        rank_images_for_monitor(&images, &monitor("M", 100, 100), &settings())
+    }
+
+    fn pick(queue: &[RankedImage], state: &mut QueueState) -> String {
+        choose_from_queue(queue, RotationMode::Sequence, state).unwrap().image.path
     }
 
     #[test]
@@ -371,54 +358,73 @@ mod tests {
     #[test]
     fn queue_state_is_created_once_and_then_reused() {
         let mut runtime = RuntimeState::default();
-        let queue = rank_images_for_monitor(&[image("a.jpg", 1, 1), image("b.jpg", 1, 1)], &monitor("M", 1, 1), &settings());
+        let queue = queue_of(&["a.jpg", "b.jpg"]);
 
-        let state = ensure_queue_state(&mut runtime, "shared", &queue);
-        assert_eq!(state.ordered_image_paths, ["a.jpg", "b.jpg"]);
-        state.next_index = 1;
+        let state = ensure_queue_state(&mut runtime, "shared");
+        assert_eq!(pick(&queue, state), "a.jpg");
 
-        let again = ensure_queue_state(&mut runtime, "shared", &[]);
-        assert_eq!(again.next_index, 1, "existing state must not be reset");
+        let again = ensure_queue_state(&mut runtime, "shared");
+        assert_eq!(again.last_image_path, "a.jpg", "existing state must not be reset");
         assert_eq!(runtime.queue_states.len(), 1);
+        ensure_queue_state(&mut runtime, "monitor:1");
+        assert_eq!(runtime.queue_states.len(), 2);
     }
 
     #[test]
     fn sequence_rotation_walks_the_queue_in_order_and_wraps() {
-        let queue = rank_images_for_monitor(
-            &[image("a.jpg", 100, 100), image("b.jpg", 100, 100), image("c.jpg", 100, 100)],
-            &monitor("M", 100, 100),
-            &settings(),
-        );
-        let mut state = sequence_state(&queue);
+        let queue = queue_of(&["a.jpg", "b.jpg", "c.jpg"]);
+        let mut state = QueueState::default();
 
-        let picked: Vec<String> = (0..4)
-            .map(|_| choose_from_queue(&queue, RotationMode::Sequence, &mut state).unwrap().image.path)
-            .collect();
+        let picked: Vec<String> = (0..4).map(|_| pick(&queue, &mut state)).collect();
         assert_eq!(picked, ["a.jpg", "b.jpg", "c.jpg", "a.jpg"]);
     }
 
     #[test]
-    fn sequence_rotation_drops_deleted_images_but_keeps_the_order() {
-        let all = [image("a.jpg", 1, 1), image("b.jpg", 1, 1), image("c.jpg", 1, 1)];
-        let m = monitor("M", 1, 1);
-        let mut state = sequence_state(&rank_images_for_monitor(&all, &m, &settings()));
-        state.next_index = 1;
+    fn sequence_rotation_picks_up_images_added_later() {
+        let mut state = QueueState::default();
+        assert_eq!(pick(&queue_of(&["a.jpg", "b.jpg"]), &mut state), "a.jpg");
 
-        let without_b = rank_images_for_monitor(&[all[0].clone(), all[2].clone()], &m, &settings());
-        let next = choose_from_queue(&without_b, RotationMode::Sequence, &mut state).unwrap();
-        assert_eq!(next.image.path, "c.jpg");
-        assert_eq!(state.ordered_image_paths, ["a.jpg", "c.jpg"]);
+        // Two images are added to the folder: every image gets its turn, the new ones included.
+        let grown = queue_of(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let picked: Vec<String> = (0..5).map(|_| pick(&grown, &mut state)).collect();
+        assert_eq!(picked, ["b.jpg", "c.jpg", "d.jpg", "a.jpg", "b.jpg"]);
+
+        // An image added before the current position doesn't cause a repeat.
+        let mut state = QueueState::default();
+        let queue = queue_of(&["b.jpg", "c.jpg"]);
+        assert_eq!(pick(&queue, &mut state), "b.jpg");
+        assert_eq!(pick(&queue_of(&["a.jpg", "b.jpg", "c.jpg"]), &mut state), "c.jpg");
     }
 
     #[test]
-    fn sequence_rotation_restarts_when_no_remembered_image_exists_anymore() {
-        let m = monitor("M", 1, 1);
-        let mut state = QueueState { ordered_image_paths: vec!["gone.jpg".into()], next_index: 5, ..Default::default() };
-        let queue = rank_images_for_monitor(&[image("new1.jpg", 1, 1), image("new2.jpg", 1, 1)], &m, &settings());
+    fn sequence_rotation_continues_in_place_when_the_last_shown_image_is_gone() {
+        let mut state = QueueState::default();
+        let all = queue_of(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        assert_eq!(pick(&all, &mut state), "a.jpg");
+        assert_eq!(pick(&all, &mut state), "b.jpg");
 
-        let next = choose_from_queue(&queue, RotationMode::Sequence, &mut state).unwrap();
-        assert_eq!(next.image.path, "new1.jpg");
-        assert_eq!(state.next_index, 1);
+        // "b" is deleted: "c" has moved into its place and is next.
+        let without_b = queue_of(&["a.jpg", "c.jpg", "d.jpg"]);
+        assert_eq!(pick(&without_b, &mut state), "c.jpg");
+        assert_eq!(pick(&without_b, &mut state), "d.jpg");
+
+        // The last image of the queue is deleted after being shown: wrap to the start.
+        assert_eq!(pick(&queue_of(&["a.jpg", "c.jpg"]), &mut state), "a.jpg");
+
+        // Nothing remembered exists any more: the place still maps into the new queue.
+        let mut state = QueueState { last_image_path: "gone.jpg".into(), last_index: 5, ..Default::default() };
+        assert_eq!(pick(&queue_of(&["new1.jpg", "new2.jpg"]), &mut state), "new2.jpg");
+    }
+
+    #[test]
+    fn sequence_rotation_continues_after_a_random_pick() {
+        let queue = queue_of(&["a.jpg", "b.jpg", "c.jpg"]);
+        let mut state = QueueState::default();
+        let random = choose_from_queue(&queue, RotationMode::Random, &mut state).unwrap().image.path;
+        assert_eq!(state.last_image_path, random, "every pick is recorded as the last shown image");
+
+        let position = queue.iter().position(|r| r.image.path == random).unwrap();
+        assert_eq!(pick(&queue, &mut state), queue[(position + 1) % 3].image.path);
     }
 
     #[test]
@@ -431,7 +437,7 @@ mod tests {
             &m,
             &s,
         );
-        let mut state = sequence_state(&queue);
+        let mut state = QueueState::default();
 
         for _ in 0..100 {
             let picked = choose_from_queue(&queue, RotationMode::Random, &mut state).unwrap();
@@ -439,7 +445,7 @@ mod tests {
         }
 
         let only_tiny = rank_images_for_monitor(&[image("tiny.jpg", 100, 50)], &m, &s);
-        let picked = choose_from_queue(&only_tiny, RotationMode::Random, &mut sequence_state(&only_tiny)).unwrap();
+        let picked = choose_from_queue(&only_tiny, RotationMode::Random, &mut QueueState::default()).unwrap();
         assert_eq!(picked.image.path, "tiny.jpg", "last resort images are used when nothing else exists");
     }
 
@@ -453,16 +459,16 @@ mod tests {
 
     #[test]
     fn peek_predicts_the_next_sequence_pick_without_advancing() {
-        let m = monitor("M", 1, 1);
-        let all = [image("a.jpg", 1, 1), image("b.jpg", 1, 1), image("c.jpg", 1, 1), image("d.jpg", 1, 1)];
-        let mut state = sequence_state(&rank_images_for_monitor(&all, &m, &settings()));
-        state.next_index = 3;
-        // "b" was deleted since the order was recorded.
-        let queue = rank_images_for_monitor(&[all[0].clone(), all[2].clone(), all[3].clone()], &m, &settings());
+        let all = queue_of(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let mut state = QueueState::default();
+        assert_eq!(peek_next_sequence_path(&all, &state), Some("a.jpg"));
+        pick(&all, &mut state);
+        pick(&all, &mut state);
 
-        let peeked = peek_next_sequence_path(&queue, &state);
-        assert_eq!(state.next_index, 3, "peek must not mutate");
-        let chosen = choose_from_queue(&queue, RotationMode::Sequence, &mut state).unwrap();
-        assert_eq!(peeked.as_deref(), Some(chosen.image.path.as_str()));
+        // "b" (the last shown image) was deleted since.
+        let queue = queue_of(&["a.jpg", "c.jpg", "d.jpg"]);
+        let peeked = peek_next_sequence_path(&queue, &state).map(str::to_string);
+        assert_eq!(state.last_image_path, "b.jpg", "peek must not change the state");
+        assert_eq!(peeked.as_deref(), Some(pick(&queue, &mut state).as_str()));
     }
 }

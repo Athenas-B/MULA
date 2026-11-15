@@ -25,9 +25,11 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
 ## Architecture notes (read before changing these areas)
 
 - **Wall Changer data model (`wallchanger/settings.rs`).** Two separate types and files:
-  `Settings` (user configuration, `settings.json`) and `RuntimeState` (queues, image cache, show
-  stats, next monitor — `state.json`, written by `service::apply` via `save_state`; the queue
-  preview only adds image sizes it had to read, via `save_image_cache`). The
+  `Settings` (user configuration, `settings.json`) and `RuntimeState` (each queue's place, show
+  stats, next monitor — `state.json`, written by `service::apply` via `save_state`). The image
+  size cache has its own `image_cache.json`: every scan goes through `images::load_images_cached`,
+  which only writes the file when the scan changed it. Queues are rebuilt from the sources each
+  time; a `QueueState` only remembers the last shown image and where it was. The
   service on/off flag has its own `service.json` (`service_running` / `set_service_running`). Sources are typed: `Source { path, enabled, level,
   kind }` with `SourceKind::Folder { include_subfolders }` / `SourceKind::Wallhaven { page_limit,
   purity: Purity { sfw, sketchy, nsfw } }` (serialized with a `"kind"` tag). Unreadable files
@@ -122,9 +124,9 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 | Wallhaven URL sources | Done | Accepts `https://wallhaven.cc/search?...` or `/api/v1/search` URLs; per-source page limit (0 = unlimited) and SFW/Sketchy/NSFW purity toggles; API key support for NSFW. Cached under `%APPDATA%\mula\wallchanger\wallhaven`. |
 | Monitor detection | Done | Uses `IDesktopWallpaper`; skips monitors whose `GetMonitorRECT` fails. |
 | Monitor preview block | Done | Shows each monitor frame and how the current Windows wallpaper is fitted (Fill / FitInsideScreen); thumbnails are reused while file, monitor and fit settings are unchanged. |
-| Image dimension caching | Done | Cached in `state.json` with size + mtime. Files that open but don't decode (wrong content, cut off, empty) are cached as 0×0; files that can't be opened right now are retried. |
+| Image dimension caching | Done | Cached in `image_cache.json` with size + mtime. Files that open but don't decode (wrong content, cut off, empty) are cached as 0×0; files that can't be opened right now are retried. |
 | Shared / per-monitor queues | Done | Separate queues, exclusive queue membership, fallback queues. |
-| Rotation modes | Done | Random and Sequence; Sequence index persists across restarts. |
+| Rotation modes | Done | Random and Sequence. Sequence shows the image after the last shown one in the current queue (remembered across restarts), so added images are reached in turn; if the last shown image is gone, it continues with the one now in its place. |
 | Scaling modes | Done | Fill and FitInsideScreen with configurable background color. |
 | Interval service | Done | Runs in background; 1–1440 minutes. |
 | Manual Change / Apply | Done | In tab and tray menu. |
@@ -181,7 +183,8 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 ## Settings / Cache Paths
 
 - Settings (user configuration only): `%APPDATA%\mula\wallchanger\settings.json`
-- Runtime state (queues, image cache, stats): `%APPDATA%\mula\wallchanger\state.json`
+- Runtime state (each queue's place, stats): `%APPDATA%\mula\wallchanger\state.json`
+- Image size cache: `%APPDATA%\mula\wallchanger\image_cache.json`
 - Service on/off: `%APPDATA%\mula\wallchanger\service.json`
 - App log: `%APPDATA%\mula\logs\mula.log` (+ `mula.log.1`)
 - Rendered overlay cache: `%APPDATA%\mula\wallchanger\rendered`
@@ -251,7 +254,7 @@ Recorded so they aren't re-investigated without new facts.
   SSD): the first pass, which reads every image's dimensions, took ~500 ms; every later
   `load_images` took **~19 ms**, of which the folder walk itself was ~14 ms. It is cheap
   because the walk uses the metadata the directory listing already returns (no per-file open
-  or stat on Windows) and dimensions are cached by size + mtime in `state.json` (undecodable
+  or stat on Windows) and dimensions are cached by size + mtime in `image_cache.json` (undecodable
   files too, as 0×0). The scan runs at most once per wallpaper change (interval ≥ 1 min,
   30 min by default) and when the queue preview loads, so an index would save ~15–20 ms per
   change. The cost would be a new dependency, watchers created/dropped whenever sources

@@ -192,16 +192,18 @@ impl Default for Settings {
     }
 }
 
+/// Where a queue's rotation is. The queue itself (which images, in what order) is rebuilt from
+/// the sources every time, so only the place in it is remembered.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueState {
     #[serde(default)]
     pub queue_key: String,
+    /// The image shown last; Sequence mode continues with the one after it.
     #[serde(default)]
     pub last_image_path: String,
+    /// Where that image was in the queue: the place to continue from if it is gone.
     #[serde(default)]
-    pub next_index: i32,
-    #[serde(default)]
-    pub ordered_image_paths: Vec<String>,
+    pub last_index: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -235,8 +237,6 @@ pub struct RuntimeState {
     #[serde(default)]
     pub queue_states: Vec<QueueState>,
     #[serde(default)]
-    pub image_cache_entries: Vec<ImageCacheEntry>,
-    #[serde(default)]
     pub image_show_stats: Vec<ImageShowStat>,
 }
 
@@ -252,8 +252,11 @@ fn default_fade_duration() -> i32 { 600 }
 fn default_fade_steps() -> i32 { 12 }
 
 static SETTINGS: JsonStore<Settings> = JsonStore::new("wallchanger/settings.json", JsonFormat::Pretty, normalize);
-/// Compact: it can hold thousands of paths.
+/// Compact: the show statistics hold one entry per image shown so far.
 static STATE: JsonStore<RuntimeState> = JsonStore::new("wallchanger/state.json", JsonFormat::Compact, |_| {});
+/// The sizes of the images in the sources, so files aren't opened again on every scan. Kept
+/// apart from the state: it is large (one entry per image) and only changes when files do.
+static IMAGE_CACHE: JsonStore<Vec<ImageCacheEntry>> = JsonStore::new("wallchanger/image_cache.json", JsonFormat::Compact, |_| {});
 static SERVICE: JsonStore<ServiceFlag> = JsonStore::new("wallchanger/service.json", JsonFormat::Pretty, |_| {});
 
 /// Bumped on every settings change (while the store is locked), so the UI can ignore responses
@@ -328,16 +331,16 @@ pub fn save_state(state: RuntimeState) -> Result<(), String> {
     STATE.set(state)
 }
 
-/// Stores a refreshed image dimension cache on its own (queues and statistics stay as they
-/// are), so image sizes a preview had to read aren't read again. Does nothing when unchanged.
+pub fn load_image_cache() -> Result<Vec<ImageCacheEntry>, String> {
+    IMAGE_CACHE.get()
+}
+
+/// Stores the image size cache a scan produced; the file is only written when it changed.
 pub fn save_image_cache(entries: &[ImageCacheEntry]) -> Result<(), String> {
-    if STATE.read(|state| state.image_cache_entries == entries)? {
+    if IMAGE_CACHE.read(|cached| cached == entries)? {
         return Ok(());
     }
-    STATE.update(|state| {
-        state.image_cache_entries = entries.to_vec();
-        Ok(())
-    })
+    IMAGE_CACHE.set(entries.to_vec())
 }
 
 /// Whether the interval service is switched on; stored on its own in `service.json`.
