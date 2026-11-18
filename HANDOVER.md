@@ -94,13 +94,28 @@ the tray's *Exit* quits and stops the elevated helper and the VSD server.
   ERROR_CANCELLED) and refuses system/boot disks in Rust and in the script.
   Residual risk: a same-user process can still ask the helper for SMART reads / self-tests.
 - **VSD (`vsd.rs` + `modules/vsd/server.py`).** Config lives in `vsd.json` (`download_dir`,
-  `autostart`, `port`). MULA builds the extension with `build.py --server-url` so it targets the
-  configured port, and starts the server with `VSD_DOWNLOAD_DIR`, `VSD_PORT` and a
+  `autostart`, `port`). Installers carry the module as Tauri resources (`bundle.resources`; not
+  `.env`, logs or tests; the `every_module_file_is_bundled` test fails when a new module file is
+  missing there); debug builds run the project's copy, release builds the bundled one (`vsd::init`
+  decides once; `module_dir`). The installed folder may be read-only, so the server's logs (`VSD_LOG_DIR` →
+  `vsd/logs`) and the user's settings (`VSD_ENV_FILE` → `vsd/vsd.env`, read before a local `.env`)
+  live in MULA's data folder. The extension is built with the system Python by `build.py
+  --server-url --out-dir` (so it targets the configured port) into `extension/dist` in debug
+  builds and `vsd/extension` in the data folder in release builds. The server is started with
+  `VSD_DOWNLOAD_DIR`, `VSD_PORT`, `VSD_LOG_DIR`, `VSD_ENV_FILE` and a
   per-launch `VSD_ADMIN_TOKEN`; log lines carry a `seq` so the UI merges backlog and live events;
   the process lock is never held across pip; config changes on the running server are sent with the
-  `X-VSD-Admin-Token` header. Autostart happens in the backend at launch. pip runs only when the
-  interpreter or `requirements.txt` changed (fingerprint in `vsd-requirements.sha256`; a server
-  that exits with an error clears it). The server rejects non-extension `Origin`s and
+  `X-VSD-Admin-Token` header. Autostart happens in the backend at launch. The server's Python is
+  a `.venv` next to `server.py` if one exists, else MULA's own `vsd/venv` in its data folder
+  (never the system Python: PEP 668 on Debian/Pop!_OS, admin rights on Windows). Each start
+  checks it (`venv_state`): no python, a missing `home` from `pyvenv.cfg`, no pip on disk, or a pip
+  that doesn't come from the venv (a Python upgrade on Linux; the system pip would otherwise
+  answer, because of `--system-site-packages`) mean broken → rebuilt. A check that can't run at
+  all (stray PYTHONHOME, antivirus) keeps the venv and reports an error instead, since a rebuild
+  re-downloads its packages. `--system-site-packages` lets packages already installed
+  system-wide satisfy `requirements.txt` without a download. pip runs only when the
+  interpreter or `requirements.txt` changed (fingerprint in `mula-requirements.sha256` inside the
+  venv, so a rebuilt venv drops it; a server that exits with an import error clears it). The server rejects non-extension `Origin`s and
   non-loopback `Host`s, only opens files it produced, only fetches http(s) (redirects included),
   and downloads segments in parallel (`VSD_SEGMENT_WORKERS`, default 6) with connection reuse.
 - **Browser extension (`modules/vsd/extension/src`).** Shared `config.js` (server URL helpers).
@@ -199,8 +214,11 @@ The original standalone Windows **Wall Changer** app has been ported into MULA a
 - Kept last fade frame per monitor: `%APPDATA%\mula\wallchanger\rendered\fade_base`
 - Wallhaven download cache: `%APPDATA%\mula\wallchanger\wallhaven\fnv<hash>\` (+ `manifest.json`)
 - Elevated helper / one-shot script dirs: `%TEMP%\mula_smartd_*`, `%TEMP%\mula_elevated_*`
-- VSD config: `%APPDATA%\mula\vsd.json`; pip fingerprint: `%APPDATA%\mula\vsd-requirements.sha256`
+- VSD config: `%APPDATA%\mula\vsd.json`; VSD's own files: `%APPDATA%\mula\vsd\` (`venv`, which
+  you can delete to start over, `logs`, `vsd.env`, `extension`)
 - SMART snapshots: `%APPDATA%\mula\snapshots\<drive>\`
+- Uninstalling with the setup.exe's "Delete the application data" ticked also removes
+  `%APPDATA%\mula` (`src-tauri/windows/hooks.nsh`); the MSI has no such option and leaves it
 - Startup registry: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `MULA`
 
 ## Build & Test Commands

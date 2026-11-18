@@ -27,6 +27,20 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../modules/vsd/server.py": "modules/vsd/server.py",
+      "../modules/vsd/requirements.txt": "modules/vsd/requirements.txt",
+      "../modules/vsd/.env.example": "modules/vsd/.env.example",
+      "../modules/vsd/extension/build.py": "modules/vsd/extension/build.py",
+      "../modules/vsd/extension/chrome/": "modules/vsd/extension/chrome/",
+      "../modules/vsd/extension/firefox/": "modules/vsd/extension/firefox/",
+      "../modules/vsd/extension/src/": "modules/vsd/extension/src/"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/hooks.nsh"
+      }
+    }
   }
 }

@@ -28,17 +28,20 @@ A cross-platform companion app built with Tauri (Rust + Web frontend) that manag
 - [Rust](https://rustup.rs/) (1.70+)
 - [Node.js](https://nodejs.org/); `npm test` needs the version in `engines` of `package.json` (the frontend tests load the ES modules through `node:vm`)
 - [Python](https://python.org/) (3.10+)
-- [ffmpeg](https://ffmpeg.org/) (on PATH or configured in .env)
+- [ffmpeg](https://ffmpeg.org/) (on PATH or set as `VSD_FFMPEG` in `vsd.env`)
 - Platform-specific:
   - **Linux:** `sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`
   - **Windows:** WebView2 (pre-installed on Windows 11), Visual Studio Build Tools
 
-### Install module dependencies
+### Module dependencies
 
-```bash
-cd modules/vsd
-pip install -r requirements.txt
-```
+Nothing to install by hand: on its first start, the VSD server gets its own Python environment
+in MULA's data folder (`vsd/venv`) and installs `modules/vsd/requirements.txt` into it (packages
+you already installed system-wide are reused). On Linux this needs `sudo apt install
+python3-venv`. A `modules/vsd/.venv` you create yourself is used instead, if there is one.
+
+VSD settings (see `modules/vsd/.env.example`) go in `vsd/vsd.env` in MULA's data folder
+(`%APPDATA%\mula` on Windows, `~/.config/mula` on Linux); a `.env` next to `server.py` also works.
 
 ### Run in development
 
@@ -70,7 +73,6 @@ MULA/
 │   └── vsd/
 │       ├── server.py     # VSD companion server (Flask)
 │       ├── requirements.txt
-│       ├── setup.py      # Dependency installer
 │       └── .env.example  # Configuration template
 └── package.json
 ```

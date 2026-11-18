@@ -647,6 +647,7 @@ pub fn run() {
             use tauri::Manager;
 
             events::init(app.handle().clone());
+            vsd::init(app.path().resource_dir().ok());
 
             let show = MenuItem::with_id(app, "show", "Show MULA", true, None::<&str>)?;
 

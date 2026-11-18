@@ -25,7 +25,10 @@ dist-ssr
 
 # Module env files (user-specific)
 modules/vsd/.env
+modules/vsd/.venv/
+# Only when server.py runs on its own: MULA sends its logs to %APPDATA%\mula\vsd\logs
 modules/vsd/logs/
+# Extension built by debug builds (release builds use %APPDATA%\mula\vsd\extension)
 modules/vsd/extension/dist/
 
 # Python

@@ -33,8 +33,12 @@ from dotenv import load_dotenv
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-# Load .env from the same directory as this script
+# Load .env: first the file MULA names in VSD_ENV_FILE (in its data folder, since an installed
+# copy of this folder may be read-only), then the one next to this script. Values already set
+# win, so the environment beats VSD_ENV_FILE, which beats the local .env.
 _HERE = Path(__file__).parent
+if env_file := os.environ.get("VSD_ENV_FILE"):
+    load_dotenv(env_file)
 load_dotenv(_HERE / ".env")
 
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "VSD"

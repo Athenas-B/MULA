@@ -129,7 +129,15 @@ class BuildTests(unittest.TestCase):
                 mock.patch.object(sys, "argv", ["build.py", "firefox", "--server-url", "http://x:1"]), \
                 mock.patch("builtins.print"):
             build.main()
-        fake.assert_called_once_with("firefox", "http://x:1")
+        fake.assert_called_once_with("firefox", "http://x:1", self.dist)
+
+    def test_main_builds_into_the_out_dir(self):
+        elsewhere = self.root / "elsewhere"
+        with mock.patch.object(sys, "argv", ["build.py", "chrome", "--out-dir", str(elsewhere)]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            build.main()
+        self.assertTrue((elsewhere / "chrome" / "manifest.json").exists())
+        self.assertFalse(self.dist.exists())
 
     def test_unknown_browser_returns_false(self):
         ok, output = self._build("safari")

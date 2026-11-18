@@ -9,6 +9,7 @@ Usage:
     python build.py chrome   # Chrome only
     python build.py firefox  # Firefox only
     python build.py chrome --server-url http://127.0.0.1:9000   # bake in another server URL
+    python build.py chrome --out-dir /writable/dir              # build there instead of ./dist
 """
 
 import re
@@ -33,13 +34,13 @@ def set_default_server(config_js: Path, server_url: str):
     config_js.write_text(updated, encoding="utf-8")
 
 
-def build(browser: str, server_url: str | None = None):
+def build(browser: str, server_url: str | None = None, dist: Path | None = None):
     manifest_dir = HERE / browser
     if not manifest_dir.exists():
         print(f"Error: {manifest_dir} not found")
         return False
 
-    out = DIST / browser
+    out = (dist or DIST) / browser
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -61,23 +62,33 @@ def build(browser: str, server_url: str | None = None):
     return True
 
 
+def take_option(args: list[str], name: str) -> str | None:
+    """Removes `name VALUE` from `args` and returns VALUE (None if absent)."""
+    if name not in args:
+        return None
+    i = args.index(name)
+    if i + 1 >= len(args):
+        print(f"Error: {name} needs a value")
+        sys.exit(1)
+    value = args[i + 1]
+    del args[i:i + 2]
+    return value
+
+
 def main():
     args = sys.argv[1:]
-    server_url = None
-    if "--server-url" in args:
-        i = args.index("--server-url")
-        if i + 1 >= len(args):
-            print("Error: --server-url needs a value")
-            sys.exit(1)
-        server_url = args[i + 1]
-        del args[i:i + 2]
+    server_url = take_option(args, "--server-url")
+    # An installed MULA can't write next to this script (e.g. Program Files), so it passes a
+    # folder in its own data directory.
+    out_dir = take_option(args, "--out-dir")
+    dist = Path(out_dir) if out_dir else DIST
     targets = args or ["chrome", "firefox"]
     for target in targets:
-        if not build(target, server_url):
+        if not build(target, server_url, dist):
             sys.exit(1)
     print("\nDone! Load extensions from:")
     for target in targets:
-        print(f"  {DIST / target}")
+        print(f"  {dist / target}")
 
 
 if __name__ == "__main__":
